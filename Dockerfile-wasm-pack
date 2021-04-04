@@ -1,0 +1,7 @@
+from liuchong/rustup:1.51.0
+
+run ["cargo", "install", "wasm-pack"]
+
+workdir /workdir
+
+cmd ["wasm-pack", "build"]

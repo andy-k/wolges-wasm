@@ -1,0 +1,352 @@
+// Copyright (C) 2020-2021 Andy Kurnia.
+
+use wasm_bindgen::prelude::*;
+
+#[allow(dead_code)]
+mod alphabet;
+mod bites;
+mod board_layout;
+#[allow(dead_code)]
+mod game_config;
+#[allow(dead_code)]
+mod klv;
+#[allow(dead_code)]
+mod kwg;
+#[allow(dead_code)]
+mod matrix;
+mod movegen;
+
+macro_rules! return_error {
+    ($error:expr) => {
+        return Err($error.into());
+    };
+}
+
+macro_rules! console_log {
+    ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
+}
+
+#[wasm_bindgen(start)]
+pub fn do_this_on_startup() {
+    std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame".into(),
+        game_config::make_common_english_game_config().into(),
+    );
+}
+
+fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
+    format!("{:?}", x)
+}
+
+// tile numbering follows alphabet order (not necessarily unicode order).
+// rack: array of numbers. 0 for blank, 1 for A.
+// board: 2D array of numbers. 0 for empty, 1 for A, -1 for blank-as-A.
+// lexicon: this implies board size and other rules too.
+// count: maximum number of moves returned.
+// (note: equal moves are not stably sorted;
+//  different counts may tie-break the last move differently.)
+#[derive(serde::Deserialize)]
+struct Question {
+    lexicon: String,
+    rack: Vec<u8>,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    #[serde(rename = "count")]
+    max_gen: usize,
+}
+
+// note: only this representation uses -1i8 for blank-as-A (in "board" input
+// and "word" response for "action":"play"). everywhere else, use 0x81u8.
+
+type WasmCache<T> = std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<T>>>;
+
+lazy_static::lazy_static! {
+    static ref CACHED_KWG: WasmCache<kwg::Kwg> = Default::default();
+    static ref CACHED_KLV: WasmCache<klv::Klv> = Default::default();
+    static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig<'static>> = Default::default();
+}
+
+#[wasm_bindgen]
+pub fn precache_kwg(key: String, value: &[u8]) {
+    CACHED_KWG
+        .write()
+        .unwrap()
+        .insert(key, kwg::Kwg::from_bytes_alloc(value).into());
+}
+
+#[wasm_bindgen]
+pub fn precache_klv(key: String, value: &[u8]) {
+    CACHED_KLV
+        .write()
+        .unwrap()
+        .insert(key, klv::Klv::from_bytes_alloc(value).into());
+}
+
+#[wasm_bindgen]
+pub fn analyze(question_str: &str) -> Result<JsValue, JsValue> {
+    let question = serde_json::from_str::<Question>(question_str).map_err(err_to_str)?;
+
+    let kwg;
+    let klv;
+    let game_config;
+
+    match question.lexicon.as_str() {
+        "CSW19" => {
+            kwg = CACHED_KWG
+                .read()
+                .map_err(err_to_str)?
+                .get("CSW19")
+                .ok_or("missing kwg")?
+                .clone();
+            klv = CACHED_KLV
+                .read()
+                .map_err(err_to_str)?
+                .get("english")
+                .ok_or("missing klv")?
+                .clone();
+            game_config = CACHED_GAME_CONFIG
+                .read()
+                .map_err(err_to_str)?
+                .get("CrosswordGame")
+                .ok_or("missing game_config")?
+                .clone();
+        }
+        "CSW19X" => {
+            kwg = CACHED_KWG
+                .read()
+                .map_err(err_to_str)?
+                .get("CSW19X")
+                .ok_or("missing kwg")?
+                .clone();
+            klv = CACHED_KLV
+                .read()
+                .map_err(err_to_str)?
+                .get("english")
+                .ok_or("missing klv")?
+                .clone();
+            game_config = CACHED_GAME_CONFIG
+                .read()
+                .map_err(err_to_str)?
+                .get("CrosswordGame")
+                .ok_or("missing game_config")?
+                .clone();
+        }
+        "NWL18" => {
+            kwg = CACHED_KWG
+                .read()
+                .map_err(err_to_str)?
+                .get("NWL18")
+                .ok_or("missing kwg")?
+                .clone();
+            klv = CACHED_KLV
+                .read()
+                .map_err(err_to_str)?
+                .get("english")
+                .ok_or("missing klv")?
+                .clone();
+            game_config = CACHED_GAME_CONFIG
+                .read()
+                .map_err(err_to_str)?
+                .get("CrosswordGame")
+                .ok_or("missing game_config")?
+                .clone();
+        }
+        "NWL20" => {
+            kwg = CACHED_KWG
+                .read()
+                .map_err(err_to_str)?
+                .get("NWL20")
+                .ok_or("missing kwg")?
+                .clone();
+            klv = CACHED_KLV
+                .read()
+                .map_err(err_to_str)?
+                .get("english")
+                .ok_or("missing klv")?
+                .clone();
+            game_config = CACHED_GAME_CONFIG
+                .read()
+                .map_err(err_to_str)?
+                .get("CrosswordGame")
+                .ok_or("missing game_config")?
+                .clone();
+        }
+        "ECWL" => {
+            kwg = CACHED_KWG
+                .read()
+                .map_err(err_to_str)?
+                .get("ECWL")
+                .ok_or("missing kwg")?
+                .clone();
+            klv = CACHED_KLV
+                .read()
+                .map_err(err_to_str)?
+                .get("english")
+                .ok_or("missing klv")?
+                .clone();
+            game_config = CACHED_GAME_CONFIG
+                .read()
+                .map_err(err_to_str)?
+                .get("CrosswordGame")
+                .ok_or("missing game_config")?
+                .clone();
+        }
+        _ => {
+            return_error!(format!("invalid lexicon {:?}", question.lexicon));
+        }
+    };
+
+    let alphabet = game_config.alphabet();
+    let alphabet_len_without_blank = alphabet.len() - 1;
+
+    // note: this allocates
+    let mut available_tally = (0..alphabet.len())
+        .map(|tile| alphabet.freq(tile))
+        .collect::<Box<_>>();
+
+    for &tile in &question.rack {
+        if tile > alphabet_len_without_blank {
+            return_error!(format!(
+                "rack has invalid tile {}, alphabet size is {}",
+                tile, alphabet_len_without_blank
+            ));
+        }
+        if available_tally[tile as usize] > 0 {
+            available_tally[tile as usize] -= 1;
+        } else {
+            return_error!(format!(
+                "too many tile {} (bag contains only {})",
+                tile,
+                alphabet.freq(tile),
+            ));
+        }
+    }
+
+    let expected_dim = game_config.board_layout().dim();
+    if question.board_tiles.len() != expected_dim.rows as usize {
+        return_error!(format!(
+            "board: need {} rows, found {} rows",
+            expected_dim.rows,
+            question.board_tiles.len()
+        ));
+    }
+    for (row_num, row) in (0..).zip(question.board_tiles.iter()) {
+        if row.len() != expected_dim.cols as usize {
+            return_error!(format!(
+                "board row {} (0-based): need {} cols, found {} cols",
+                row_num,
+                expected_dim.cols,
+                row.len()
+            ));
+        }
+    }
+    let mut board_tiles =
+        Vec::with_capacity((expected_dim.rows as usize) * (expected_dim.cols as usize));
+    for (row_num, row) in (0..).zip(question.board_tiles.iter()) {
+        for (col_num, &signed_tile) in (0..).zip(row) {
+            if signed_tile == 0 {
+                board_tiles.push(0);
+            } else if signed_tile as u8 <= alphabet_len_without_blank {
+                let tile = signed_tile as u8;
+                board_tiles.push(tile);
+                if available_tally[tile as usize] > 0 {
+                    available_tally[tile as usize] -= 1;
+                } else {
+                    return_error!(format!(
+                        "too many tile {} (bag contains only {})",
+                        tile,
+                        alphabet.freq(tile),
+                    ));
+                }
+            } else if (!signed_tile as u8) < alphabet_len_without_blank {
+                // turn -1i8, -2i8 into 0x81u8, 0x82u8
+                board_tiles.push(0x81 + !signed_tile as u8);
+                // verify usage of blank tile
+                if available_tally[0] > 0 {
+                    available_tally[0] -= 1;
+                } else {
+                    return_error!(format!(
+                        "too many tile {} (bag contains only {})",
+                        0,
+                        alphabet.freq(0),
+                    ));
+                }
+            } else {
+                return_error!(format!(
+                    "board row {} col {} (0-based): invalid tile {}, alphabet size is {}",
+                    row_num, col_num, signed_tile, alphabet_len_without_blank
+                ));
+            }
+        }
+    }
+
+    let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
+
+    let board_snapshot = &movegen::BoardSnapshot {
+        board_tiles: &board_tiles,
+        game_config: &game_config,
+        kwg: &kwg,
+        klv: &klv,
+    };
+
+    move_generator.gen_moves_unfiltered(board_snapshot, &question.rack, question.max_gen);
+    let plays = &move_generator.plays;
+    if false {
+        console_log!("found {} moves", plays.len());
+        for play in plays.iter() {
+            console_log!("{} {}", play.equity, play.play.fmt(board_snapshot));
+        }
+    }
+
+    let mut result = Vec::<serde_json::Value>::with_capacity(plays.len());
+    for play in plays.iter() {
+        match &play.play {
+            movegen::Play::Exchange { tiles } => {
+                if tiles.is_empty() {
+                    result.push(serde_json::json!({
+                        "equity": play.equity,
+                        "action": "pass" }));
+                } else {
+                    // tiles: array of numbers. 0 for blank, 1 for A.
+                    result.push(serde_json::json!({
+                        "equity": play.equity,
+                        "action": "exchange",
+                        "tiles": tiles[..] }));
+                }
+            }
+            movegen::Play::Place {
+                down,
+                lane,
+                idx,
+                word,
+                score,
+            } => {
+                // turn 0x81u8, 0x82u8 into -1i8, -2i8
+                let word_played = word
+                    .iter()
+                    .map(|&x| {
+                        if x & 0x80 != 0 {
+                            -((x & !0x80) as i8)
+                        } else {
+                            x as i8
+                        }
+                    })
+                    .collect::<Vec<i8>>();
+                // across plays: down=false, lane=row, idx=col (0-based).
+                // down plays: down=true, lane=col, idx=row (0-based).
+                // word: 0 for play-through, 1 for A, -1 for blank-as-A.
+                result.push(serde_json::json!({
+                    "equity": play.equity,
+                    "action": "play",
+                    "down": down,
+                    "lane": lane,
+                    "idx": idx,
+                    "word": word_played,
+                    "score": score }));
+            }
+        }
+    }
+
+    Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
+}
