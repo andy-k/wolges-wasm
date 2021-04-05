@@ -42,18 +42,22 @@ fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
 // tile numbering follows alphabet order (not necessarily unicode order).
 // rack: array of numbers. 0 for blank, 1 for A.
 // board: 2D array of numbers. 0 for empty, 1 for A, -1 for blank-as-A.
-// lexicon: this implies board size and other rules too.
 // count: maximum number of moves returned.
 // (note: equal moves are not stably sorted;
 //  different counts may tie-break the last move differently.)
+// lexicon: kwg.
+// leave: klv.
+// rules: hardcoded on startup.
 #[derive(serde::Deserialize)]
 struct Question {
-    lexicon: String,
     rack: Vec<u8>,
     #[serde(rename = "board")]
     board_tiles: Vec<Vec<i8>>,
     #[serde(rename = "count")]
     max_gen: usize,
+    lexicon: String,
+    leave: String,
+    rules: String,
 }
 
 // note: only this representation uses -1i8 for blank-as-A (in "board" input
@@ -109,115 +113,24 @@ pub fn precache_klv(key: String, value: &[u8]) {
 pub fn analyze(question_str: &str) -> Result<JsValue, JsValue> {
     let question = serde_json::from_str::<Question>(question_str).map_err(err_to_str)?;
 
-    let kwg;
-    let klv;
-    let game_config;
-
-    match question.lexicon.as_str() {
-        "CSW19" => {
-            kwg = CACHED_KWG
-                .read()
-                .map_err(err_to_str)?
-                .get("CSW19")
-                .ok_or("missing kwg")?
-                .clone();
-            klv = CACHED_KLV
-                .read()
-                .map_err(err_to_str)?
-                .get("english")
-                .ok_or("missing klv")?
-                .clone();
-            game_config = CACHED_GAME_CONFIG
-                .read()
-                .map_err(err_to_str)?
-                .get("CrosswordGame")
-                .ok_or("missing game_config")?
-                .clone();
-        }
-        "CSW19X" => {
-            kwg = CACHED_KWG
-                .read()
-                .map_err(err_to_str)?
-                .get("CSW19X")
-                .ok_or("missing kwg")?
-                .clone();
-            klv = CACHED_KLV
-                .read()
-                .map_err(err_to_str)?
-                .get("english")
-                .ok_or("missing klv")?
-                .clone();
-            game_config = CACHED_GAME_CONFIG
-                .read()
-                .map_err(err_to_str)?
-                .get("CrosswordGame")
-                .ok_or("missing game_config")?
-                .clone();
-        }
-        "NWL18" => {
-            kwg = CACHED_KWG
-                .read()
-                .map_err(err_to_str)?
-                .get("NWL18")
-                .ok_or("missing kwg")?
-                .clone();
-            klv = CACHED_KLV
-                .read()
-                .map_err(err_to_str)?
-                .get("english")
-                .ok_or("missing klv")?
-                .clone();
-            game_config = CACHED_GAME_CONFIG
-                .read()
-                .map_err(err_to_str)?
-                .get("CrosswordGame")
-                .ok_or("missing game_config")?
-                .clone();
-        }
-        "NWL20" => {
-            kwg = CACHED_KWG
-                .read()
-                .map_err(err_to_str)?
-                .get("NWL20")
-                .ok_or("missing kwg")?
-                .clone();
-            klv = CACHED_KLV
-                .read()
-                .map_err(err_to_str)?
-                .get("english")
-                .ok_or("missing klv")?
-                .clone();
-            game_config = CACHED_GAME_CONFIG
-                .read()
-                .map_err(err_to_str)?
-                .get("CrosswordGame")
-                .ok_or("missing game_config")?
-                .clone();
-        }
-        "ECWL" => {
-            kwg = CACHED_KWG
-                .read()
-                .map_err(err_to_str)?
-                .get("ECWL")
-                .ok_or("missing kwg")?
-                .clone();
-            klv = CACHED_KLV
-                .read()
-                .map_err(err_to_str)?
-                .get("english")
-                .ok_or("missing klv")?
-                .clone();
-            game_config = CACHED_GAME_CONFIG
-                .read()
-                .map_err(err_to_str)?
-                .get("CrosswordGame")
-                .ok_or("missing game_config")?
-                .clone();
-        }
-        _ => {
-            return_error!(format!("invalid lexicon {:?}", question.lexicon));
-        }
-    };
+    let kwg = CACHED_KWG
+        .read()
+        .map_err(err_to_str)?
+        .get(&question.lexicon)
+        .ok_or("missing kwg")?
+        .clone();
+    let klv = CACHED_KLV
+        .read()
+        .map_err(err_to_str)?
+        .get(&question.leave)
+        .ok_or("missing klv")?
+        .clone();
+    let game_config = CACHED_GAME_CONFIG
+        .read()
+        .map_err(err_to_str)?
+        .get(&question.rules)
+        .ok_or("missing game_config")?
+        .clone();
 
     let alphabet = game_config.alphabet();
     let alphabet_len_without_blank = alphabet.len() - 1;
