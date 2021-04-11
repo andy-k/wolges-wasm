@@ -2,19 +2,12 @@
 
 use wasm_bindgen::prelude::*;
 
-#[allow(dead_code)]
-mod alphabet;
-mod bites;
-mod board_layout;
-#[allow(dead_code)]
-mod game_config;
-#[allow(dead_code)]
-mod klv;
-#[allow(dead_code)]
-mod kwg;
-#[allow(dead_code)]
-mod matrix;
-mod movegen;
+macro_rules! mod_many {
+  ($($mod: ident)+) => {
+    $(#[allow(dead_code)] mod $mod;)+
+  };
+}
+mod_many!(alphabet bites board_layout game_config klv kwg matrix movegen);
 
 macro_rules! return_error {
     ($error:expr) => {
