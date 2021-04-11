@@ -93,6 +93,23 @@ lazy_static::lazy_static! {
     static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig<'static>> = Default::default();
 }
 
+macro_rules! get_wasm_cache {
+    ($cache: expr, $key: expr, $err: expr) => {
+        $cache
+            .read()
+            .map_err(err_to_str)?
+            .get($key)
+            .ok_or($err)?
+            .clone()
+    };
+}
+
+macro_rules! use_wasm_cache {
+    ($var: ident, $cache: expr, $key: expr) => {
+        let $var = get_wasm_cache!($cache, $key, concat!("missing ", stringify!($var)));
+    };
+}
+
 #[wasm_bindgen]
 pub fn precache_kwg(key: String, value: &[u8]) {
     CACHED_KWG
@@ -113,24 +130,9 @@ pub fn precache_klv(key: String, value: &[u8]) {
 pub fn analyze(question_str: &str) -> Result<JsValue, JsValue> {
     let question = serde_json::from_str::<Question>(question_str).map_err(err_to_str)?;
 
-    let kwg = CACHED_KWG
-        .read()
-        .map_err(err_to_str)?
-        .get(&question.lexicon)
-        .ok_or("missing kwg")?
-        .clone();
-    let klv = CACHED_KLV
-        .read()
-        .map_err(err_to_str)?
-        .get(&question.leave)
-        .ok_or("missing klv")?
-        .clone();
-    let game_config = CACHED_GAME_CONFIG
-        .read()
-        .map_err(err_to_str)?
-        .get(&question.rules)
-        .ok_or("missing game_config")?
-        .clone();
+    use_wasm_cache!(kwg, CACHED_KWG, &question.lexicon);
+    use_wasm_cache!(klv, CACHED_KLV, &question.leave);
+    use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &question.rules);
 
     let alphabet = game_config.alphabet();
     let alphabet_len_without_blank = alphabet.len() - 1;
