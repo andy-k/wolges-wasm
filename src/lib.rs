@@ -1,22 +1,26 @@
 // Copyright (C) 2020-2021 Andy Kurnia.
 
+use rand::prelude::*;
 use wasm_bindgen::prelude::*;
+
+#[macro_use]
+mod error;
 
 macro_rules! mod_many {
   ($($mod: ident)+) => {
     $(#[allow(dead_code)] mod $mod;)+
   };
 }
-mod_many!(alphabet bag bites board_layout display error fash game_config game_state game_timers klv kwg matrix movegen);
-
-macro_rules! return_error {
-    ($error:expr) => {
-        return Err($error.into());
-    };
-}
+mod_many!(alphabet bag bites board_layout display fash game_config game_state game_timers kibitzer klv kwg matrix movegen simmer stats);
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
+}
+
+macro_rules! return_js_error {
+    ($error:expr) => {
+        return Err($error.into());
+    };
 }
 
 #[wasm_bindgen(start)]
@@ -42,7 +46,7 @@ fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
 // leave: klv.
 // rules: hardcoded on startup.
 #[derive(serde::Deserialize)]
-struct Question {
+struct AnalyzeRequest {
     rack: Vec<u8>,
     #[serde(rename = "board")]
     board_tiles: Vec<Vec<i8>>,
@@ -53,37 +57,49 @@ struct Question {
     rules: String,
 }
 
-// note: only this representation uses -1i8 for blank-as-A (in "board" input
-// and "word" response for "action":"play"). everywhere else, use 0x81u8.
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-#[serde(tag = "action")]
-enum JsonPlay {
-    #[serde(rename = "exchange")]
-    Exchange { tiles: Box<[u8]> },
-    #[serde(rename = "play")]
-    Play {
-        down: bool,
-        lane: i8,
-        idx: i8,
-        word: Box<[i8]>,
-        score: i16,
-    },
+#[derive(serde::Deserialize)]
+struct SimPrepareRequest {
+    rack: Vec<u8>,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    #[serde(rename = "count")]
+    max_gen: usize,
+    lexicon: String,
+    leave: String,
+    rules: String,
+    #[serde(rename = "plies")]
+    num_sim_plies: usize,
+    turn: u8,
+    rack_sizes: Vec<u8>,
+    scores: Vec<i16>,
+    zero_turns: u16,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-struct JsonPlayWithEquity {
-    equity: f32,
-    #[serde(flatten)]
-    play: JsonPlay,
+struct Candidate {
+    play_index: usize,
+    stats: stats::Stats,
+}
+
+// ongoing Sim Processes, only dropped on request.
+struct SimProc {
+    initial_board_tiles: Vec<u8>,
+    game_config: std::sync::Arc<game_config::GameConfig<'static>>,
+    kwg: std::sync::Arc<kwg::Kwg>,
+    klv: std::sync::Arc<klv::Klv>,
+    simmer: simmer::Simmer,
+    plays: Vec<movegen::ValuedMove>,
+    candidates: Vec<Candidate>,
+    play_finder: std::collections::HashMap<movegen::Play, usize>,
 }
 
 type WasmCache<T> = std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<T>>>;
+type WasmCacheInt<T> = std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<T>>>;
 
 lazy_static::lazy_static! {
     static ref CACHED_KWG: WasmCache<kwg::Kwg> = Default::default();
     static ref CACHED_KLV: WasmCache<klv::Klv> = Default::default();
     static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig<'static>> = Default::default();
+    static ref SIM_PROCS: WasmCacheInt<std::sync::RwLock<SimProc>> = Default::default();
 }
 
 macro_rules! get_wasm_cache {
@@ -103,6 +119,11 @@ macro_rules! use_wasm_cache {
     };
 }
 
+thread_local! {
+    static RNG: std::cell::RefCell<Box<dyn RngCore>> =
+        std::cell::RefCell::new(Box::new(rand_chacha::ChaCha20Rng::from_entropy()));
+}
+
 #[wasm_bindgen]
 pub fn precache_kwg(key: String, value: &[u8]) {
     CACHED_KWG
@@ -120,108 +141,29 @@ pub fn precache_klv(key: String, value: &[u8]) {
 }
 
 #[wasm_bindgen]
-pub fn analyze(question_str: &str) -> Result<JsValue, JsValue> {
-    let question = serde_json::from_str::<Question>(question_str).map_err(err_to_str)?;
+pub fn analyze(req_str: &str) -> Result<JsValue, JsValue> {
+    let req = serde_json::from_str::<AnalyzeRequest>(req_str).map_err(err_to_str)?;
 
-    use_wasm_cache!(kwg, CACHED_KWG, &question.lexicon);
-    use_wasm_cache!(klv, CACHED_KLV, &question.leave);
-    use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &question.rules);
+    use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
+    use_wasm_cache!(klv, CACHED_KLV, &req.leave);
+    use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
-    let alphabet = game_config.alphabet();
-    let alphabet_len_without_blank = alphabet.len() - 1;
-
-    // note: this allocates
-    let mut available_tally = (0..alphabet.len())
-        .map(|tile| alphabet.freq(tile))
-        .collect::<Box<_>>();
-
-    for &tile in &question.rack {
-        if tile > alphabet_len_without_blank {
-            return_error!(format!(
-                "rack has invalid tile {}, alphabet size is {}",
-                tile, alphabet_len_without_blank
-            ));
-        }
-        if available_tally[tile as usize] > 0 {
-            available_tally[tile as usize] -= 1;
-        } else {
-            return_error!(format!(
-                "too many tile {} (bag contains only {})",
-                tile,
-                alphabet.freq(tile),
-            ));
-        }
-    }
-
-    let expected_dim = game_config.board_layout().dim();
-    if question.board_tiles.len() != expected_dim.rows as usize {
-        return_error!(format!(
-            "board: need {} rows, found {} rows",
-            expected_dim.rows,
-            question.board_tiles.len()
-        ));
-    }
-    for (row_num, row) in (0..).zip(question.board_tiles.iter()) {
-        if row.len() != expected_dim.cols as usize {
-            return_error!(format!(
-                "board row {} (0-based): need {} cols, found {} cols",
-                row_num,
-                expected_dim.cols,
-                row.len()
-            ));
-        }
-    }
-    let mut board_tiles =
-        Vec::with_capacity((expected_dim.rows as usize) * (expected_dim.cols as usize));
-    for (row_num, row) in (0..).zip(question.board_tiles.iter()) {
-        for (col_num, &signed_tile) in (0..).zip(row) {
-            if signed_tile == 0 {
-                board_tiles.push(0);
-            } else if signed_tile as u8 <= alphabet_len_without_blank {
-                let tile = signed_tile as u8;
-                board_tiles.push(tile);
-                if available_tally[tile as usize] > 0 {
-                    available_tally[tile as usize] -= 1;
-                } else {
-                    return_error!(format!(
-                        "too many tile {} (bag contains only {})",
-                        tile,
-                        alphabet.freq(tile),
-                    ));
-                }
-            } else if (!signed_tile as u8) < alphabet_len_without_blank {
-                // turn -1i8, -2i8 into 0x81u8, 0x82u8
-                board_tiles.push(0x81 + !signed_tile as u8);
-                // verify usage of blank tile
-                if available_tally[0] > 0 {
-                    available_tally[0] -= 1;
-                } else {
-                    return_error!(format!(
-                        "too many tile {} (bag contains only {})",
-                        0,
-                        alphabet.freq(0),
-                    ));
-                }
-            } else {
-                return_error!(format!(
-                    "board row {} col {} (0-based): invalid tile {}, alphabet size is {}",
-                    row_num, col_num, signed_tile, alphabet_len_without_blank
-                ));
-            }
-        }
-    }
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &req.rack, &req.board_tiles)
+        .map_err(err_to_str)?;
 
     let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
-
     let board_snapshot = &movegen::BoardSnapshot {
-        board_tiles: &board_tiles,
+        board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
         kwg: &kwg,
         klv: &klv,
     };
 
-    move_generator.gen_moves_unfiltered(board_snapshot, &question.rack, question.max_gen);
+    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen);
     let plays = &move_generator.plays;
+
     if false {
         console_log!("found {} moves", plays.len());
         for play in plays.iter() {
@@ -229,52 +171,243 @@ pub fn analyze(question_str: &str) -> Result<JsValue, JsValue> {
         }
     }
 
-    let mut result = Vec::with_capacity(plays.len());
-    for play in plays.iter() {
-        match &play.play {
-            movegen::Play::Exchange { tiles } => {
-                // tiles: array of numbers. 0 for blank, 1 for A.
-                result.push(JsonPlayWithEquity {
-                    equity: play.equity,
-                    play: JsonPlay::Exchange {
-                        tiles: tiles[..].into(),
-                    },
-                });
-            }
-            movegen::Play::Place {
-                down,
-                lane,
-                idx,
-                word,
-                score,
-            } => {
-                // turn 0x81u8, 0x82u8 into -1i8, -2i8
-                let word_played = word
-                    .iter()
-                    .map(|&x| {
-                        if x & 0x80 != 0 {
-                            -((x & !0x80) as i8)
-                        } else {
-                            x as i8
-                        }
-                    })
-                    .collect::<Vec<i8>>();
-                // across plays: down=false, lane=row, idx=col (0-based).
-                // down plays: down=true, lane=col, idx=row (0-based).
-                // word: 0 for play-through, 1 for A, -1 for blank-as-A.
-                result.push(JsonPlayWithEquity {
-                    equity: play.equity,
-                    play: JsonPlay::Play {
-                        down: *down,
-                        lane: *lane,
-                        idx: *idx,
-                        word: word_played.into(),
-                        score: *score,
-                    },
-                });
-            }
+    let result = plays
+        .iter()
+        .map(|x| x.into())
+        .collect::<Vec<kibitzer::JsonPlayWithEquity>>();
+
+    Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
+}
+
+#[wasm_bindgen]
+pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
+    let req = serde_json::from_str::<SimPrepareRequest>(req_str).map_err(err_to_str)?;
+
+    use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
+    use_wasm_cache!(klv, CACHED_KLV, &req.leave);
+    use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
+
+    if req.rack.len() > game_config.rack_size() as usize {
+        // It is intentional that analyze() doesn't enforce this.
+        return_js_error!(format!(
+            "rack: max {} tiles, found {} tiles",
+            game_config.rack_size(),
+            req.rack.len()
+        ));
+    }
+    if req.turn >= game_config.num_players() {
+        return_js_error!(format!(
+            "turn: must be >= 0 and < {}, found {}",
+            game_config.num_players(),
+            req.turn
+        ));
+    }
+    if req.rack_sizes.len() != game_config.num_players() as usize {
+        return_js_error!(format!(
+            "rack_sizes: length must be {}, found {}",
+            game_config.num_players(),
+            req.rack_sizes.len(),
+        ));
+    }
+    if !req
+        .rack_sizes
+        .iter()
+        .all(|&x| x <= game_config.rack_size() as u8)
+    {
+        return_js_error!(format!(
+            "rack_sizes: each element must be <= {}, found {:?}",
+            game_config.rack_size(),
+            req.rack_sizes,
+        ));
+    }
+    if req.rack_sizes[req.turn as usize] as usize != req.rack.len() {
+        return_js_error!(format!(
+            "rack_sizes[turn={}]={}, but rack length is {}",
+            req.turn,
+            req.rack_sizes[req.turn as usize],
+            req.rack.len(),
+        ));
+    }
+    if req.scores.len() != game_config.num_players() as usize {
+        return_js_error!(format!(
+            "scores: length must be {}, found {}",
+            game_config.num_players(),
+            req.scores.len(),
+        ));
+    }
+
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &req.rack, &req.board_tiles)
+        .map_err(err_to_str)?;
+
+    let mut game_state = game_state::GameState::new(&game_config);
+    game_state.turn = req.turn;
+    game_state.zero_turns = req.zero_turns;
+    game_state.players[req.turn as usize]
+        .rack
+        .extend_from_slice(&req.rack);
+    game_state
+        .board_tiles
+        .copy_from_slice(&kibitzer.board_tiles);
+    game_state.bag.0.clear();
+    game_state
+        .bag
+        .0
+        .reserve(kibitzer.available_tally.iter().map(|&x| x as usize).sum());
+    game_state.bag.0.extend(
+        (0u8..)
+            .zip(kibitzer.available_tally.iter())
+            .flat_map(|(tile, &count)| std::iter::repeat(tile).take(count as usize)),
+    );
+    RNG.with(|rng| {
+        game_state.bag.shuffle(&mut *rng.borrow_mut());
+    });
+    let bag_size = game_state.bag.0.len();
+    for i in 0..game_config.num_players() as usize {
+        game_state.players[i].score = req.scores[i];
+        if i != req.turn as usize {
+            game_state
+                .bag
+                .replenish(&mut game_state.players[i].rack, req.rack_sizes[i] as usize);
+        }
+        if game_state.players[i].rack.len() != req.rack_sizes[i] as usize {
+            return_js_error!(format!(
+                "unable to draw rack_sizes {:?} from {} unplayed tiles",
+                req.rack_sizes,
+                bag_size + req.rack.len(),
+            ));
         }
     }
 
-    Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
+    let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
+    let board_snapshot = &movegen::BoardSnapshot {
+        board_tiles: &kibitzer.board_tiles,
+        game_config: &game_config,
+        kwg: &kwg,
+        klv: &klv,
+    };
+    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen);
+
+    let mut sim_proc = SimProc {
+        initial_board_tiles: kibitzer.board_tiles,
+        game_config: game_config.clone(),
+        kwg: kwg.clone(),
+        klv: klv.clone(),
+        plays: std::mem::take(&mut move_generator.plays),
+        candidates: (0..move_generator.plays.len())
+            .map(|idx| Candidate {
+                play_index: idx,
+                stats: stats::Stats::new(),
+            })
+            .collect(),
+        simmer: simmer::Simmer::new(&game_config),
+        play_finder: Default::default(),
+    };
+    for (i, play) in sim_proc.plays.iter().enumerate() {
+        sim_proc.play_finder.insert(play.play.clone(), i);
+    }
+    sim_proc
+        .simmer
+        .prepare(&game_config, &game_state, req.num_sim_plies);
+
+    let mut sim_pid;
+    {
+        let mut sim_procs = SIM_PROCS.write().map_err(err_to_str)?;
+        sim_pid = sim_procs.len();
+        loop {
+            if let std::collections::hash_map::Entry::Vacant(entry) = sim_procs.entry(sim_pid) {
+                entry.insert(std::sync::Arc::new(std::sync::RwLock::new(sim_proc)));
+                break;
+            }
+            sim_pid -= 1;
+        }
+    }
+
+    Ok((sim_pid as f64).into())
+}
+
+#[wasm_bindgen]
+pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
+    let sim_procs_lock = SIM_PROCS.read().map_err(err_to_str)?;
+    let mut sim_proc = sim_procs_lock
+        .get(&sim_pid)
+        .ok_or("bad sim_pid")?
+        .write()
+        .map_err(err_to_str)?;
+
+    if false {
+        sim_proc.candidates.clear();
+        let _ = sim_proc.candidates.first().map(|x| &x.stats);
+    }
+
+    if false {
+        return Ok(format!(
+            "{:?}",
+            sim_proc
+                .candidates
+                .iter()
+                .map(|x| x.play_index)
+                .collect::<Box<_>>()
+        )
+        .into());
+    }
+
+    let plays = std::mem::take(&mut sim_proc.plays);
+    let game_config = sim_proc.game_config.clone();
+    let kwg = sim_proc.kwg.clone();
+    let klv = sim_proc.klv.clone();
+    if false {
+        console_log!("begin!");
+    }
+    let mut stats = stats::Stats::new();
+    for _num in 1..=1000 {
+        sim_proc.simmer.prepare_iteration();
+        for play in plays.iter() {
+            let game_ended = sim_proc
+                .simmer
+                .simulate(&game_config, &kwg, &klv, &play.play);
+            let final_spread = sim_proc.simmer.final_equity_spread();
+            let win_prob = sim_proc.simmer.compute_win_prob(game_ended, final_spread);
+            let sim_spread = final_spread - sim_proc.simmer.initial_score_spread as f32;
+            if false {
+                let board_snapshot = &movegen::BoardSnapshot {
+                    board_tiles: &sim_proc.initial_board_tiles,
+                    game_config: &sim_proc.game_config,
+                    kwg: &sim_proc.kwg,
+                    klv: &sim_proc.klv,
+                };
+                console_log!(
+                    "{} {} gets {}",
+                    play.equity,
+                    play.play.fmt(board_snapshot),
+                    sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
+                );
+            }
+            stats.update(sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage());
+        }
+    }
+    if false {
+        console_log!("end");
+        console_log!(
+            "c={} m={} sd={}",
+            stats.count(),
+            stats.mean(),
+            stats.standard_deviation()
+        );
+    }
+    sim_proc.plays = plays;
+
+    Ok(JsValue::NULL)
+}
+
+// true if dropped, false if did not exist
+#[wasm_bindgen]
+pub fn sim_drop(sim_pid: usize) -> Result<JsValue, JsValue> {
+    Ok(SIM_PROCS
+        .write()
+        .map_err(err_to_str)?
+        .remove(&sim_pid)
+        .is_some()
+        .into())
 }
