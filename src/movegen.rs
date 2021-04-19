@@ -1,6 +1,6 @@
 // Copyright (C) 2020-2021 Andy Kurnia.
 
-use super::{alphabet, bites, game_config, klv, kwg, matrix};
+use super::{alphabet, bites, display, fash, game_config, klv, kwg, matrix};
 
 #[derive(Clone)]
 struct CrossSet {
@@ -60,7 +60,7 @@ struct WorkingBuffer {
     rack_bits: u64, // bit 0 = blank conveniently matches bit 0 = have cross set
     descending_scores: Vec<i8>, // rack.len()
     exchange_buffer: Vec<u8>, // rack.len()
-    square_multipliers_by_aggregated_word_multipliers_buffer: std::collections::HashMap<i16, usize>,
+    square_multipliers_by_aggregated_word_multipliers_buffer: fash::MyHashMap<i16, usize>,
     precomputed_square_multiplier_buffer: Vec<i16>,
     indexes_to_descending_square_multiplier_buffer: Vec<i8>,
     best_leave_values: Vec<f32>, // rack.len() + 1
@@ -244,8 +244,7 @@ impl WorkingBuffer {
             rack_bits: 0,
             descending_scores: Vec::new(),
             exchange_buffer: Vec::new(),
-            square_multipliers_by_aggregated_word_multipliers_buffer:
-                std::collections::HashMap::new(),
+            square_multipliers_by_aggregated_word_multipliers_buffer: fash::MyHashMap::default(),
             precomputed_square_multiplier_buffer: Vec::new(),
             indexes_to_descending_square_multiplier_buffer: Vec::new(),
             best_leave_values: Vec::new(),
@@ -747,8 +746,7 @@ struct GenPlacePlacementsParams<'a> {
     perpendicular_scores_strip: &'a [i16],
     rack_bits: u64,
     descending_scores: &'a [i8],
-    square_multipliers_by_aggregated_word_multipliers_buffer:
-        &'a mut std::collections::HashMap<i16, usize>,
+    square_multipliers_by_aggregated_word_multipliers_buffer: &'a mut fash::MyHashMap<i16, usize>,
     precomputed_square_multiplier_buffer: &'a mut Vec<i16>,
     indexes_to_descending_square_multiplier_buffer: &'a mut Vec<i8>,
     best_leave_values: &'a [f32],
@@ -1663,9 +1661,9 @@ impl std::fmt::Display for WriteablePlay<'_> {
                 let dim = self.board_snapshot.game_config.board_layout().dim();
                 let alphabet = self.board_snapshot.game_config.alphabet();
                 if *down {
-                    write!(f, "{}{} ", (*lane as u8 + 0x41) as char, idx + 1)?;
+                    write!(f, "{}{} ", display::column(*lane), idx + 1)?;
                 } else {
-                    write!(f, "{}{} ", lane + 1, (*idx as u8 + 0x41) as char)?;
+                    write!(f, "{}{} ", lane + 1, display::column(*idx))?;
                 }
                 let strider = dim.lane(*down, *lane);
                 let mut inside = false;

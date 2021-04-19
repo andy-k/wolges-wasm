@@ -7,7 +7,7 @@ macro_rules! mod_many {
     $(#[allow(dead_code)] mod $mod;)+
   };
 }
-mod_many!(alphabet bites board_layout game_config klv kwg matrix movegen);
+mod_many!(alphabet bag bites board_layout display error fash game_config game_state game_timers klv kwg matrix movegen);
 
 macro_rules! return_error {
     ($error:expr) => {
