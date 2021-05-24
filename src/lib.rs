@@ -30,6 +30,10 @@ pub fn do_this_on_startup() {
         "CrosswordGame".into(),
         game_config::make_common_english_game_config().into(),
     );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog".into(),
+        game_config::make_jumbled_english_game_config().into(),
+    );
 }
 
 fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
