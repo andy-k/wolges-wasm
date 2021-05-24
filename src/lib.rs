@@ -183,7 +183,7 @@ pub fn analyze(req_str: &str) -> Result<JsValue, JsValue> {
     Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
 }
 
-#[wasm_bindgen]
+//#[wasm_bindgen]
 pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     let req = serde_json::from_str::<SimPrepareRequest>(req_str).map_err(err_to_str)?;
 
@@ -331,7 +331,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     Ok((sim_pid as f64).into())
 }
 
-#[wasm_bindgen]
+//#[wasm_bindgen]
 pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
     let sim_procs_lock = SIM_PROCS.read().map_err(err_to_str)?;
     let mut sim_proc = sim_procs_lock
@@ -406,7 +406,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
 }
 
 // true if dropped, false if did not exist
-#[wasm_bindgen]
+//#[wasm_bindgen]
 pub fn sim_drop(sim_pid: usize) -> Result<JsValue, JsValue> {
     Ok(SIM_PROCS
         .write()
