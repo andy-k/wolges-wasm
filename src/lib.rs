@@ -165,7 +165,7 @@ pub fn analyze(req_str: &str) -> Result<JsValue, JsValue> {
         klv: &klv,
     };
 
-    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen);
+    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen, true);
     let plays = &move_generator.plays;
 
     if false {
@@ -291,7 +291,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
         kwg: &kwg,
         klv: &klv,
     };
-    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen);
+    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen, true);
 
     let mut sim_proc = SimProc {
         initial_board_tiles: kibitzer.board_tiles,
