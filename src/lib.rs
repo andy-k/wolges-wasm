@@ -145,8 +145,8 @@ pub fn precache_klv(key: String, value: &[u8]) {
 }
 
 #[wasm_bindgen]
-pub fn analyze(req_str: &str) -> Result<JsValue, JsValue> {
-    let req = serde_json::from_str::<AnalyzeRequest>(req_str).map_err(err_to_str)?;
+pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
+    let req = serde_json::from_str::<AnalyzeRequest>(&req_str).map_err(err_to_str)?;
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
@@ -165,7 +165,17 @@ pub fn analyze(req_str: &str) -> Result<JsValue, JsValue> {
         klv: &klv,
     };
 
-    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen, false);
+    move_generator
+        .async_gen_moves_filtered(
+            board_snapshot,
+            &req.rack,
+            req.max_gen,
+            false,
+            |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i16, _rack_tally: &[u8]| true,
+            |leave_value: f32| leave_value,
+            || wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)),
+        )
+        .await;
     let plays = &move_generator.plays;
 
     if false {

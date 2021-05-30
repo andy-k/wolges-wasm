@@ -227,6 +227,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fba7978c679d53ce2d0ac80c8c175840feb849a161664365d1287b41f2e67f1"
+dependencies = [
+ "cfg-if 1.0.0",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "wasm-bindgen-macro"
 version = "0.2.74"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -271,11 +283,13 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "getrandom",
+ "js-sys",
  "lazy_static",
  "rand",
  "rand_chacha",
  "serde",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
