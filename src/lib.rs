@@ -11,7 +11,7 @@ macro_rules! mod_many {
     $(#[allow(dead_code)] mod $mod;)+
   };
 }
-mod_many!(alphabet bag bites board_layout display fash game_config game_state game_timers kibitzer klv kwg matrix movegen simmer stats);
+mod_many!(alphabet bag bites board_layout display fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats);
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
@@ -59,6 +59,31 @@ struct AnalyzeRequest {
     lexicon: String,
     leave: String,
     rules: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ScoreRequest {
+    rack: Vec<u8>,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    lexicon: String,
+    leave: String,
+    rules: String,
+    plays: Vec<kibitzer::JsonPlay>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(tag = "result")]
+pub enum ScoredPlay {
+    #[serde(rename = "error")]
+    Error { error: String },
+    #[serde(rename = "scored")]
+    Scored {
+        canonical: bool,
+        valid: bool,
+        #[serde(flatten)]
+        json_play_with_equity: kibitzer::JsonPlayWithEquity,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -189,6 +214,87 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
         .iter()
         .map(|x| x.into())
         .collect::<Vec<kibitzer::JsonPlayWithEquity>>();
+
+    Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
+}
+
+#[wasm_bindgen]
+pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
+    let req = serde_json::from_str::<ScoreRequest>(&req_str).map_err(err_to_str)?;
+
+    use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
+    use_wasm_cache!(klv, CACHED_KLV, &req.leave);
+    use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
+
+    let mut game_state = game_state::GameState::new(&game_config);
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &req.rack, &req.board_tiles)
+        .map_err(err_to_str)?;
+    game_state
+        .board_tiles
+        .copy_from_slice(&kibitzer.board_tiles);
+    game_state.bag.0.clear();
+    game_state
+        .bag
+        .0
+        .reserve(kibitzer.available_tally.iter().map(|&x| x as usize).sum());
+    game_state.bag.0.extend(
+        (0u8..)
+            .zip(kibitzer.available_tally.iter())
+            .flat_map(|(tile, &count)| std::iter::repeat(tile).take(count as usize)),
+    );
+    game_state.players[0].rack.clear();
+    game_state.players[0].rack.extend(&req.rack);
+
+    let board_snapshot = &movegen::BoardSnapshot {
+        board_tiles: &kibitzer.board_tiles,
+        game_config: &game_config,
+        kwg: &kwg,
+        klv: &klv,
+    };
+
+    let mut ps = play_scorer::PlayScorer::new();
+    let result = req
+        .plays
+        .iter()
+        .map(|json_play| {
+            let play = movegen::Play::from(json_play);
+            match ps.validate_play(board_snapshot, &game_state, &play) {
+                Err(err) => ScoredPlay::Error {
+                    error: err.to_string(),
+                },
+                Ok(adjusted_play) => {
+                    let is_canonical = adjusted_play.is_none();
+                    let mut canonical_play = adjusted_play.unwrap_or(play);
+                    let recounted_score = ps.compute_score(board_snapshot, &canonical_play);
+                    match canonical_play {
+                        movegen::Play::Exchange { .. } => {}
+                        movegen::Play::Place { ref mut score, .. } => {
+                            if *score != recounted_score {
+                                *score = recounted_score;
+                            }
+                        }
+                    };
+                    let recounted_equity = ps.compute_equity(
+                        board_snapshot,
+                        &game_state,
+                        &canonical_play,
+                        1.0,
+                        recounted_score,
+                    );
+                    ScoredPlay::Scored {
+                        canonical: is_canonical,
+                        valid: ps.words_are_valid(board_snapshot, &canonical_play),
+                        json_play_with_equity: kibitzer::JsonPlayWithEquity {
+                            equity: recounted_equity,
+                            play: (&canonical_play).into(),
+                        },
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>();
 
     Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
 }
