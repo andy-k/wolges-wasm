@@ -234,16 +234,27 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     game_state
         .board_tiles
         .copy_from_slice(&kibitzer.board_tiles);
+    let mut num_unseen_tiles = kibitzer
+        .available_tally
+        .iter()
+        .map(|&x| x as usize)
+        .sum::<usize>();
+    let mut unseen_tiles = (0u8..)
+        .zip(kibitzer.available_tally.iter())
+        .flat_map(|(tile, &count)| std::iter::repeat(tile).take(count as usize));
+    for i in 1..game_config.num_players() as usize {
+        let len_this_rack = std::cmp::min(num_unseen_tiles, game_config.rack_size() as usize);
+        let rack = &mut game_state.players[i].rack;
+        rack.clear();
+        rack.reserve(len_this_rack);
+        for _ in 0..len_this_rack {
+            rack.push(unseen_tiles.next().unwrap());
+        }
+        num_unseen_tiles -= len_this_rack;
+    }
     game_state.bag.0.clear();
-    game_state
-        .bag
-        .0
-        .reserve(kibitzer.available_tally.iter().map(|&x| x as usize).sum());
-    game_state.bag.0.extend(
-        (0u8..)
-            .zip(kibitzer.available_tally.iter())
-            .flat_map(|(tile, &count)| std::iter::repeat(tile).take(count as usize)),
-    );
+    game_state.bag.0.reserve(num_unseen_tiles);
+    game_state.bag.0.extend(unseen_tiles);
     game_state.players[0].rack.clear();
     game_state.players[0].rack.extend(&req.rack);
 
