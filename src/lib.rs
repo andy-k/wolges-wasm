@@ -118,11 +118,11 @@ struct SimProc {
     simmer: simmer::Simmer,
     plays: Vec<movegen::ValuedMove>,
     candidates: Vec<Candidate>,
-    play_finder: std::collections::HashMap<movegen::Play, usize>,
+    play_finder: fash::MyHashMap<movegen::Play, usize>,
 }
 
-type WasmCache<T> = std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<T>>>;
-type WasmCacheInt<T> = std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<T>>>;
+type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>>;
+type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
 lazy_static::lazy_static! {
     static ref CACHED_KWG: WasmCache<kwg::Kwg> = Default::default();
