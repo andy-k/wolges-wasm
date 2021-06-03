@@ -192,12 +192,15 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
 
     move_generator
         .async_gen_moves_filtered(
-            board_snapshot,
-            &req.rack,
-            req.max_gen,
-            false,
+            &movegen::GenMovesParams {
+                board_snapshot,
+                rack: &req.rack,
+                max_gen: req.max_gen,
+                always_include_pass: false,
+            },
             |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i16, _rack_tally: &[u8]| true,
             |leave_value: f32| leave_value,
+            |_equity: f32, _play: &movegen::Play| true,
             || wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)),
         )
         .await;
@@ -418,7 +421,12 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
         kwg: &kwg,
         klv: &klv,
     };
-    move_generator.gen_moves_unfiltered(board_snapshot, &req.rack, req.max_gen, false);
+    move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
+        board_snapshot,
+        rack: &req.rack,
+        max_gen: req.max_gen,
+        always_include_pass: false,
+    });
 
     let mut sim_proc = SimProc {
         initial_board_tiles: kibitzer.board_tiles,
