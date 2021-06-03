@@ -190,20 +190,55 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
         klv: &klv,
     };
 
-    move_generator
-        .async_gen_moves_filtered(
-            &movegen::GenMovesParams {
-                board_snapshot,
-                rack: &req.rack,
-                max_gen: req.max_gen,
-                always_include_pass: false,
-            },
-            |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i16, _rack_tally: &[u8]| true,
-            |leave_value: f32| leave_value,
-            |_equity: f32, _play: &movegen::Play| true,
-            || wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)),
-        )
-        .await;
+    {
+        let mut seen_moves = fash::MyHashSet::default();
+        let mut alpha_buf = Vec::new();
+        move_generator
+            .async_gen_moves_filtered(
+                &movegen::GenMovesParams {
+                    board_snapshot,
+                    rack: &req.rack,
+                    max_gen: req.max_gen,
+                    always_include_pass: false,
+                },
+                |_down: bool,
+                 _lane: i8,
+                 _idx: i8,
+                 _word: &[u8],
+                 _score: i16,
+                 _rack_tally: &[u8]| true,
+                |leave_value: f32| leave_value,
+                |equity: f32, play: &movegen::Play| match game_config.game_rules() {
+                    game_config::GameRules::Classic => true,
+                    game_config::GameRules::Jumbled => match play {
+                        movegen::Play::Exchange { .. } => true,
+                        movegen::Play::Place {
+                            down,
+                            lane,
+                            idx,
+                            word,
+                            score,
+                        } => {
+                            alpha_buf.clear();
+                            alpha_buf.extend_from_slice(word);
+                            alpha_buf.sort_unstable();
+                            seen_moves.insert((
+                                equity.to_bits(),
+                                movegen::Play::Place {
+                                    down: *down,
+                                    lane: *lane,
+                                    idx: *idx,
+                                    word: alpha_buf[..].into(),
+                                    score: *score,
+                                },
+                            ))
+                        }
+                    },
+                },
+                || wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)),
+            )
+            .await;
+    }
     let plays = &move_generator.plays;
 
     if false {
