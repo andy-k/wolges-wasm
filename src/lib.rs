@@ -81,6 +81,7 @@ pub enum ScoredPlay {
     Scored {
         canonical: bool,
         valid: bool,
+        invalid_words: Vec<Vec<u8>>,
         #[serde(flatten)]
         json_play_with_equity: kibitzer::JsonPlayWithEquity,
     },
@@ -304,6 +305,7 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     };
 
     let mut ps = play_scorer::PlayScorer::new();
+    let mut invalid_bites_buf = Vec::new();
     let result = req
         .plays
         .iter()
@@ -332,9 +334,15 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
                         1.0,
                         recounted_score,
                     );
+                    invalid_bites_buf.clear();
+                    ps.find_invalid_words(board_snapshot, &canonical_play, &mut invalid_bites_buf);
                     ScoredPlay::Scored {
                         canonical: is_canonical,
-                        valid: ps.words_are_valid(board_snapshot, &canonical_play),
+                        valid: invalid_bites_buf.is_empty(),
+                        invalid_words: invalid_bites_buf
+                            .iter()
+                            .map(|bites| bites[..].into())
+                            .collect(),
                         json_play_with_equity: kibitzer::JsonPlayWithEquity {
                             equity: recounted_equity,
                             play: (&canonical_play).into(),
