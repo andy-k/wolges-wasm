@@ -1,6 +1,6 @@
 // Copyright (C) 2020-2021 Andy Kurnia.
 
-use super::{error, game_config, game_state, move_filter, movegen};
+use super::{bites, error, game_config, game_state, move_filter, movegen};
 
 pub struct PlayScorer {
     rack_tally: Vec<u8>,
@@ -239,12 +239,11 @@ impl PlayScorer {
     }
 
     #[inline(always)]
-    pub fn classic_words_are_valid(
+    fn classic_words_checker<'a>(
         &mut self,
-        board_snapshot: &movegen::BoardSnapshot,
-        play: &movegen::Play,
-    ) -> bool {
-        self.words_all(board_snapshot, play, |word: &[u8]| {
+        board_snapshot: &'a movegen::BoardSnapshot,
+    ) -> impl FnMut(&[u8]) -> bool + 'a {
+        move |word: &[u8]| {
             let mut p = 0;
             for &tile in word {
                 p = board_snapshot.kwg.seek(p, tile);
@@ -253,16 +252,15 @@ impl PlayScorer {
                 }
             }
             board_snapshot.kwg[p].accepts()
-        })
+        }
     }
 
     #[inline(always)]
-    pub fn jumbled_words_are_valid(
+    fn jumbled_words_checker<'a>(
         &mut self,
-        board_snapshot: &movegen::BoardSnapshot,
-        play: &movegen::Play,
-    ) -> bool {
-        self.words_all(board_snapshot, play, |word: &[u8]| {
+        board_snapshot: &'a movegen::BoardSnapshot,
+    ) -> impl FnMut(&[u8]) -> bool + 'a {
+        move |word: &[u8]| {
             // doing this the slow way, with no additional space
             let mut p = 0;
             let mut current_min_tile = word.iter().min();
@@ -278,7 +276,7 @@ impl PlayScorer {
                 current_min_tile = word.iter().filter(|&&tile| tile > current_tile).min();
             }
             board_snapshot.kwg[p].accepts()
-        })
+        }
     }
 
     #[inline(always)]
@@ -288,9 +286,50 @@ impl PlayScorer {
         play: &movegen::Play,
     ) -> bool {
         match board_snapshot.game_config.game_rules() {
-            game_config::GameRules::Classic => self.classic_words_are_valid(board_snapshot, play),
-            game_config::GameRules::Jumbled => self.jumbled_words_are_valid(board_snapshot, play),
+            game_config::GameRules::Classic => {
+                let checker = self.classic_words_checker(board_snapshot);
+                self.words_all(board_snapshot, play, checker)
+            }
+            game_config::GameRules::Jumbled => {
+                let checker = self.jumbled_words_checker(board_snapshot);
+                self.words_all(board_snapshot, play, checker)
+            }
         }
+    }
+
+    #[inline(always)]
+    fn collect_invalid_words<'a>(
+        &mut self,
+        mut checker: impl FnMut(&[u8]) -> bool + 'a,
+        out: &'a mut Vec<bites::Bites>,
+    ) -> impl FnMut(&[u8]) -> bool + 'a {
+        move |word: &[u8]| {
+            if !checker(word) {
+                out.push(word.into());
+            }
+            true // always continue iterating
+        }
+    }
+
+    #[inline(always)]
+    pub fn find_invalid_words(
+        &mut self,
+        board_snapshot: &movegen::BoardSnapshot,
+        play: &movegen::Play,
+        invalid_words: &mut Vec<bites::Bites>,
+    ) {
+        match board_snapshot.game_config.game_rules() {
+            game_config::GameRules::Classic => {
+                let checker = self.classic_words_checker(board_snapshot);
+                let checker = self.collect_invalid_words(checker, invalid_words);
+                self.words_all(board_snapshot, play, checker)
+            }
+            game_config::GameRules::Jumbled => {
+                let checker = self.jumbled_words_checker(board_snapshot);
+                let checker = self.collect_invalid_words(checker, invalid_words);
+                self.words_all(board_snapshot, play, checker)
+            }
+        };
     }
 
     // Unused &mut self for future-proofing.
@@ -424,7 +463,6 @@ impl PlayScorer {
                 });
             }
         };
-        let leave_value = board_snapshot.klv.leave_value_from_tally(&self.rack_tally);
 
         let mut recounted_equity = recounted_score as f32;
         if game_state.bag.0.is_empty() {
@@ -452,6 +490,7 @@ impl PlayScorer {
                 recounted_equity += unplayed_tiles_bonus as f32;
             }
         } else {
+            let leave_value = board_snapshot.klv.leave_value_from_tally(&self.rack_tally);
             recounted_equity += leave_scale * leave_value;
             if !game_state.board_tiles.iter().any(|&tile| tile != 0) {
                 match play {
