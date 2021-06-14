@@ -305,7 +305,6 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     };
 
     let mut ps = play_scorer::PlayScorer::new();
-    let mut invalid_bites_buf = Vec::new();
     let result = req
         .plays
         .iter()
@@ -334,15 +333,14 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
                         1.0,
                         recounted_score,
                     );
-                    invalid_bites_buf.clear();
-                    ps.find_invalid_words(board_snapshot, &canonical_play, &mut invalid_bites_buf);
+                    let mut invalid_words = Vec::new();
+                    ps.find_invalid_words(board_snapshot, &canonical_play, |word| {
+                        invalid_words.push(word.into())
+                    });
                     ScoredPlay::Scored {
                         canonical: is_canonical,
-                        valid: invalid_bites_buf.is_empty(),
-                        invalid_words: invalid_bites_buf
-                            .iter()
-                            .map(|bites| bites[..].into())
-                            .collect(),
+                        valid: invalid_words.is_empty(),
+                        invalid_words,
                         json_play_with_equity: kibitzer::JsonPlayWithEquity {
                             equity: recounted_equity,
                             play: (&canonical_play).into(),
