@@ -26,6 +26,10 @@ macro_rules! return_js_error {
 #[wasm_bindgen(start)]
 pub fn do_this_on_startup() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+    CACHED_KLV.write().unwrap().insert(
+        "noleave".into(),
+        klv::Klv::from_bytes_alloc(klv::EMPTY_KLV_BYTES).into(),
+    );
     CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame".into(),
         game_config::make_common_english_game_config().into(),
@@ -33,6 +37,38 @@ pub fn do_this_on_startup() {
     CACHED_GAME_CONFIG.write().unwrap().insert(
         "WordSmog".into(),
         game_config::make_jumbled_english_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame/german".into(),
+        game_config::make_german_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog/german".into(),
+        game_config::make_jumbled_german_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame/norwegian".into(),
+        game_config::make_norwegian_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog/norwegian".into(),
+        game_config::make_jumbled_norwegian_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame/polish".into(),
+        game_config::make_polish_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog/polish".into(),
+        game_config::make_jumbled_polish_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame/spanish".into(),
+        game_config::make_spanish_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog/spanish".into(),
+        game_config::make_jumbled_spanish_game_config().into(),
     );
 }
 
