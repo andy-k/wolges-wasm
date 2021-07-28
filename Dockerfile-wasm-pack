@@ -1,4 +1,4 @@
-from liuchong/rustup:1.52.1
+from liuchong/rustup:1.53.0
 
 run ["cargo", "install", "wasm-pack"]
 run ["rustup", "target", "add", "wasm32-unknown-unknown"]
