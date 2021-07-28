@@ -452,11 +452,17 @@ impl WorkingBuffer {
     fn init_after_cross_sets(&mut self, board_snapshot: &BoardSnapshot<'_>) {
         let board_layout = board_snapshot.game_config.board_layout();
         let dim = board_layout.dim();
+        let premiums = board_layout.premiums();
+        let transposed_premiums = board_layout.transposed_premiums();
         for row in 0..dim.rows {
             let strip_range_start = (row as isize * dim.cols as isize) as usize;
             for col in 0..dim.cols {
                 let idx = strip_range_start + col as usize;
-                let cross_set = &self.cross_set_for_across_plays[idx];
+                let cross_set = &mut self.cross_set_for_across_plays[idx];
+                let premium = premiums[idx];
+                if premium.word_multiplier == 0 && premium.tile_multiplier == 0 {
+                    cross_set.bits = 1;
+                }
                 let effective_pwm = self.remaining_word_multipliers_for_across_plays[idx]
                     & -(cross_set.bits as i8 & 1);
                 self.perpendicular_word_multipliers_for_across_plays[idx] = effective_pwm;
@@ -468,7 +474,11 @@ impl WorkingBuffer {
             let strip_range_start = (col as isize * dim.rows as isize) as usize;
             for row in 0..dim.rows {
                 let idx = strip_range_start + row as usize;
-                let cross_set = &self.cross_set_for_down_plays[idx];
+                let cross_set = &mut self.cross_set_for_down_plays[idx];
+                let premium = transposed_premiums[idx];
+                if premium.word_multiplier == 0 && premium.tile_multiplier == 0 {
+                    cross_set.bits = 1;
+                }
                 let effective_pwm = self.remaining_word_multipliers_for_down_plays[idx]
                     & -(cross_set.bits as i8 & 1);
                 self.perpendicular_word_multipliers_for_down_plays[idx] = effective_pwm;
@@ -1160,9 +1170,9 @@ fn gen_place_placements<'a, PossibleStripPlacementCallbackType: FnMut(i8, i8, i8
         }
     }
 
-    let mut rightmost = strider_len as i8; // processed up to here
-    let mut leftmost = rightmost;
+    let mut leftmost = strider_len as i8; // processed up to here
     loop {
+        let mut rightmost = leftmost;
         while leftmost > 0 && params.board_strip[leftmost as usize - 1] == 0 {
             leftmost -= 1;
         }
@@ -1203,13 +1213,16 @@ fn gen_place_placements<'a, PossibleStripPlacementCallbackType: FnMut(i8, i8, i8
                 }
             }
         }
-        while leftmost > 0 && params.board_strip[leftmost as usize - 1] != 0 {
+        loop {
             leftmost -= 1;
+            if leftmost <= 1 {
+                // not enough room for 2-tile words
+                return;
+            }
+            if params.board_strip[leftmost as usize] == 0 {
+                break;
+            }
         }
-        if leftmost <= 1 {
-            break;
-        }
-        rightmost = leftmost - 1; // prevent touching leftmost tile
     }
 }
 
