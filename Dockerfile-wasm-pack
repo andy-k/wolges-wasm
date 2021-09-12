@@ -1,4 +1,4 @@
-from rust:1.54.0
+from rust:1.55.0
 
 run ["cargo", "install", "wasm-pack"]
 run ["rustup", "target", "add", "wasm32-unknown-unknown"]
