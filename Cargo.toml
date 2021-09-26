@@ -6,6 +6,7 @@ description = "wolges as wasm"
 edition = "2018"
 license = "MIT"
 repository = "https://github.com/andy-k/wolges-wasm"
+resolver = "2"
 
 [lib]
 crate-type = ["cdylib"]
