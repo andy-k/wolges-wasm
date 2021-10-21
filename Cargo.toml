@@ -12,7 +12,7 @@ resolver = "2"
 crate-type = ["cdylib"]
 
 [dependencies]
-console_error_panic_hook = "0.1.6"
+console_error_panic_hook = "0.1.7"
 getrandom = { version = "0.2.3", features = ["js"] }
 js-sys = "0.3.55"
 lazy_static = "1.4.0"
