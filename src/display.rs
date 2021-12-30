@@ -1,4 +1,4 @@
-// Copyright (C) 2020-2021 Andy Kurnia.
+// Copyright (C) 2020-2022 Andy Kurnia.
 
 use super::{alphabet, board_layout, game_config, game_state, game_timers};
 
@@ -64,6 +64,27 @@ pub fn str_to_column_usize(sb: &[u8]) -> Option<usize> {
         return None;
     }
     let c = sb[0];
+    if (0x41..=0x5a).contains(&c) {
+        let mut v = c as usize - 0x41;
+        for &c in sb[1..].iter() {
+            if (0x41..=0x5a).contains(&c) {
+                v = v.checked_mul(26)?.checked_add(c as usize - (0x41 - 26))?;
+            } else {
+                return None;
+            }
+        }
+        Some(v)
+    } else {
+        None
+    }
+}
+
+// Parses ColumnStr strings (passed as str.as_bytes()).
+pub fn str_to_column_usize_ignore_case(sb: &[u8]) -> Option<usize> {
+    if sb.is_empty() {
+        return None;
+    }
+    let c = sb[0] & !0x20;
     if (0x41..=0x5a).contains(&c) {
         let mut v = c as usize - 0x41;
         for &c in sb[1..].iter() {
