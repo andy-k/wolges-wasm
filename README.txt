@@ -10,7 +10,7 @@ Example usage may be found in Liwords project.
 
 LICENSE
 
-Copyright (C) 2020-2021 Andy Kurnia.
+Copyright (C) 2020-2022 Andy Kurnia.
 Released under the MIT license.
 
 
