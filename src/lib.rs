@@ -39,6 +39,14 @@ pub fn do_this_on_startup() {
         game_config::make_jumbled_english_game_config().into(),
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGameSuper".into(),
+        game_config::make_super_english_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmogSuper".into(),
+        game_config::make_jumbled_super_english_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame/french".into(),
         game_config::make_french_game_config().into(),
     );
