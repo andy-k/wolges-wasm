@@ -1,9 +1,5 @@
 // Copyright (C) 2020-2022 Andy Kurnia.
 
-// to remove after https://github.com/rustwasm/wasm-bindgen/pull/2778 is released.
-// see also: https://github.com/rustwasm/wasm-bindgen/issues/2774#issuecomment-1025883235
-#![allow(clippy::unused_unit)]
-
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
 
