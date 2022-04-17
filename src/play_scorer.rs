@@ -39,7 +39,7 @@ impl PlayScorer {
             movegen::Play::Exchange { tiles } => {
                 if tiles.is_empty() {
                     return Ok(None);
-                } else if game_state.bag.0.len() < game_config.rack_size() as usize {
+                } else if game_state.bag.0.len() < game_config.exchange_tile_limit() as usize {
                     return_error!("not enough tiles to allow exchanges".into());
                 }
 
@@ -88,7 +88,7 @@ impl PlayScorer {
                     return_error!("word is too short".into());
                 }
 
-                let (row, col) = if *down { (*lane, *idx) } else { (*idx, *lane) };
+                let (row, col) = if *down { (*idx, *lane) } else { (*lane, *idx) };
                 let board_layout = game_config.board_layout();
                 let dim = board_layout.dim();
                 if row < 0 || col < 0 || row >= dim.rows || col >= dim.cols {
