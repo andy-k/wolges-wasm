@@ -5,4 +5,8 @@ run ["rustup", "target", "add", "wasm32-unknown-unknown"]
 
 workdir /workdir
 
+# for webpack
 cmd ["wasm-pack", "build"]
+
+# for deno
+cmd ["wasm-pack", "build", "-t", "web", "-d", "pkg-web"]
