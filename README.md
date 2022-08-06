@@ -1,4 +1,6 @@
-ABOUT
+# Wolges-wasm
+
+## About
 
 Wolges-wasm provides Wolges as a wasm.
 
@@ -7,19 +9,20 @@ Both Wolges and Wolges-wasm are released under the MIT license.
 
 Example usage may be found in Liwords project.
 
+## License
 
-LICENSE
-
-Copyright (C) 2020-2022 Andy Kurnia.
+Copyright (C) 2020-2022 Andy Kurnia.\
 Released under the MIT license.
 
-
-RELATED PROJECTS
+## Related Projects
 
 - https://github.com/andy-k/wolges
 - https://github.com/domino14/liwords
 
-
-REFERENCES
+## References
 
 - https://developer.mozilla.org/en-US/docs/WebAssembly/Rust_to_wasm
+
+## GitHub Badge
+
+- [![Rust](https://github.com/andy-k/wolges-wasm/actions/workflows/rust.yml/badge.svg)](https://github.com/andy-k/wolges-wasm/actions/workflows/rust.yml)
