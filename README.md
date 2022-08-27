@@ -25,4 +25,4 @@ Released under the MIT license.
 
 ## GitHub Badge
 
-- [![Rust](https://github.com/andy-k/wolges-wasm/actions/workflows/rust.yml/badge.svg)](https://github.com/andy-k/wolges-wasm/actions/workflows/rust.yml)
+- [![Actions](https://github.com/andy-k/wolges-wasm/actions/workflows/actions.yml/badge.svg)](https://github.com/andy-k/wolges-wasm/actions/workflows/actions.yml)
