@@ -89,7 +89,7 @@ pub fn do_this_on_startup() {
 }
 
 fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
-    format!("{:?}", x)
+    format!("{x:?}")
 }
 
 // tile numbering follows alphabet order (not necessarily unicode order).
