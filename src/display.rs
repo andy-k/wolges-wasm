@@ -45,6 +45,11 @@ pub struct ColumnStr(usize);
 
 impl std::fmt::Display for ColumnStr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.width().is_some() {
+            // allocates, but no choice.
+            #[allow(clippy::recursive_format_impl)]
+            return f.pad(&format!("{self}"));
+        }
         if self.0 >= 26 {
             // usize::MAX is about 26**14 so recursion may be ok.
             write!(f, "{}", Self(self.0 / 26 - 1))?;
@@ -109,38 +114,55 @@ struct BoardPrinter<'a> {
 
 impl std::fmt::Display for BoardPrinter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "  ")?;
-        for c in 0..self.board_layout.dim().cols {
-            write!(f, " {}", column(c))?;
+        if f.width().is_some() {
+            // allocates, but no choice.
+            #[allow(clippy::recursive_format_impl)]
+            return f.pad(&format!("{self}"));
+        }
+        let ncols: i8 = self.board_layout.dim().cols;
+        let max_col_label_width = 1 + ((ncols > 26) as usize);
+        let nrows: i8 = self.board_layout.dim().rows;
+        let max_row_num_width = 1 + ((nrows >= 10) as usize) + ((nrows >= 100) as usize);
+        let max_tile_width = self.alphabet.widest_label_len();
+        let w = max_col_label_width.max(max_tile_width);
+        write!(f, "{:max_row_num_width$}", "")?;
+        for c in 0..ncols {
+            write!(f, " {:^w$}", column(c))?;
         }
         writeln!(f)?;
-        write!(f, "  +")?;
-        for _ in 1..self.board_layout.dim().cols {
-            write!(f, "--")?;
+        write!(f, "{:max_row_num_width$}+", "")?;
+        for _ in 0..ncols {
+            write!(f, "{:-<w$}", "")?;
         }
-        writeln!(f, "-+")?;
-        for r in 0..self.board_layout.dim().rows {
-            write!(f, "{:2}|", r + 1)?;
-            for c in 0..self.board_layout.dim().cols {
+        for _ in 1..ncols {
+            write!(f, "-")?;
+        }
+        writeln!(f, "+")?;
+        for r in 0..nrows {
+            write!(f, "{:max_row_num_width$}|", r + 1)?;
+            for c in 0..ncols {
                 if c > 0 {
                     write!(f, " ")?
                 }
                 write!(
                     f,
-                    "{}",
+                    "{:^w$}",
                     board_label(self.alphabet, self.board_layout, self.board_tiles, r, c)
                 )?;
             }
             writeln!(f, "|{}", r + 1)?;
         }
-        write!(f, "  +")?;
-        for _ in 1..self.board_layout.dim().cols {
-            write!(f, "--")?;
+        write!(f, "{:max_row_num_width$}+", "")?;
+        for _ in 0..ncols {
+            write!(f, "{:-<w$}", "")?;
         }
-        writeln!(f, "-+")?;
-        write!(f, "  ")?;
-        for c in 0..self.board_layout.dim().cols {
-            write!(f, " {}", column(c))?;
+        for _ in 1..ncols {
+            write!(f, "-")?;
+        }
+        writeln!(f, "+")?;
+        write!(f, "{:max_row_num_width$}", "")?;
+        for c in 0..ncols {
+            write!(f, " {:^w$}", column(c))?;
         }
         writeln!(f)?;
         Ok(())
@@ -170,6 +192,11 @@ pub struct BoardFenner<'a> {
 
 impl std::fmt::Display for BoardFenner<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.width().is_some() {
+            // allocates, but no choice.
+            #[allow(clippy::recursive_format_impl)]
+            return f.pad(&format!("{self}"));
+        }
         let mut p = 0usize;
         for r in 0..self.board_layout.dim().rows {
             if r > 0 {
@@ -299,6 +326,11 @@ struct MsPrinter {
 
 impl std::fmt::Display for MsPrinter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.width().is_some() {
+            // allocates, but no choice.
+            #[allow(clippy::recursive_format_impl)]
+            return f.pad(&format!("{self}"));
+        }
         let mut ms = self.ms;
         if ms < 0 {
             write!(f, "-")?;
@@ -321,6 +353,11 @@ struct GameStatePrinter<'a> {
 
 impl std::fmt::Display for GameStatePrinter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.width().is_some() {
+            // allocates, but no choice.
+            #[allow(clippy::recursive_format_impl)]
+            return f.pad(&format!("{self}"));
+        }
         writeln!(
             f,
             "{}{}\nPool {}: {}",
