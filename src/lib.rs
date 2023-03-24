@@ -32,7 +32,7 @@ pub fn do_this_on_startup() {
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame".into(),
-        game_config::make_common_english_game_config().into(),
+        game_config::make_english_game_config().into(),
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
         "WordSmog".into(),
@@ -169,7 +169,7 @@ struct SimPrepareRequest {
     num_sim_plies: usize,
     turn: u8,
     rack_sizes: Vec<u8>,
-    scores: Vec<i16>,
+    scores: Vec<i32>,
     zero_turns: u16,
 }
 
@@ -274,7 +274,7 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
                  _lane: i8,
                  _idx: i8,
                  _word: &[u8],
-                 _score: i16,
+                 _score: i32,
                  _rack_tally: &[u8]| true,
                 |leave_value: f32| leave_value,
                 |equity: f32, play: &movegen::Play| match game_config.game_rules() {

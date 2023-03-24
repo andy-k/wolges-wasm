@@ -107,8 +107,8 @@ impl<'a> Alphabet<'a> {
         }
     }
 
-    pub fn rack_score(&self, rack: &[u8]) -> i16 {
-        rack.iter().map(|&t| self.score(t) as i16).sum::<i16>()
+    pub fn rack_score(&self, rack: &[u8]) -> i32 {
+        rack.iter().map(|&t| self.score(t) as i32).sum::<i32>()
     }
 }
 
@@ -498,7 +498,7 @@ pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
             tile!("A", "a", 12, 1, 1),
             tile!("B", "b", 2, 3, 0),
             tile!("C", "c", 4, 3, 0),
-            tile!("CH", "ch", 1, 5, 0),
+            tile!("[CH]", "[ch]", 1, 5, 0),
             tile!("D", "d", 5, 2, 0),
             tile!("E", "e", 12, 1, 1),
             tile!("F", "f", 1, 4, 0),
@@ -507,7 +507,7 @@ pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
             tile!("I", "i", 6, 1, 1),
             tile!("J", "j", 1, 8, 0),
             tile!("L", "l", 4, 1, 0),
-            tile!("LL", "ll", 1, 8, 0),
+            tile!("[LL]", "[ll]", 1, 8, 0),
             tile!("M", "m", 2, 3, 0),
             tile!("N", "n", 5, 1, 0),
             tile!("Ñ", "ñ", 1, 8, 0),
@@ -515,7 +515,7 @@ pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
             tile!("P", "p", 2, 3, 0),
             tile!("Q", "q", 1, 5, 0),
             tile!("R", "r", 5, 1, 0),
-            tile!("RR", "rr", 1, 8, 0),
+            tile!("[RR]", "[rr]", 1, 8, 0),
             tile!("S", "s", 6, 1, 0),
             tile!("T", "t", 4, 1, 0),
             tile!("U", "u", 5, 1, 1),
@@ -569,19 +569,28 @@ impl<'a> AlphabetReader<'a> {
         }
     }
 
-    // Recognizes [A-Z].
+    // Recognizes [A-Z] and [a-z] identically.
     pub fn new_for_words(alphabet: &Alphabet<'a>) -> Self {
-        let supported_tiles = (1..alphabet.len())
-            .map(|tile| (tile, alphabet.of_rack(tile).unwrap().as_bytes()))
-            .collect::<Box<_>>();
+        let mut supported_tiles = Vec::with_capacity((alphabet.len() - 1) as usize * 2);
+        for base_tile in 1..alphabet.len() {
+            for &tile in &[base_tile, base_tile | 0x80] {
+                supported_tiles.push((base_tile, alphabet.of_board(tile).unwrap().as_bytes()));
+            }
+        }
+        let supported_tiles = supported_tiles.into_boxed_slice();
         Self::new_for_tiles(supported_tiles)
     }
 
-    // Recognizes [?A-Z].
+    // Recognizes [?A-Z] and [a-z] identically.
     pub fn new_for_racks(alphabet: &Alphabet<'a>) -> Self {
-        let supported_tiles = (0..alphabet.len())
-            .map(|tile| (tile, alphabet.of_rack(tile).unwrap().as_bytes()))
-            .collect::<Box<_>>();
+        let mut supported_tiles = Vec::with_capacity(alphabet.len() as usize * 2 - 1);
+        supported_tiles.push((0, alphabet.of_rack(0).unwrap().as_bytes()));
+        for base_tile in 1..alphabet.len() {
+            for &tile in &[base_tile, base_tile | 0x80] {
+                supported_tiles.push((base_tile, alphabet.of_board(tile).unwrap().as_bytes()));
+            }
+        }
+        let supported_tiles = supported_tiles.into_boxed_slice();
         Self::new_for_tiles(supported_tiles)
     }
 
@@ -623,5 +632,29 @@ impl<'a> AlphabetReader<'a> {
             return if_single.map(|tile| (tile, ix + 1));
         }
         None
+    }
+
+    #[inline(always)]
+    pub fn set_word(&self, s: &str, v: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        v.clear();
+        self.append_word(s, v)
+    }
+
+    #[inline(always)]
+    pub fn append_word(&self, s: &str, v: &mut Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        if !s.is_empty() {
+            v.reserve(s.len());
+            let sb = s.as_bytes();
+            let mut ix = 0;
+            while ix < sb.len() {
+                if let Some((tile, end_ix)) = self.next_tile(sb, ix) {
+                    v.push(tile);
+                    ix = end_ix;
+                } else {
+                    crate::return_error!(format!("invalid tile after {v:?} in {s:?}"));
+                }
+            }
+        }
+        Ok(())
     }
 }
