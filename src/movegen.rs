@@ -504,7 +504,7 @@ fn gen_classic_cross_set<'a>(
     cross_sets: &'a mut [CrossSet],
     output_strider: matrix::Strider,
     cross_set_buffer: &'a mut [CrossSetComputation],
-    mut cached_cross_sets: &'a mut [CachedCrossSet],
+    cached_cross_sets: &'a mut [CachedCrossSet],
 ) {
     let len = output_strider.len();
     let step = output_strider.step() as usize;
@@ -2029,17 +2029,14 @@ impl Eq for ValuedMove {}
 impl PartialOrd for ValuedMove {
     #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        other.equity.partial_cmp(&self.equity)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for ValuedMove {
     #[inline(always)]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.partial_cmp(other) {
-            Some(x) => x,
-            None => std::cmp::Ordering::Equal,
-        }
+        other.equity.total_cmp(&self.equity)
     }
 }
 
