@@ -44,12 +44,12 @@ impl Kwg {
         let mut elts = Vec::with_capacity(kwg_len);
         let mut r = 0;
         for _ in 0..kwg_len {
-            elts.push(Node(u32::from_le(
+            elts.push(Node(
                 buf[r] as u32
                     | (buf[r + 1] as u32) << 8
                     | (buf[r + 2] as u32) << 16
                     | (buf[r + 3] as u32) << 24,
-            )));
+            ));
             r += 4;
         }
         Kwg(elts.into_boxed_slice())
@@ -175,14 +175,15 @@ impl Kwg {
                 return !0;
             }
             let mut node = self[p];
+            idx += word_counts[p as usize];
             while node.tile() != tile {
                 if node.is_end() {
                     return !0;
                 }
-                idx += word_counts[p as usize] - word_counts[p as usize + 1];
                 p += 1;
                 node = self[p];
             }
+            idx -= word_counts[p as usize];
             if remaining == 0 {
                 return idx | ((node.accepts() as i32 - 1) as u32);
             }
@@ -204,14 +205,15 @@ impl Kwg {
         if let Some(mut tile) = iter.next() {
             while p != 0 {
                 let mut node = self[p];
+                idx += word_counts[p as usize];
                 while node.tile() != tile {
                     if node.is_end() {
                         return !0;
                     }
-                    idx += word_counts[p as usize] - word_counts[p as usize + 1];
                     p += 1;
                     node = self[p];
                 }
+                idx -= word_counts[p as usize];
                 match iter.next() {
                     Some(t) => {
                         tile = t;
