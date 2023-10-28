@@ -270,12 +270,7 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
                     max_gen: req.max_gen,
                     always_include_pass: false,
                 },
-                |_down: bool,
-                 _lane: i8,
-                 _idx: i8,
-                 _word: &[u8],
-                 _score: i32,
-                 _rack_tally: &[u8]| true,
+                |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
                 |leave_value: f32| leave_value,
                 |equity: f32, play: &movegen::Play| match game_config.game_rules() {
                     game_config::GameRules::Classic => true,

@@ -58,7 +58,6 @@ struct WorkingBuffer {
     transposed_board_tiles: Box<[u8]>,                 // c*r
     num_tiles_on_board: u16,
     num_tiles_in_bag: i16, // negative when players also have less than full racks
-    play_out_bonus: i32,
     num_tiles_on_rack: u8,
     rack_bits: u64, // bit 0 = blank conveniently matches bit 0 = have cross set
     multi_leaves: klv::MultiLeaves,
@@ -111,7 +110,6 @@ impl Clone for WorkingBuffer {
             transposed_board_tiles: self.transposed_board_tiles.clone(),
             num_tiles_on_board: self.num_tiles_on_board,
             num_tiles_in_bag: self.num_tiles_in_bag,
-            play_out_bonus: self.play_out_bonus,
             num_tiles_on_rack: self.num_tiles_on_rack,
             rack_bits: self.rack_bits,
             multi_leaves: self.multi_leaves.clone(),
@@ -171,7 +169,6 @@ impl Clone for WorkingBuffer {
         self.num_tiles_on_board
             .clone_from(&source.num_tiles_on_board);
         self.num_tiles_in_bag.clone_from(&source.num_tiles_in_bag);
-        self.play_out_bonus.clone_from(&source.play_out_bonus);
         self.num_tiles_on_rack.clone_from(&source.num_tiles_on_rack);
         self.rack_bits.clone_from(&source.rack_bits);
         self.multi_leaves.clone_from(&source.multi_leaves);
@@ -249,7 +246,6 @@ impl WorkingBuffer {
             transposed_board_tiles: vec![0u8; rows_times_cols].into_boxed_slice(),
             num_tiles_on_board: 0,
             num_tiles_in_bag: 0,
-            play_out_bonus: 0,
             num_tiles_on_rack: 0,
             rack_bits: 0,
             multi_leaves: klv::MultiLeaves::new(),
@@ -346,8 +342,8 @@ impl WorkingBuffer {
             - (self.num_tiles_on_board as i16
                 + board_snapshot.game_config.num_players() as i16
                     * board_snapshot.game_config.rack_size() as i16);
-        self.play_out_bonus = if self.num_tiles_in_bag <= 0 {
-            2 * ((0u8..)
+        let play_out_bonus = if self.num_tiles_in_bag <= 0 {
+            (2 * ((0u8..)
                 .zip(self.rack_tally.iter())
                 .map(|(tile, &num)| {
                     (alphabet.freq(tile) as i32 - num as i32) * alphabet.score(tile) as i32
@@ -357,9 +353,9 @@ impl WorkingBuffer {
                     .board_tiles
                     .iter()
                     .map(|&t| if t != 0 { alphabet.score(t) as i32 } else { 0 })
-                    .sum::<i32>())
+                    .sum::<i32>())) as f32
         } else {
-            0
+            0.0
         };
 
         // eg if my rack is ZY??YVA it'd be [10,4,4,4,1,0,0].
@@ -369,8 +365,23 @@ impl WorkingBuffer {
             self.num_tiles_on_rack += count;
             self.rack_bits |= ((count != 0) as u64) << tile;
         }
-        self.multi_leaves
-            .init(&mut self.rack_tally, board_snapshot.klv, adjust_leave_value);
+        if self.num_tiles_in_bag <= 0 {
+            self.multi_leaves.init(
+                &self.rack_tally,
+                board_snapshot.klv,
+                false,
+                adjust_leave_value,
+            );
+            self.multi_leaves
+                .init_endgame_leaves(|tile| alphabet.score(tile), play_out_bonus);
+        } else {
+            self.multi_leaves.init(
+                &self.rack_tally,
+                board_snapshot.klv,
+                true,
+                adjust_leave_value,
+            );
+        }
         self.descending_scores.clear();
         self.descending_scores
             .reserve(self.num_tiles_on_rack as usize);
@@ -386,15 +397,16 @@ impl WorkingBuffer {
         self.descending_scores.reverse();
 
         if self.num_tiles_in_bag <= 0 {
+            // the multi_leaves is correct but doing this directly is faster.
             self.best_leave_values.clear();
             self.best_leave_values
                 .resize(self.num_tiles_on_rack as usize + 1, f32::NEG_INFINITY);
-            let mut unpaid = 0i32;
+            let mut unplayed = 0i32;
             for i in (0..self.num_tiles_on_rack).rev() {
-                unpaid += self.descending_scores[i as usize] as i32;
-                self.best_leave_values[i as usize] = (-10 - 2 * unpaid) as f32;
+                unplayed += self.descending_scores[i as usize] as i32;
+                self.best_leave_values[i as usize] = (-10 - 2 * unplayed) as f32;
             }
-            self.best_leave_values[self.num_tiles_on_rack as usize] = self.play_out_bonus as f32;
+            self.best_leave_values[self.num_tiles_on_rack as usize] = play_out_bonus;
         } else {
             self.multi_leaves
                 .extract_raw_best_leave_values(&mut self.best_leave_values);
@@ -1189,7 +1201,7 @@ fn gen_place_placements<'a, PossibleStripPlacementCallbackType: FnMut(i8, i8, i8
     }
 }
 
-struct GenPlaceMovesParams<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])> {
+struct GenPlaceMovesParams<'a, CallbackType: FnMut(i8, &[u8], i32, f32)> {
     board_snapshot: &'a BoardSnapshot<'a>,
     board_strip: &'a [u8],
     cross_set_strip: &'a [CrossSet],
@@ -1205,27 +1217,29 @@ struct GenPlaceMovesParams<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])> {
     leftmost: i8,
     rightmost: i8,
     callback: CallbackType,
+    multi_leaves: &'a klv::MultiLeaves,
     used_letters_tally: &'a mut [u8], // jumbled mode only
 }
 
-fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, f32)>(
     params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
     single_tile_plays: bool,
 ) {
-    struct Env<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])> {
+    struct Env<'a, CallbackType: FnMut(i8, &[u8], i32, f32)> {
         params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
         alphabet: &'a alphabet::Alphabet<'a>,
         num_played: i8,
         idx_left: i8,
     }
 
-    fn record<CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+    fn record<CallbackType: FnMut(i8, &[u8], i32, f32)>(
         env: &mut Env<'_, CallbackType>,
         idx_left: i8,
         idx_right: i8,
         main_score: i32,
         perpendicular_cumulative_score: i32,
         word_multiplier: i32,
+        leave_idx: u32,
     ) {
         let score = main_score * word_multiplier
             + perpendicular_cumulative_score
@@ -1238,17 +1252,19 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
             idx_left,
             &env.params.word_strip_buffer[idx_left as usize..idx_right as usize],
             score,
-            env.params.rack_tally,
+            env.params.multi_leaves.leave_value(leave_idx),
         );
     }
 
-    fn play_right<CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+    #[allow(clippy::too_many_arguments)]
+    fn play_right<CallbackType: FnMut(i8, &[u8], i32, f32)>(
         env: &mut Env<'_, CallbackType>,
         mut idx: i8,
         mut p: i32,
         mut main_score: i32,
         perpendicular_cumulative_score: i32,
         word_multiplier: i32,
+        leave_idx: u32,
         mut is_unique: bool,
     ) {
         // tail-recurse placing current sequence of tiles
@@ -1277,6 +1293,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                 main_score,
                 perpendicular_cumulative_score,
                 word_multiplier,
+                leave_idx,
             );
         }
         if env.num_played as u8 >= env.params.num_max_played {
@@ -1323,6 +1340,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                 + perpendicular_score
                                 + tile_value * perpendicular_word_multiplier as i32,
                             new_word_multiplier,
+                            leave_idx - env.params.multi_leaves.place_value(tile),
                             is_unique,
                         );
                         env.num_played -= 1;
@@ -1343,6 +1361,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                 + perpendicular_score
                                 + tile_value * perpendicular_word_multiplier as i32,
                             new_word_multiplier,
+                            leave_idx - env.params.multi_leaves.place_value(0),
                             is_unique,
                         );
                         env.num_played -= 1;
@@ -1357,13 +1376,15 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
         }
     }
 
-    fn play_left<CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+    #[allow(clippy::too_many_arguments)]
+    fn play_left<CallbackType: FnMut(i8, &[u8], i32, f32)>(
         env: &mut Env<'_, CallbackType>,
         mut idx: i8,
         mut p: i32,
         mut main_score: i32,
         perpendicular_cumulative_score: i32,
         word_multiplier: i32,
+        leave_idx: u32,
         mut is_unique: bool,
     ) {
         // tail-recurse placing current sequence of tiles
@@ -1389,6 +1410,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                 main_score,
                 perpendicular_cumulative_score,
                 word_multiplier,
+                leave_idx,
             );
         }
         if env.num_played as u8 >= env.params.num_max_played {
@@ -1411,6 +1433,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                 main_score,
                 perpendicular_cumulative_score,
                 word_multiplier,
+                leave_idx,
                 is_unique,
             );
             if node.is_end() {
@@ -1455,6 +1478,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                 + perpendicular_score
                                 + tile_value * perpendicular_word_multiplier as i32,
                             new_word_multiplier,
+                            leave_idx - env.params.multi_leaves.place_value(tile),
                             is_unique,
                         );
                         env.num_played -= 1;
@@ -1475,6 +1499,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                 + perpendicular_score
                                 + tile_value * perpendicular_word_multiplier as i32,
                             new_word_multiplier,
+                            leave_idx - env.params.multi_leaves.place_value(0),
                             is_unique,
                         );
                         env.num_played -= 1;
@@ -1491,6 +1516,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
 
     let alphabet = params.board_snapshot.game_config.alphabet();
     let anchor = params.anchor;
+    let pass_leave_idx = params.multi_leaves.pass_leave_idx();
     play_left(
         &mut Env {
             params,
@@ -1503,28 +1529,30 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
         0,
         0,
         1,
+        pass_leave_idx,
         single_tile_plays,
     );
 }
 
-fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, f32)>(
     params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
     single_tile_plays: bool,
 ) {
-    struct Env<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])> {
+    struct Env<'a, CallbackType: FnMut(i8, &[u8], i32, f32)> {
         params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
         alphabet: &'a alphabet::Alphabet<'a>,
         num_played: i8,
         idx_left: i8,
     }
 
-    fn record_if_valid<CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+    fn record_if_valid<CallbackType: FnMut(i8, &[u8], i32, f32)>(
         env: &mut Env<'_, CallbackType>,
         idx_left: i8,
         idx_right: i8,
         main_score: i32,
         perpendicular_cumulative_score: i32,
         word_multiplier: i32,
+        leave_idx: u32,
     ) {
         if env
             .params
@@ -1543,17 +1571,18 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                 idx_left,
                 &env.params.word_strip_buffer[idx_left as usize..idx_right as usize],
                 score,
-                env.params.rack_tally,
+                env.params.multi_leaves.leave_value(leave_idx),
             );
         }
     }
 
-    fn play_right<CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+    fn play_right<CallbackType: FnMut(i8, &[u8], i32, f32)>(
         env: &mut Env<'_, CallbackType>,
         mut idx: i8,
         mut main_score: i32,
         perpendicular_cumulative_score: i32,
         word_multiplier: i32,
+        leave_idx: u32,
         mut is_unique: bool,
     ) {
         let orig_idx = idx;
@@ -1578,6 +1607,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                 main_score,
                 perpendicular_cumulative_score,
                 word_multiplier,
+                leave_idx,
             );
         }
         if (env.num_played as u8) < env.params.num_max_played && idx < env.params.rightmost {
@@ -1615,6 +1645,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                     + perpendicular_score
                                     + tile_value * perpendicular_word_multiplier as i32,
                                 new_word_multiplier,
+                                leave_idx - env.params.multi_leaves.place_value(tile),
                                 is_unique,
                             );
                             env.params.used_letters_tally[tile as usize] -= 1;
@@ -1636,6 +1667,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                     + perpendicular_score
                                     + tile_value * perpendicular_word_multiplier as i32,
                                 new_word_multiplier,
+                                leave_idx - env.params.multi_leaves.place_value(0),
                                 is_unique,
                             );
                             env.params.used_letters_tally[tile as usize] -= 1;
@@ -1653,12 +1685,13 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
         }
     }
 
-    fn play_left<CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+    fn play_left<CallbackType: FnMut(i8, &[u8], i32, f32)>(
         env: &mut Env<'_, CallbackType>,
         mut idx: i8,
         mut main_score: i32,
         perpendicular_cumulative_score: i32,
         word_multiplier: i32,
+        leave_idx: u32,
         mut is_unique: bool,
     ) {
         let orig_idx = idx;
@@ -1680,6 +1713,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                 main_score,
                 perpendicular_cumulative_score,
                 word_multiplier,
+                leave_idx,
             );
         }
         if (env.num_played as u8) < env.params.num_max_played {
@@ -1691,6 +1725,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                     main_score,
                     perpendicular_cumulative_score,
                     word_multiplier,
+                    leave_idx,
                     is_unique,
                 );
             }
@@ -1730,6 +1765,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                         + perpendicular_score
                                         + tile_value * perpendicular_word_multiplier as i32,
                                     new_word_multiplier,
+                                    leave_idx - env.params.multi_leaves.place_value(tile),
                                     is_unique,
                                 );
                                 env.params.used_letters_tally[tile as usize] -= 1;
@@ -1752,6 +1788,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
                                         + perpendicular_score
                                         + tile_value * perpendicular_word_multiplier as i32,
                                     new_word_multiplier,
+                                    leave_idx - env.params.multi_leaves.place_value(0),
                                     is_unique,
                                 );
                                 env.params.used_letters_tally[tile as usize] -= 1;
@@ -1772,6 +1809,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
 
     let alphabet = params.board_snapshot.game_config.alphabet();
     let anchor = params.anchor;
+    let pass_leave_idx = params.multi_leaves.pass_leave_idx();
     play_left(
         &mut Env {
             params,
@@ -1783,12 +1821,13 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
         0,
         0,
         1,
+        pass_leave_idx,
         single_tile_plays,
     );
 }
 
 #[inline(always)]
-fn gen_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
+fn gen_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, f32)>(
     params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
     single_tile_plays: bool,
 ) {
@@ -1798,9 +1837,10 @@ fn gen_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, &[u8])>(
     }
 }
 
-fn gen_place_moves_at<'a, FoundPlaceMove: FnMut(bool, i8, i8, &[u8], i32, &[u8])>(
+fn gen_place_moves_at<'a, FoundPlaceMove: FnMut(bool, i8, i8, &[u8], i32, f32)>(
     board_snapshot: &'a BoardSnapshot<'a>,
     working_buffer: &mut WorkingBuffer,
+    multi_leaves: &'a klv::MultiLeaves,
     placement: &PossiblePlacement,
     max_rack_size: u8,
     mut found_place_move: FoundPlaceMove,
@@ -1872,9 +1912,17 @@ fn gen_place_moves_at<'a, FoundPlaceMove: FnMut(bool, i8, i8, &[u8], i32, &[u8])
             anchor: placement.anchor,
             leftmost: placement.leftmost,
             rightmost: placement.rightmost,
-            callback: |idx: i8, word: &[u8], score: i32, rack_tally: &[u8]| {
-                found_place_move(placement.down, placement.lane, idx, word, score, rack_tally)
+            callback: |idx: i8, word: &[u8], score: i32, leave_value: f32| {
+                found_place_move(
+                    placement.down,
+                    placement.lane,
+                    idx,
+                    word,
+                    score,
+                    leave_value,
+                )
             },
+            multi_leaves,
             used_letters_tally: &mut working_buffer.used_letters_tally,
         },
         !placement.down,
@@ -2136,9 +2184,10 @@ impl KurniaMoveGenerator {
 
         let working_buffer = &mut self.working_buffer;
         working_buffer.init(board_snapshot, rack, &|leave_value: f32| leave_value);
+        let multi_leaves = std::mem::take(&mut working_buffer.multi_leaves);
 
         let found_place_move =
-            |down: bool, lane: i8, idx: i8, word: &[u8], score: i32, _rack_tally: &[u8]| {
+            |down: bool, lane: i8, idx: i8, word: &[u8], score: i32, _leave_value: f32| {
                 vec_moves.borrow_mut().push(ValuedMove {
                     equity: 0.0,
                     play: Play::Place {
@@ -2151,7 +2200,7 @@ impl KurniaMoveGenerator {
                 });
             };
 
-        let found_exchange_move = |_rack_tally: &[u8], exchanged_tiles: &[u8]| {
+        let found_exchange_move = |exchanged_tiles: &[u8], _leave_value: f32| {
             vec_moves.borrow_mut().push(ValuedMove {
                 equity: 0.0,
                 play: Play::Exchange {
@@ -2160,25 +2209,35 @@ impl KurniaMoveGenerator {
             });
         };
 
-        kurnia_gen_place_moves_iter(
+        for _ in kurnia_gen_place_moves_iter(
             true,
             board_snapshot,
             working_buffer,
+            &multi_leaves,
             found_place_move,
             |_best_possible_equity: f32| true,
-        )
-        .for_each(|_| ());
-        kurnia_gen_nonplace_moves_except_pass(board_snapshot, working_buffer, found_exchange_move);
+        ) {}
+        kurnia_gen_exchange_moves(
+            board_snapshot,
+            working_buffer,
+            &multi_leaves,
+            found_exchange_move,
+        );
         if always_include_pass || vec_moves.borrow().is_empty() {
-            found_exchange_move(&working_buffer.rack_tally, &working_buffer.exchange_buffer);
+            found_exchange_move(
+                &working_buffer.exchange_buffer,
+                multi_leaves.pass_leave_value(),
+            );
         }
 
         self.plays = vec_moves.into_inner();
+
+        let _ = std::mem::replace(&mut working_buffer.multi_leaves, multi_leaves);
     }
 
     pub async fn async_gen_moves_filtered<
         'a,
-        PlaceMovePredicate: FnMut(bool, i8, i8, &[u8], i32, &[u8]) -> bool,
+        PlaceMovePredicate: FnMut(bool, i8, i8, &[u8], i32) -> bool,
         AdjustLeaveValue: Fn(f32) -> f32,
         EquityPredicate: FnMut(f32, &Play) -> bool,
         BreatheFuture: std::future::Future,
@@ -2228,30 +2287,10 @@ impl KurniaMoveGenerator {
         working_buffer.init(params.board_snapshot, params.rack, &adjust_leave_value);
         let multi_leaves = std::mem::take(&mut working_buffer.multi_leaves);
         let num_tiles_on_board = working_buffer.num_tiles_on_board;
-        let num_tiles_in_bag = working_buffer.num_tiles_in_bag;
-        let play_out_bonus = working_buffer.play_out_bonus;
-
-        let leave_value_from_tally = |rack_tally: &[u8]| {
-            if num_tiles_in_bag <= 0 {
-                let played_out = rack_tally.iter().all(|&num| num == 0);
-                (if played_out {
-                    play_out_bonus
-                } else {
-                    -10 - 2
-                        * (0u8..)
-                            .zip(rack_tally)
-                            .map(|(tile, num)| *num as i32 * alphabet.score(tile) as i32)
-                            .sum::<i32>()
-                }) as f32
-            } else {
-                multi_leaves.leave_value_from_tally(rack_tally)
-            }
-        };
 
         let found_place_move =
-            |down: bool, lane: i8, idx: i8, word: &[u8], score: i32, rack_tally: &[u8]| {
-                if place_move_predicate(down, lane, idx, word, score, rack_tally) {
-                    let leave_value = leave_value_from_tally(rack_tally);
+            |down: bool, lane: i8, idx: i8, word: &[u8], score: i32, leave_value: f32| {
+                if place_move_predicate(down, lane, idx, word, score) {
                     let other_adjustments = if num_tiles_on_board == 0 {
                         (idx..)
                             .zip(word)
@@ -2282,12 +2321,12 @@ impl KurniaMoveGenerator {
                 }
             };
 
-        let found_exchange_move = |rack_tally: &[u8], exchanged_tiles: &[u8]| {
+        let found_exchange_move = |exchanged_tiles: &[u8], leave_value: f32| {
             push_move(
                 &found_moves,
                 &equity_pred,
                 params.max_gen,
-                leave_value_from_tally(rack_tally),
+                leave_value,
                 || Play::Exchange {
                     tiles: exchanged_tiles.into(),
                 },
@@ -2304,18 +2343,23 @@ impl KurniaMoveGenerator {
             false,
             params.board_snapshot,
             working_buffer,
+            &multi_leaves,
             found_place_move,
             can_accept,
         ) {
             breathe().await;
         }
-        kurnia_gen_nonplace_moves_except_pass(
+        kurnia_gen_exchange_moves(
             params.board_snapshot,
             working_buffer,
+            &multi_leaves,
             found_exchange_move,
         );
         if params.always_include_pass || found_moves.borrow().is_empty() {
-            found_exchange_move(&working_buffer.rack_tally, &working_buffer.exchange_buffer);
+            found_exchange_move(
+                &working_buffer.exchange_buffer,
+                multi_leaves.pass_leave_value(),
+            );
         }
 
         self.plays = found_moves.into_inner().into_vec();
@@ -2326,7 +2370,7 @@ impl KurniaMoveGenerator {
 
     pub fn gen_moves_filtered<
         'a,
-        PlaceMovePredicate: FnMut(bool, i8, i8, &[u8], i32, &[u8]) -> bool,
+        PlaceMovePredicate: FnMut(bool, i8, i8, &[u8], i32) -> bool,
         AdjustLeaveValue: Fn(f32) -> f32,
         EquityPredicate: FnMut(f32, &Play) -> bool,
     >(
@@ -2374,30 +2418,10 @@ impl KurniaMoveGenerator {
         working_buffer.init(params.board_snapshot, params.rack, &adjust_leave_value);
         let multi_leaves = std::mem::take(&mut working_buffer.multi_leaves);
         let num_tiles_on_board = working_buffer.num_tiles_on_board;
-        let num_tiles_in_bag = working_buffer.num_tiles_in_bag;
-        let play_out_bonus = working_buffer.play_out_bonus;
-
-        let leave_value_from_tally = |rack_tally: &[u8]| {
-            if num_tiles_in_bag <= 0 {
-                let played_out = rack_tally.iter().all(|&num| num == 0);
-                (if played_out {
-                    play_out_bonus
-                } else {
-                    -10 - 2
-                        * (0u8..)
-                            .zip(rack_tally)
-                            .map(|(tile, num)| *num as i32 * alphabet.score(tile) as i32)
-                            .sum::<i32>()
-                }) as f32
-            } else {
-                multi_leaves.leave_value_from_tally(rack_tally)
-            }
-        };
 
         let found_place_move =
-            |down: bool, lane: i8, idx: i8, word: &[u8], score: i32, rack_tally: &[u8]| {
-                if place_move_predicate(down, lane, idx, word, score, rack_tally) {
-                    let leave_value = leave_value_from_tally(rack_tally);
+            |down: bool, lane: i8, idx: i8, word: &[u8], score: i32, leave_value: f32| {
+                if place_move_predicate(down, lane, idx, word, score) {
                     let other_adjustments = if num_tiles_on_board == 0 {
                         (idx..)
                             .zip(word)
@@ -2428,12 +2452,12 @@ impl KurniaMoveGenerator {
                 }
             };
 
-        let found_exchange_move = |rack_tally: &[u8], exchanged_tiles: &[u8]| {
+        let found_exchange_move = |exchanged_tiles: &[u8], leave_value: f32| {
             push_move(
                 &found_moves,
                 &equity_pred,
                 params.max_gen,
-                leave_value_from_tally(rack_tally),
+                leave_value,
                 || Play::Exchange {
                     tiles: exchanged_tiles.into(),
                 },
@@ -2446,21 +2470,25 @@ impl KurniaMoveGenerator {
                 && borrowed.peek().unwrap().equity >= best_possible_equity);
         };
 
-        kurnia_gen_place_moves_iter(
+        for _ in kurnia_gen_place_moves_iter(
             false,
             params.board_snapshot,
             working_buffer,
+            &multi_leaves,
             found_place_move,
             can_accept,
-        )
-        .for_each(|_| ());
-        kurnia_gen_nonplace_moves_except_pass(
+        ) {}
+        kurnia_gen_exchange_moves(
             params.board_snapshot,
             working_buffer,
+            &multi_leaves,
             found_exchange_move,
         );
         if params.always_include_pass || found_moves.borrow().is_empty() {
-            found_exchange_move(&working_buffer.rack_tally, &working_buffer.exchange_buffer);
+            found_exchange_move(
+                &working_buffer.exchange_buffer,
+                multi_leaves.pass_leave_value(),
+            );
         }
 
         self.plays = found_moves.into_inner().into_vec();
@@ -2473,73 +2501,38 @@ impl KurniaMoveGenerator {
     pub fn gen_moves_unfiltered<'a>(&mut self, params: &'a GenMovesParams<'a>) {
         self.gen_moves_filtered(
             params,
-            |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32, _rack_tally: &[u8]| true,
+            |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
             |leave_value: f32| leave_value,
             |_equity: f32, _play: &Play| true,
         );
     }
 }
 
-fn kurnia_gen_nonplace_moves_except_pass<'a, FoundExchangeMove: FnMut(&[u8], &[u8])>(
+fn kurnia_gen_exchange_moves<'a, FoundExchangeMove: FnMut(&[u8], f32)>(
     board_snapshot: &'a BoardSnapshot<'a>,
     working_buffer: &mut WorkingBuffer,
+    multi_leaves: &klv::MultiLeaves,
     found_exchange_move: FoundExchangeMove,
 ) {
-    working_buffer.exchange_buffer.clear(); // should be no-op
-    struct ExchangeEnv<'a, FoundExchangeMove: FnMut(&[u8], &[u8])> {
-        found_exchange_move: FoundExchangeMove,
-        rack_tally: &'a mut [u8],
-        exchange_buffer: &'a mut Vec<u8>,
-        max_vec_len: usize,
-    }
-    fn generate_exchanges<FoundExchangeMove: FnMut(&[u8], &[u8])>(
-        env: &mut ExchangeEnv<'_, FoundExchangeMove>,
-        mut idx: u8,
-    ) {
-        let rack_tally_len = env.rack_tally.len();
-        while (idx as usize) < rack_tally_len && env.rack_tally[idx as usize] == 0 {
-            idx += 1;
-        }
-        if idx as usize >= rack_tally_len {
-            if !env.exchange_buffer.is_empty() {
-                (env.found_exchange_move)(env.rack_tally, env.exchange_buffer);
-            }
-            return;
-        }
-        let original_count = env.rack_tally[idx as usize];
-        let vec_len = env.exchange_buffer.len();
-        loop {
-            generate_exchanges(env, idx + 1);
-            if env.rack_tally[idx as usize] == 0 || env.exchange_buffer.len() >= env.max_vec_len {
-                break;
-            }
-            env.rack_tally[idx as usize] -= 1;
-            env.exchange_buffer.push(idx);
-        }
-        env.rack_tally[idx as usize] = original_count;
-        env.exchange_buffer.truncate(vec_len);
-    }
     if working_buffer.num_tiles_in_bag >= board_snapshot.game_config.exchange_tile_limit() {
-        generate_exchanges(
-            &mut ExchangeEnv {
-                found_exchange_move,
-                rack_tally: &mut working_buffer.rack_tally,
-                exchange_buffer: &mut working_buffer.exchange_buffer,
-                max_vec_len: working_buffer.num_tiles_in_bag as usize,
-            },
-            0,
+        multi_leaves.kurnia_gen_exchange_moves_unconditionally(
+            found_exchange_move,
+            &mut working_buffer.rack_tally,
+            &mut working_buffer.exchange_buffer,
+            working_buffer.num_tiles_in_bag as usize,
         );
     }
 }
 
 fn kurnia_gen_place_moves_iter<
     'a,
-    FoundPlaceMove: 'a + FnMut(bool, i8, i8, &[u8], i32, &[u8]),
+    FoundPlaceMove: 'a + FnMut(bool, i8, i8, &[u8], i32, f32),
     CanAccept: 'a + Fn(f32) -> bool,
 >(
     want_raw: bool,
     board_snapshot: &'a BoardSnapshot<'a>,
     working_buffer: &'a mut WorkingBuffer,
+    multi_leaves: &'a klv::MultiLeaves,
     mut found_place_move: FoundPlaceMove,
     can_accept: CanAccept,
 ) -> impl 'a + Iterator {
@@ -2700,6 +2693,7 @@ fn kurnia_gen_place_moves_iter<
                 gen_place_moves_at(
                     board_snapshot,
                     working_buffer,
+                    multi_leaves,
                     &placement,
                     max_rack_size,
                     &mut found_place_move,
