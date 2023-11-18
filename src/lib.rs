@@ -102,6 +102,14 @@ pub fn do_this_on_startup() {
         "WordSmog/spanish".into(),
         game_config::make_jumbled_spanish_game_config().into(),
     );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame/yupik".into(),
+        game_config::make_yupik_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog/yupik".into(),
+        game_config::make_jumbled_yupik_game_config().into(),
+    );
 }
 
 fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
