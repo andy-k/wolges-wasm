@@ -257,6 +257,7 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
         game_config: &game_config,
         kwg: &kwg,
         klv: &klv,
+        kwg_representative: None,
     };
 
     {
@@ -365,6 +366,7 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
         game_config: &game_config,
         kwg: &kwg,
         klv: &klv,
+        kwg_representative: None,
     };
 
     let mut ps = play_scorer::PlayScorer::new();
@@ -524,6 +526,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
         game_config: &game_config,
         kwg: &kwg,
         klv: &klv,
+        kwg_representative: None,
     };
     move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
         board_snapshot,
@@ -619,6 +622,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
                     game_config: &sim_proc.game_config,
                     kwg: &sim_proc.kwg,
                     klv: &sim_proc.klv,
+                    kwg_representative: None,
                 };
                 console_log!(
                     "{} {} gets {}",
