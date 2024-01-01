@@ -15,8 +15,9 @@ pub struct StaticAlphabet<'a> {
     tiles: &'a [Tile<'a>],
     widest_label_len: usize, // in codepoints for now (graphemes is too complex)
     num_tiles: u16,
-    same_score_tile: Vec<u8>,
-    same_score_tile_bits: Vec<u64>,
+    same_score_tile: Box<[u8]>,
+    same_score_tile_bits: Box<[u64]>,
+    tiles_by_descending_scores: Box<[u8]>,
 }
 
 pub enum Alphabet<'a> {
@@ -26,14 +27,10 @@ pub enum Alphabet<'a> {
 impl<'a> Alphabet<'a> {
     pub fn new_static(x: StaticAlphabet<'a>) -> Self {
         let num_letters = x.tiles.len() as u8;
-        let mut same_score_tile = Vec::from_iter(0..num_letters);
+        let mut same_score_tile = Box::from_iter(0..num_letters);
         let mut same_score_tile_bits = Vec::with_capacity(num_letters as usize);
-        if num_letters != 0 {
-            same_score_tile_bits.push(1);
-        }
-        // 0 is never same as others, to prevent unexpected behavior.
         // sameness is defined only by same scores (is_vowel may mismatch).
-        for i in 1..num_letters {
+        for i in 0..num_letters {
             if same_score_tile[i as usize] == i {
                 let mut b = 1u64 << i;
                 let v = x.tiles[i as usize].score;
@@ -44,11 +41,27 @@ impl<'a> Alphabet<'a> {
                     }
                 }
                 same_score_tile_bits.push(b);
+                if i == 0 && b != 1 {
+                    // blank has same score as something else, use one of those.
+                    // this keeps the gaddag builder working.
+                    let v = (b & !1).trailing_zeros() as u8;
+                    while b != 0 {
+                        same_score_tile[b.trailing_zeros() as usize] = v;
+                        b &= b - 1; // turn off lowest bit
+                    }
+                }
             } else {
                 same_score_tile_bits
                     .push(same_score_tile_bits[same_score_tile[i as usize] as usize]);
             }
         }
+        let mut tiles_by_descending_scores = Box::from_iter(0..num_letters);
+        tiles_by_descending_scores.sort_unstable_by(|&a, &b| {
+            x.tiles[b as usize]
+                .score
+                .cmp(&x.tiles[a as usize].score)
+                .then(a.cmp(&b))
+        });
         Self::Static(StaticAlphabet {
             widest_label_len: x.tiles.iter().fold(0, |acc, tile| {
                 acc.max(tile.label.chars().count())
@@ -56,7 +69,8 @@ impl<'a> Alphabet<'a> {
             }),
             num_tiles: x.tiles.iter().map(|tile| tile.freq as u16).sum(),
             same_score_tile,
-            same_score_tile_bits,
+            same_score_tile_bits: same_score_tile_bits.into_boxed_slice(),
+            tiles_by_descending_scores,
             ..x
         })
     }
@@ -153,6 +167,13 @@ impl<'a> Alphabet<'a> {
                     x.same_score_tile_bits[idx as usize]
                 }
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn tiles_by_descending_scores(&self) -> &[u8] {
+        match self {
+            Alphabet::Static(x) => &x.tiles_by_descending_scores[..],
         }
     }
 
