@@ -13,13 +13,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1.7"
-getrandom = { version = "0.2.11", features = ["js"] }
-js-sys = "0.3.66"
+getrandom = { version = "0.2.12", features = ["js"] }
+js-sys = "0.3.67"
 lazy_static = "1.4.0"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
-serde = { version = "1.0.193", features = ["derive"] }
-serde_json = "1.0.109"
-wasm-bindgen = "0.2.89"
-wasm-bindgen-futures = "0.4.39"
-web-sys = { version = "0.3.66", features = ["console"] }
+serde = { version = "1.0.195", features = ["derive"] }
+serde_json = "1.0.111"
+wasm-bindgen = "0.2.90"
+wasm-bindgen-futures = "0.4.40"
+web-sys = { version = "0.3.67", features = ["console"] }
