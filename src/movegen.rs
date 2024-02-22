@@ -2448,9 +2448,10 @@ impl KurniaMoveGenerator {
             let play = construct_play();
             if equity_pred.borrow_mut()(equity, &play) {
                 if borrowed.len() >= max_gen {
-                    borrowed.pop();
+                    *borrowed.peek_mut().unwrap() = ValuedMove { equity, play };
+                } else {
+                    borrowed.push(ValuedMove { equity, play });
                 }
-                borrowed.push(ValuedMove { equity, play });
             }
         }
 
@@ -2533,8 +2534,7 @@ impl KurniaMoveGenerator {
             );
         }
 
-        self.plays = found_moves.into_inner().into_vec();
-        self.plays.sort_unstable();
+        self.plays = found_moves.into_inner().into_sorted_vec();
 
         let _ = std::mem::replace(&mut working_buffer.multi_leaves, multi_leaves);
     }
@@ -2579,9 +2579,10 @@ impl KurniaMoveGenerator {
             let play = construct_play();
             if equity_pred.borrow_mut()(equity, &play) {
                 if borrowed.len() >= max_gen {
-                    borrowed.pop();
+                    *borrowed.peek_mut().unwrap() = ValuedMove { equity, play };
+                } else {
+                    borrowed.push(ValuedMove { equity, play });
                 }
-                borrowed.push(ValuedMove { equity, play });
             }
         }
 
@@ -2662,8 +2663,7 @@ impl KurniaMoveGenerator {
             );
         }
 
-        self.plays = found_moves.into_inner().into_vec();
-        self.plays.sort_unstable();
+        self.plays = found_moves.into_inner().into_sorted_vec();
 
         let _ = std::mem::replace(&mut working_buffer.multi_leaves, multi_leaves);
     }
