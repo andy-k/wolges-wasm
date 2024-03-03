@@ -1,6 +1,6 @@
 // Copyright (C) 2020-2024 Andy Kurnia.
 
-use super::{alphabet, bites, display, fash, game_config, klv, kwg, matrix};
+use super::{alphabet, bites, display, game_config, klv, kwg, matrix};
 
 #[derive(Clone)]
 struct CrossSet {
@@ -63,9 +63,9 @@ struct WorkingBuffer {
     num_tiles_on_rack: u8,
     rack_bits: u64, // bit 0 = blank conveniently matches bit 0 = have cross set
     multi_leaves: klv::MultiLeaves,
-    descending_scores: Vec<i8>, // rack.len()
-    exchange_buffer: Vec<u8>,   // rack.len()
-    square_multipliers_by_aggregated_word_multipliers_buffer: fash::MyHashMap<i32, usize>,
+    descending_scores: Vec<i8>,            // rack.len()
+    exchange_buffer: Vec<u8>,              // rack.len(), or max(word length) with word prune
+    aggregated_word_multipliers: Vec<i32>, // sorted, unique, O(n) insertion but n is tiny.
     precomputed_square_multiplier_buffer: Vec<i32>,
     indexes_to_descending_square_multiplier_buffer: Vec<i8>,
     best_leave_values: Vec<f32>, // rack.len() + 1
@@ -119,9 +119,7 @@ impl Clone for WorkingBuffer {
             multi_leaves: self.multi_leaves.clone(),
             descending_scores: self.descending_scores.clone(),
             exchange_buffer: self.exchange_buffer.clone(),
-            square_multipliers_by_aggregated_word_multipliers_buffer: self
-                .square_multipliers_by_aggregated_word_multipliers_buffer
-                .clone(),
+            aggregated_word_multipliers: self.aggregated_word_multipliers.clone(),
             precomputed_square_multiplier_buffer: self.precomputed_square_multiplier_buffer.clone(),
             indexes_to_descending_square_multiplier_buffer: self
                 .indexes_to_descending_square_multiplier_buffer
@@ -180,8 +178,8 @@ impl Clone for WorkingBuffer {
         self.multi_leaves.clone_from(&source.multi_leaves);
         self.descending_scores.clone_from(&source.descending_scores);
         self.exchange_buffer.clone_from(&source.exchange_buffer);
-        self.square_multipliers_by_aggregated_word_multipliers_buffer
-            .clone_from(&source.square_multipliers_by_aggregated_word_multipliers_buffer);
+        self.aggregated_word_multipliers
+            .clone_from(&source.aggregated_word_multipliers);
         self.precomputed_square_multiplier_buffer
             .clone_from(&source.precomputed_square_multiplier_buffer);
         self.indexes_to_descending_square_multiplier_buffer
@@ -197,7 +195,7 @@ impl Clone for WorkingBuffer {
 }
 
 impl WorkingBuffer {
-    fn new(game_config: &game_config::GameConfig<'_>) -> Self {
+    fn new(game_config: &game_config::GameConfig) -> Self {
         let dim = game_config.board_layout().dim();
         let rows_times_cols = (dim.rows as isize * dim.cols as isize) as usize;
         Self {
@@ -260,7 +258,7 @@ impl WorkingBuffer {
             multi_leaves: klv::MultiLeaves::new(),
             descending_scores: Vec::new(),
             exchange_buffer: Vec::new(),
-            square_multipliers_by_aggregated_word_multipliers_buffer: fash::MyHashMap::default(),
+            aggregated_word_multipliers: Vec::new(),
             precomputed_square_multiplier_buffer: Vec::new(),
             indexes_to_descending_square_multiplier_buffer: Vec::new(),
             best_leave_values: Vec::new(),
@@ -425,13 +423,6 @@ impl WorkingBuffer {
             self.best_leave_values[i as usize] +=
                 board_snapshot.game_config.num_played_bonus(i) as f32;
         }
-        self.used_letters_tally.clear();
-        match board_snapshot.game_config.game_rules() {
-            game_config::GameRules::Classic => {}
-            game_config::GameRules::Jumbled => {
-                self.used_letters_tally.resize(alphabet.len() as usize, 0);
-            }
-        }
         self.used_tile_scores.clear();
         self.used_tile_scores.reserve(rack.len());
         self.used_tile_scores_buffer.clear();
@@ -439,6 +430,14 @@ impl WorkingBuffer {
     }
 
     fn init_after_cross_sets(&mut self, board_snapshot: &BoardSnapshot<'_>) {
+        let alphabet = board_snapshot.game_config.alphabet();
+        self.used_letters_tally.clear();
+        match board_snapshot.game_config.game_rules() {
+            game_config::GameRules::Classic => {}
+            game_config::GameRules::Jumbled => {
+                self.used_letters_tally.resize(alphabet.len() as usize, 0);
+            }
+        }
         let board_layout = board_snapshot.game_config.board_layout();
         let dim = board_layout.dim();
         let premiums = board_layout.premiums();
@@ -496,7 +495,7 @@ impl WorkingBuffer {
 // kwg must be Gaddawg for Classic, AlphaDawg for Jumbled.
 pub struct BoardSnapshot<'a> {
     pub board_tiles: &'a [u8],
-    pub game_config: &'a game_config::GameConfig<'a>,
+    pub game_config: &'a game_config::GameConfig,
     pub kwg: &'a kwg::Kwg,
     pub klv: &'a klv::Klv,
 }
@@ -869,7 +868,7 @@ fn gen_cross_set<'a>(
 
 struct GenPlacePlacementsParams<'a> {
     board_strip: &'a [u8],
-    alphabet: &'a alphabet::Alphabet<'a>,
+    alphabet: &'a alphabet::Alphabet,
     rack_tally: &'a mut [u8],
     used_tile_scores: &'a mut Vec<i8>,
     used_tile_scores_buffer: &'a mut Vec<i8>,
@@ -882,7 +881,7 @@ struct GenPlacePlacementsParams<'a> {
     perpendicular_scores_strip: &'a [i32],
     rack_bits: u64,
     descending_scores: &'a [i8],
-    square_multipliers_by_aggregated_word_multipliers_buffer: &'a mut fash::MyHashMap<i32, usize>,
+    aggregated_word_multipliers: &'a mut Vec<i32>,
     precomputed_square_multiplier_buffer: &'a mut Vec<i32>,
     indexes_to_descending_square_multiplier_buffer: &'a mut Vec<i8>,
     best_leave_values: &'a [f32],
@@ -898,36 +897,40 @@ fn gen_place_placements<'a, PossibleStripPlacementCallbackType: FnMut(i8, i8, i8
     let strider_len = params.board_strip.len();
 
     if !want_raw {
-        params
-            .square_multipliers_by_aggregated_word_multipliers_buffer
-            .clear();
-        let mut vec_size = 0usize;
+        params.aggregated_word_multipliers.clear();
+        // each contiguous subsequence of multiple 1s needs to be processed just once.
+        let mut last_was_one = false;
         for i in 0..strider_len {
-            let mut wm = 1;
-            for &wm_val in &params.remaining_word_multipliers_strip[i..strider_len] {
-                wm *= wm_val as i32;
-                if let std::collections::hash_map::Entry::Vacant(entry) = params
-                    .square_multipliers_by_aggregated_word_multipliers_buffer
-                    .entry(wm)
-                {
-                    entry.insert(vec_size);
-                    vec_size += strider_len;
+            let mut wm = params.remaining_word_multipliers_strip[i] as i32;
+            if last_was_one && wm == 1 {
+                continue;
+            }
+            last_was_one = wm == 1;
+            if let Err(idx) = params.aggregated_word_multipliers.binary_search(&wm) {
+                params.aggregated_word_multipliers.insert(idx, wm);
+            }
+            for &wm_val in &params.remaining_word_multipliers_strip[i + 1..strider_len] {
+                if wm_val != 1 {
+                    // wm_val == 1 is frequent.
+                    wm *= wm_val as i32;
+                    // monotonically increasing only if all multipliers are positive.
+                    if let Err(idx) = params.aggregated_word_multipliers.binary_search(&wm) {
+                        params.aggregated_word_multipliers.insert(idx, wm);
+                    }
                 }
             }
         }
-        params.precomputed_square_multiplier_buffer.clear();
+        let vec_size = strider_len * params.aggregated_word_multipliers.len();
         params
             .precomputed_square_multiplier_buffer
             .resize(vec_size, 0);
         params
             .indexes_to_descending_square_multiplier_buffer
-            .clear();
-        params
-            .indexes_to_descending_square_multiplier_buffer
             .resize(vec_size, 0);
-        for (k, &low_end) in params
-            .square_multipliers_by_aggregated_word_multipliers_buffer
+        for (k, low_end) in params
+            .aggregated_word_multipliers
             .iter()
+            .zip((0..).step_by(strider_len))
         {
             // k is the aggregated main word multiplier.
             // low_end is the index of the strider_len-length slice.
@@ -988,7 +991,10 @@ fn gen_place_placements<'a, PossibleStripPlacementCallbackType: FnMut(i8, i8, i8
         // that square must be A, but this is not currently implemented.
         let low_end = env
             .params
-            .square_multipliers_by_aggregated_word_multipliers_buffer[&acc.word_multiplier];
+            .aggregated_word_multipliers
+            .binary_search(&acc.word_multiplier)
+            .unwrap()
+            * env.strider_len;
         let high_end = low_end + env.strider_len;
         let precomputed_square_multiplier_slice =
             &env.params.precomputed_square_multiplier_buffer[low_end..high_end];
@@ -1427,7 +1433,7 @@ fn gen_classic_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, f32)>(
 ) {
     struct Env<'a, CallbackType: FnMut(i8, &[u8], i32, f32)> {
         params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
-        alphabet: &'a alphabet::Alphabet<'a>,
+        alphabet: &'a alphabet::Alphabet,
         num_played: u8,
         idx_left: i8,
     }
@@ -1723,7 +1729,7 @@ fn gen_jumbled_place_moves<'a, CallbackType: FnMut(i8, &[u8], i32, f32)>(
 ) {
     struct Env<'a, CallbackType: FnMut(i8, &[u8], i32, f32)> {
         params: &'a mut GenPlaceMovesParams<'a, CallbackType>,
-        alphabet: &'a alphabet::Alphabet<'a>,
+        alphabet: &'a alphabet::Alphabet,
         num_played: u8,
         idx_left: i8,
     }
@@ -2328,7 +2334,7 @@ impl Clone for KurniaMoveGenerator {
 }
 
 impl KurniaMoveGenerator {
-    pub fn new(game_config: &game_config::GameConfig<'_>) -> Self {
+    pub fn new(game_config: &game_config::GameConfig) -> Self {
         Self {
             working_buffer: WorkingBuffer::new(game_config),
             plays: Vec::new(),
@@ -2677,6 +2683,18 @@ impl KurniaMoveGenerator {
             |_equity: f32, _play: &Play| true,
         );
     }
+
+    // found_word may be called multiple times for the same word.
+    #[inline(always)]
+    pub fn gen_remaining_words<'a, FoundWord: 'a + FnMut(&[u8])>(
+        &mut self,
+        board_snapshot: &'a BoardSnapshot<'a>,
+        found_word: FoundWord,
+    ) {
+        let working_buffer = &mut self.working_buffer;
+        working_buffer.init(board_snapshot, &[], &|leave_value: f32| leave_value);
+        gen_remaining_words(board_snapshot, working_buffer, found_word)
+    }
 }
 
 fn kurnia_gen_exchange_moves<'a, FoundExchangeMove: FnMut(&[u8], f32)>(
@@ -2789,8 +2807,7 @@ fn kurnia_gen_place_moves_iter<
                     [strip_range_start..strip_range_end],
                 rack_bits: working_buffer.rack_bits,
                 descending_scores: &working_buffer.descending_scores,
-                square_multipliers_by_aggregated_word_multipliers_buffer: &mut working_buffer
-                    .square_multipliers_by_aggregated_word_multipliers_buffer,
+                aggregated_word_multipliers: &mut working_buffer.aggregated_word_multipliers,
                 precomputed_square_multiplier_buffer: &mut working_buffer
                     .precomputed_square_multiplier_buffer,
                 indexes_to_descending_square_multiplier_buffer: &mut working_buffer
@@ -2840,8 +2857,7 @@ fn kurnia_gen_place_moves_iter<
                     [strip_range_start..strip_range_end],
                 rack_bits: working_buffer.rack_bits,
                 descending_scores: &working_buffer.descending_scores,
-                square_multipliers_by_aggregated_word_multipliers_buffer: &mut working_buffer
-                    .square_multipliers_by_aggregated_word_multipliers_buffer,
+                aggregated_word_multipliers: &mut working_buffer.aggregated_word_multipliers,
                 precomputed_square_multiplier_buffer: &mut working_buffer
                     .precomputed_square_multiplier_buffer,
                 indexes_to_descending_square_multiplier_buffer: &mut working_buffer
@@ -2912,4 +2928,327 @@ fn kurnia_gen_place_moves_iter<
         }
         None => None,
     })
+}
+
+struct GenRemainingConnectedWordsParams<'a> {
+    board_strip: &'a [u8],
+    rack_tally: &'a mut [u8],
+    word_strip_buffer: &'a mut [u8],
+    kwg: &'a kwg::Kwg,
+}
+
+// note: this basic word prune algorithm does not consider hooks yet.
+fn gen_remaining_connected_words<'a, FoundWord: 'a + FnMut(&[u8]), FoundSpace: 'a + FnMut(u8)>(
+    params: &'a mut GenRemainingConnectedWordsParams<'a>,
+    found_word: FoundWord,
+    mut found_space: FoundSpace,
+) {
+    params
+        .word_strip_buffer
+        .iter_mut()
+        .zip(params.board_strip.iter().map(|x| x & 0x7f))
+        .for_each(|(m, v)| *m = v);
+
+    struct Env<'a, FoundWord: 'a + FnMut(&[u8])> {
+        params: &'a mut GenRemainingConnectedWordsParams<'a>,
+        found_word: FoundWord,
+        anchor: i8,
+        rightmost: i8,
+        num_played: i8,
+        idx_left: i8,
+    }
+
+    fn record<FoundWord: FnMut(&[u8])>(env: &mut Env<'_, FoundWord>, idx_left: i8, idx_right: i8) {
+        (env.found_word)(&env.params.word_strip_buffer[idx_left as usize..idx_right as usize]);
+    }
+
+    fn play_right<FoundWord: FnMut(&[u8])>(env: &mut Env<'_, FoundWord>, mut p: i32, mut idx: i8) {
+        // tail-recurse placing current sequence of tiles
+        while idx < env.rightmost {
+            let b = env.params.board_strip[idx as usize];
+            if b == 0 {
+                break;
+            }
+            p = env.params.kwg.seek(p, b & 0x7f);
+            if p <= 0 {
+                return;
+            }
+            idx += 1;
+        }
+        let node = env.params.kwg[p];
+        if idx > env.anchor + 1 && idx - env.idx_left >= 2 && node.accepts() {
+            record(env, env.idx_left, idx);
+        }
+
+        if idx < env.rightmost {
+            p = node.arc_index();
+            if p <= 0 {
+                return;
+            }
+            loop {
+                let node = env.params.kwg[p];
+                let tile = node.tile();
+                if env.params.rack_tally[tile as usize] > 0 {
+                    env.params.rack_tally[tile as usize] -= 1;
+                    env.params.word_strip_buffer[idx as usize] = tile;
+                    play_right(env, p, idx + 1);
+                    env.params.rack_tally[tile as usize] += 1;
+                } else if env.params.rack_tally[0] > 0 {
+                    env.params.rack_tally[0] -= 1;
+                    env.params.word_strip_buffer[idx as usize] = tile; // not blanked for kwg.
+                    play_right(env, p, idx + 1);
+                    env.params.rack_tally[0] += 1;
+                }
+                if node.is_end() {
+                    break;
+                }
+                p += 1;
+            }
+        }
+    }
+
+    fn play_left<FoundWord: FnMut(&[u8])>(env: &mut Env<'_, FoundWord>, mut p: i32, mut idx: i8) {
+        // tail-recurse placing current sequence of tiles
+        while idx >= 0 {
+            let b = env.params.board_strip[idx as usize];
+            if b == 0 {
+                break;
+            }
+            p = env.params.kwg.seek(p, b & 0x7f);
+            if p <= 0 {
+                return;
+            }
+            idx -= 1;
+        }
+        let mut node = env.params.kwg[p];
+        if env.num_played > 0 && env.anchor - idx >= 2 && node.accepts() {
+            record(env, idx + 1, env.anchor + 1);
+        }
+
+        p = node.arc_index();
+        if p <= 0 {
+            return;
+        }
+
+        node = env.params.kwg[p];
+        if node.tile() == 0 {
+            // assume idx < env.anchor, because tile 0 does not occur at start in well-formed kwg gaddawg
+            env.idx_left = idx + 1;
+            play_right(env, p, env.anchor + 1);
+            if node.is_end() {
+                return;
+            }
+            p += 1;
+        }
+
+        if idx >= 0 {
+            loop {
+                let node = env.params.kwg[p];
+                let tile = node.tile();
+                if env.params.rack_tally[tile as usize] > 0 {
+                    env.params.rack_tally[tile as usize] -= 1;
+                    env.num_played += 1;
+                    env.params.word_strip_buffer[idx as usize] = tile;
+                    play_left(env, p, idx - 1);
+                    env.num_played -= 1;
+                    env.params.rack_tally[tile as usize] += 1;
+                } else if env.params.rack_tally[0] > 0 {
+                    env.params.rack_tally[0] -= 1;
+                    env.num_played += 1;
+                    env.params.word_strip_buffer[idx as usize] = tile; // not blanked for kwg.
+                    play_left(env, p, idx - 1);
+                    env.num_played -= 1;
+                    env.params.rack_tally[0] += 1;
+                }
+                if node.is_end() {
+                    break;
+                }
+                p += 1;
+            }
+        }
+    }
+
+    let strider_len = params.board_strip.len();
+    let mut env = Env {
+        params,
+        found_word,
+        anchor: 0,
+        rightmost: 0,
+        num_played: 0,
+        idx_left: 0,
+    };
+    let mut leftmost = strider_len as i8; // processed up to here
+    loop {
+        env.rightmost = leftmost;
+        while leftmost > 0 && env.params.board_strip[leftmost as usize - 1] == 0 {
+            leftmost -= 1;
+        }
+        found_space((env.rightmost - leftmost - ((leftmost > 0) as i8)).max(0) as u8); // leftmost>0 requires gap from next word.
+        if leftmost > 0 {
+            // board[leftmost - 1] is a tile.
+            env.anchor = leftmost - 1;
+            // board[anchor + 1] is empty or off-board, board[anchor] has a tile.
+            let mut p = 1;
+            while leftmost > 0 && env.params.board_strip[leftmost as usize - 1] != 0 {
+                leftmost -= 1;
+                p = env
+                    .params
+                    .kwg
+                    .seek(p, env.params.board_strip[leftmost as usize] & 0x7f);
+            }
+            // board[leftmost] has a tile, board[leftmost - 1] is empty or off-board.
+            if p >= 0 {
+                play_left(&mut env, p, leftmost - 1);
+            }
+        }
+        // board[leftmost] was leftmost tile. need gap from previous word.
+        leftmost -= 1;
+        // now board[leftmost] is empty.
+        if leftmost <= 1 {
+            // assume words are >= 2.
+            break;
+        }
+    }
+    env.params.word_strip_buffer.iter_mut().for_each(|m| *m = 0);
+}
+
+struct GenRemainingUnconnectedWordsParams<'a> {
+    rack_tally: &'a mut [u8],
+    word_vec: &'a mut Vec<u8>,
+    kwg: &'a kwg::Kwg,
+    max_len: usize,
+}
+
+fn gen_remaining_unconnected_words<'a, FoundWord: 'a + FnMut(&[u8])>(
+    params: &'a mut GenRemainingUnconnectedWordsParams<'a>,
+    found_word: FoundWord,
+) {
+    params.word_vec.clear();
+    params.word_vec.reserve(params.max_len);
+    struct Env<'a, FoundWord: 'a + FnMut(&[u8])> {
+        rack_tally: &'a mut [u8],
+        word_vec: &'a mut Vec<u8>,
+        kwg: &'a kwg::Kwg,
+        max_len: usize,
+        found_word: FoundWord,
+    }
+    fn iter<FoundWord: FnMut(&[u8])>(env: &mut Env<'_, FoundWord>, mut p: i32) {
+        if env.word_vec.len() >= env.max_len {
+            return;
+        }
+        loop {
+            let node = &env.kwg[p];
+            let tile = node.tile();
+            if env.rack_tally[tile as usize] > 0 {
+                env.rack_tally[tile as usize] -= 1;
+                env.word_vec.push(tile);
+                if node.accepts() {
+                    (env.found_word)(env.word_vec);
+                }
+                let np = node.arc_index();
+                if np != 0 {
+                    iter(env, np);
+                }
+                env.word_vec.pop();
+                env.rack_tally[tile as usize] += 1;
+            } else if env.rack_tally[0] > 0 {
+                env.rack_tally[0] -= 1;
+                env.word_vec.push(tile);
+                if node.accepts() {
+                    (env.found_word)(env.word_vec);
+                }
+                let np = node.arc_index();
+                if np != 0 {
+                    iter(env, np);
+                }
+                env.word_vec.pop();
+                env.rack_tally[0] += 1;
+            }
+            if node.is_end() {
+                break;
+            }
+            p += 1;
+        }
+    }
+    iter(
+        &mut Env {
+            rack_tally: params.rack_tally,
+            word_vec: params.word_vec,
+            kwg: params.kwg,
+            max_len: params.max_len,
+            found_word,
+        },
+        params.kwg[0].arc_index(),
+    );
+}
+
+// found_word may be called multiple times for the same word.
+fn gen_remaining_words<'a, FoundWord: 'a + FnMut(&[u8])>(
+    board_snapshot: &'a BoardSnapshot<'a>,
+    working_buffer: &'a mut WorkingBuffer,
+    mut found_word: FoundWord,
+) {
+    let game_config = &board_snapshot.game_config;
+    let board_layout = game_config.board_layout();
+    let dim = board_layout.dim();
+    let alphabet = game_config.alphabet();
+
+    let available_tally = &mut working_buffer.used_letters_tally;
+    available_tally.clear();
+    available_tally.reserve(alphabet.len() as usize);
+    for i in 0..alphabet.len() {
+        available_tally.push(alphabet.freq(i));
+    }
+    // should check underflow.
+    for i in board_snapshot.board_tiles.iter() {
+        if *i != 0 {
+            if i & 0x80 == 0 {
+                available_tally[*i as usize] -= 1;
+            } else {
+                available_tally[0] -= 1;
+            }
+        }
+    }
+    let mut max_space_len = 0;
+    let mut found_space = |space_len: u8| max_space_len = max_space_len.max(space_len);
+    for row in 0..dim.rows {
+        let strip_range_start = (row as isize * dim.cols as isize) as usize;
+        let strip_range_end = strip_range_start + dim.cols as usize;
+        gen_remaining_connected_words(
+            &mut GenRemainingConnectedWordsParams {
+                board_strip: &board_snapshot.board_tiles[strip_range_start..strip_range_end],
+                rack_tally: &mut working_buffer.used_letters_tally, // intentional.
+                word_strip_buffer: &mut working_buffer.word_buffer_for_across_plays
+                    [strip_range_start..strip_range_end],
+                kwg: board_snapshot.kwg,
+            },
+            &mut found_word,
+            &mut found_space,
+        );
+    }
+    for col in 0..dim.cols {
+        let strip_range_start = (col as isize * dim.rows as isize) as usize;
+        let strip_range_end = strip_range_start + dim.rows as usize;
+        gen_remaining_connected_words(
+            &mut GenRemainingConnectedWordsParams {
+                board_strip: &working_buffer.transposed_board_tiles
+                    [strip_range_start..strip_range_end],
+                rack_tally: &mut working_buffer.used_letters_tally, // intentional.
+                word_strip_buffer: &mut working_buffer.word_buffer_for_down_plays
+                    [strip_range_start..strip_range_end],
+                kwg: board_snapshot.kwg,
+            },
+            &mut found_word,
+            &mut found_space,
+        );
+    }
+    gen_remaining_unconnected_words(
+        &mut GenRemainingUnconnectedWordsParams {
+            kwg: board_snapshot.kwg,
+            rack_tally: &mut working_buffer.used_letters_tally, // intentional.
+            word_vec: &mut working_buffer.exchange_buffer,      // intentional.
+            max_len: max_space_len as usize,
+        },
+        &mut found_word,
+    );
 }

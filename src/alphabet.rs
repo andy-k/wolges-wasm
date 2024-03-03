@@ -1,18 +1,20 @@
 // Copyright (C) 2020-2024 Andy Kurnia.
 
-struct Tile<'a> {
-    label: &'a str,
-    blank_label: &'a str,
+use super::{bites, bites_str};
+
+struct Tile {
+    label: bites_str::BitesStr,
+    blank_label: bites_str::BitesStr,
     freq: u8,
     score: i8,
     is_vowel: bool,
-    alias_labels: &'a [&'a str],
-    alias_blank_labels: &'a [&'a str],
+    alias_labels: Vec<bites_str::BitesStr>,
+    alias_blank_labels: Vec<bites_str::BitesStr>,
 }
 
 #[derive(Default)]
-pub struct StaticAlphabet<'a> {
-    tiles: &'a [Tile<'a>],
+pub struct StaticAlphabet {
+    tiles: Vec<Tile>,
     widest_label_len: usize, // in codepoints for now (graphemes is too complex)
     num_tiles: u16,
     same_score_tile: Box<[u8]>,
@@ -20,12 +22,12 @@ pub struct StaticAlphabet<'a> {
     tiles_by_descending_scores: Box<[u8]>,
 }
 
-pub enum Alphabet<'a> {
-    Static(StaticAlphabet<'a>),
+pub enum Alphabet {
+    Static(StaticAlphabet),
 }
 
-impl<'a> Alphabet<'a> {
-    pub fn new_static(x: StaticAlphabet<'a>) -> Self {
+impl Alphabet {
+    pub fn new_static(x: StaticAlphabet) -> Self {
         let num_letters = x.tiles.len() as u8;
         let mut same_score_tile = Box::from_iter(0..num_letters);
         let mut same_score_tile_bits = Vec::with_capacity(num_letters as usize);
@@ -88,7 +90,7 @@ impl<'a> Alphabet<'a> {
     }
 
     #[inline(always)]
-    fn get(&self, idx: u8) -> &'a Tile<'a> {
+    fn get(&self, idx: u8) -> &Tile {
         match self {
             Alphabet::Static(x) => &x.tiles[idx as usize],
         }
@@ -109,23 +111,23 @@ impl<'a> Alphabet<'a> {
     }
 
     #[inline(always)]
-    pub fn of_board(&self, idx: u8) -> Option<&'a str> {
+    pub fn of_board(&self, idx: u8) -> Option<&str> {
         let c = idx & 0x7f;
         if c == 0 || c >= self.len() {
             None
         } else if idx & 0x80 == 0 {
-            Some(self.get(c).label)
+            Some(&self.get(c).label)
         } else {
-            Some(self.get(c).blank_label)
+            Some(&self.get(c).blank_label)
         }
     }
 
     #[inline(always)]
-    pub fn of_rack(&self, idx: u8) -> Option<&'a str> {
+    pub fn of_rack(&self, idx: u8) -> Option<&str> {
         if idx >= self.len() {
             None
         } else {
-            Some(self.get(idx).label)
+            Some(&self.get(idx).label)
         }
     }
 
@@ -177,7 +179,7 @@ impl<'a> Alphabet<'a> {
         }
     }
 
-    pub fn fmt_rack(&'a self, rack: &'a [u8]) -> WriteableRack<'a> {
+    pub fn fmt_rack<'a>(&'a self, rack: &'a [u8]) -> WriteableRack<'a> {
         WriteableRack {
             alphabet: self,
             rack,
@@ -190,7 +192,7 @@ impl<'a> Alphabet<'a> {
 }
 
 pub struct WriteableRack<'a> {
-    alphabet: &'a Alphabet<'a>,
+    alphabet: &'a Alphabet,
     rack: &'a [u8],
 }
 
@@ -208,14 +210,18 @@ impl std::fmt::Display for WriteableRack<'_> {
     }
 }
 
+macro_rules! v {
+    ($($item: expr),*) => { vec![$($item.into(), )*] };
+}
+
 macro_rules! tile {
     ($label: expr, $blank_label: expr, $freq: expr, $score: expr, $vowel_int: expr) => {
-        tile!($label, $blank_label, $freq, $score, $vowel_int, &[], &[])
+        tile!($label, $blank_label, $freq, $score, $vowel_int, v![], v![])
     };
     ($label: expr, $blank_label: expr, $freq: expr, $score: expr, $vowel_int: expr, $alias_labels: expr, $alias_blank_labels: expr) => {
         Tile {
-            label: $label,
-            blank_label: $blank_label,
+            label: $label.into(),
+            blank_label: $blank_label.into(),
             freq: $freq,
             score: $score,
             is_vowel: ($vowel_int) != 0,
@@ -227,14 +233,14 @@ macro_rules! tile {
 
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#Catalan
 // with QU tile instead of Q
-pub fn make_catalan_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_catalan_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 12, 1, 1),
             tile!("B", "b", 2, 3, 0),
             tile!("C", "c", 3, 2, 0),
-            tile!("Ç", "ç", 1, 10, 0, &["K"], &["k"]),
+            tile!("Ç", "ç", 1, 10, 0, v!["K"], v!["k"]),
             tile!("D", "d", 3, 2, 0),
             tile!("E", "e", 13, 1, 1),
             tile!("F", "f", 1, 4, 0),
@@ -243,13 +249,13 @@ pub fn make_catalan_alphabet<'a>() -> Alphabet<'a> {
             tile!("I", "i", 8, 1, 1),
             tile!("J", "j", 1, 8, 0),
             tile!("L", "l", 4, 1, 0),
-            tile!("L·L", "l·l", 1, 10, 0, &["W"], &["w"]),
+            tile!("L·L", "l·l", 1, 10, 0, v!["W"], v!["w"]),
             tile!("M", "m", 3, 2, 0),
             tile!("N", "n", 6, 1, 0),
-            tile!("NY", "ny", 1, 10, 0, &["Y"], &["y"]),
+            tile!("NY", "ny", 1, 10, 0, v!["Y"], v!["y"]),
             tile!("O", "o", 5, 1, 1),
             tile!("P", "p", 2, 3, 0),
-            tile!("QU", "qu", 1, 8, 0, &["Q"], &["q"]),
+            tile!("QU", "qu", 1, 8, 0, v!["Q"], v!["q"]),
             tile!("R", "r", 8, 1, 0),
             tile!("S", "s", 8, 1, 0),
             tile!("T", "t", 5, 1, 0),
@@ -263,14 +269,14 @@ pub fn make_catalan_alphabet<'a>() -> Alphabet<'a> {
 }
 
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#Catalan
-pub fn make_super_catalan_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_super_catalan_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 5, 0, 0),
             tile!("A", "a", 25, 1, 1),
             tile!("B", "b", 3, 3, 0),
             tile!("C", "c", 5, 2, 0),
-            tile!("Ç", "ç", 2, 12, 0, &["K"], &["k"]), // note: different score from regular
+            tile!("Ç", "ç", 2, 12, 0, v!["K"], v!["k"]), // note: different score from regular
             tile!("D", "d", 5, 2, 0),
             tile!("E", "e", 27, 1, 1),
             tile!("F", "f", 2, 4, 0),
@@ -279,13 +285,13 @@ pub fn make_super_catalan_alphabet<'a>() -> Alphabet<'a> {
             tile!("I", "i", 17, 1, 1),
             tile!("J", "j", 2, 8, 0),
             tile!("L", "l", 8, 1, 0),
-            tile!("L·L", "l·l", 1, 15, 0, &["W"], &["w"]), // note: different score from regular
+            tile!("L·L", "l·l", 1, 15, 0, v!["W"], v!["w"]), // note: different score from regular
             tile!("M", "m", 7, 2, 0),
             tile!("N", "n", 12, 1, 0),
-            tile!("NY", "ny", 2, 10, 0, &["Y"], &["y"]),
+            tile!("NY", "ny", 2, 10, 0, v!["Y"], v!["y"]),
             tile!("O", "o", 10, 1, 1),
             tile!("P", "p", 3, 3, 0),
-            tile!("QU", "qu", 2, 8, 0, &["Q"], &["q"]),
+            tile!("QU", "qu", 2, 8, 0, v!["Q"], v!["q"]),
             tile!("R", "r", 16, 1, 0),
             tile!("S", "s", 19, 1, 0),
             tile!("T", "t", 10, 1, 0),
@@ -299,9 +305,9 @@ pub fn make_super_catalan_alphabet<'a>() -> Alphabet<'a> {
 }
 
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#English
-pub fn make_english_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_english_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 9, 1, 1),
             tile!("B", "b", 2, 3, 0),
@@ -336,9 +342,9 @@ pub fn make_english_alphabet<'a>() -> Alphabet<'a> {
 
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#French
 // https://en.wikipedia.org/wiki/French_orthography
-pub fn make_french_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_french_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 9, 1, 1),
             tile!("B", "b", 2, 3, 0),
@@ -372,9 +378,9 @@ pub fn make_french_alphabet<'a>() -> Alphabet<'a> {
 }
 
 // http://hkcrosswordclub.com/?cat=14
-pub fn make_hong_kong_english_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_hong_kong_english_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 4, 0, 0),
             tile!("A", "a", 9, 1, 1),
             tile!("B", "b", 2, 3, 0),
@@ -408,9 +414,9 @@ pub fn make_hong_kong_english_alphabet<'a>() -> Alphabet<'a> {
 }
 
 // https://en.wikipedia.org/wiki/Super_Scrabble
-pub fn make_super_english_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_super_english_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 4, 0, 0),
             tile!("A", "a", 16, 1, 1),
             tile!("B", "b", 4, 3, 0),
@@ -444,9 +450,9 @@ pub fn make_super_english_alphabet<'a>() -> Alphabet<'a> {
 }
 
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#German
-pub fn make_german_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_german_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 5, 1, 1),
             tile!("Ä", "ä", 1, 6, 1),
@@ -486,9 +492,9 @@ pub fn make_german_alphabet<'a>() -> Alphabet<'a> {
 // https://en.wikipedia.org/wiki/Norwegian_orthography
 // https://unicode.org/mail-arch/unicode-ml/y2002-m01/0297.html
 // also this ordering matches system locale files
-pub fn make_norwegian_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_norwegian_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 7, 1, 1),
             tile!("B", "b", 3, 4, 0),
@@ -530,9 +536,9 @@ pub fn make_norwegian_alphabet<'a>() -> Alphabet<'a> {
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#Polish
 // https://en.wikipedia.org/wiki/Polish_alphabet#Letters
 // https://en.wikipedia.org/wiki/Polish_phonology#Vowels
-pub fn make_polish_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_polish_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 9, 1, 1),
             tile!("Ą", "ą", 1, 5, 1),
@@ -574,9 +580,9 @@ pub fn make_polish_alphabet<'a>() -> Alphabet<'a> {
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#Slovenian
 // the additional letters are unofficial and experimental
 // (so data files may not be stable).
-pub fn make_slovene_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_slovene_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 10, 1, 1),
             tile!("Å", "å", 0, 0, 1), // ?
@@ -621,14 +627,14 @@ pub fn make_slovene_alphabet<'a>() -> Alphabet<'a> {
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#Spanish
 // based on Spanish-language sets sold outside North America
 // (CH/LL/RR are ambiguous and should not be supported)
-pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_spanish_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 12, 1, 1),
             tile!("B", "b", 2, 3, 0),
             tile!("C", "c", 4, 3, 0),
-            tile!("[CH]", "[ch]", 1, 5, 0, &["1"], &[]),
+            tile!("[CH]", "[ch]", 1, 5, 0, v!["1"], v![]),
             tile!("D", "d", 5, 2, 0),
             tile!("E", "e", 12, 1, 1),
             tile!("F", "f", 1, 4, 0),
@@ -637,7 +643,7 @@ pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
             tile!("I", "i", 6, 1, 1),
             tile!("J", "j", 1, 8, 0),
             tile!("L", "l", 4, 1, 0),
-            tile!("[LL]", "[ll]", 1, 8, 0, &["2"], &[]),
+            tile!("[LL]", "[ll]", 1, 8, 0, v!["2"], v![]),
             tile!("M", "m", 2, 3, 0),
             tile!("N", "n", 5, 1, 0),
             tile!("Ñ", "ñ", 1, 8, 0),
@@ -645,7 +651,7 @@ pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
             tile!("P", "p", 2, 3, 0),
             tile!("Q", "q", 1, 5, 0),
             tile!("R", "r", 5, 1, 0),
-            tile!("[RR]", "[rr]", 1, 8, 0, &["3"], &[]),
+            tile!("[RR]", "[rr]", 1, 8, 0, v!["3"], v![]),
             tile!("S", "s", 6, 1, 0),
             tile!("T", "t", 4, 1, 0),
             tile!("U", "u", 5, 1, 1),
@@ -660,9 +666,9 @@ pub fn make_spanish_alphabet<'a>() -> Alphabet<'a> {
 
 // TODO: find citeable source
 // https://discord.com/channels/741321677828522035/778469677588283403/1171937313224392704
-pub fn make_yupik_alphabet<'a>() -> Alphabet<'a> {
+pub fn make_yupik_alphabet() -> Alphabet {
     Alphabet::new_static(StaticAlphabet {
-        tiles: &[
+        tiles: vec![
             tile!("?", "?", 2, 0, 0),
             tile!("A", "a", 17, 1, 1),
             tile!("C", "c", 2, 6, 0),
@@ -687,14 +693,14 @@ pub fn make_yupik_alphabet<'a>() -> Alphabet<'a> {
     })
 }
 
-pub struct AlphabetReader<'a> {
-    supported_tiles: Box<[(u8, &'a [u8])]>,
+pub struct AlphabetReader {
+    supported_tiles: Box<[(u8, bites::Bites)]>,
     by_first_byte: [Option<(usize, usize)>; 256],
 }
 
 // This is slow, but supports multi-codepoint tiles with greedy matching.
-impl<'a> AlphabetReader<'a> {
-    pub fn new_for_tiles(mut supported_tiles: Box<[(u8, &'a [u8])]>) -> Self {
+impl AlphabetReader {
+    pub fn new_for_tiles(mut supported_tiles: Box<[(u8, bites::Bites)]>) -> Self {
         // sort supported tiles by first byte (asc), length (desc), and tile (asc).
         supported_tiles.sort_unstable_by(|(a_tile, a_label), (b_tile, b_label)| {
             a_label[0].cmp(&b_label[0]).then_with(|| {
@@ -724,7 +730,7 @@ impl<'a> AlphabetReader<'a> {
     }
 
     // Recognizes [A-Z] and [a-z] identically, as well as aliases.
-    pub fn new_for_words(alphabet: &Alphabet<'a>) -> Self {
+    pub fn new_for_words(alphabet: &Alphabet) -> Self {
         let alphabet_len = alphabet.len();
         let mut cap = 0;
         for idx in 1..alphabet_len {
@@ -734,13 +740,13 @@ impl<'a> AlphabetReader<'a> {
         let mut supported_tiles = Vec::with_capacity(cap);
         for idx in 1..alphabet_len {
             let tile = alphabet.get(idx);
-            supported_tiles.push((idx, tile.label.as_bytes()));
-            for alias in tile.alias_labels {
-                supported_tiles.push((idx, alias.as_bytes()));
+            supported_tiles.push((idx, tile.label.as_bytes().into()));
+            for alias in tile.alias_labels.iter() {
+                supported_tiles.push((idx, alias.as_bytes().into()));
             }
-            supported_tiles.push((idx, tile.blank_label.as_bytes()));
-            for alias in tile.alias_blank_labels {
-                supported_tiles.push((idx, alias.as_bytes()));
+            supported_tiles.push((idx, tile.blank_label.as_bytes().into()));
+            for alias in tile.alias_blank_labels.iter() {
+                supported_tiles.push((idx, alias.as_bytes().into()));
             }
         }
         let supported_tiles = supported_tiles.into_boxed_slice();
@@ -748,7 +754,7 @@ impl<'a> AlphabetReader<'a> {
     }
 
     // Same as new_for_words but merge tiles with same score.
-    pub fn new_for_word_scores(alphabet: &Alphabet<'a>) -> Self {
+    pub fn new_for_word_scores(alphabet: &Alphabet) -> Self {
         let alphabet_len = alphabet.len();
         let mut cap = 0;
         for idx in 1..alphabet_len {
@@ -759,13 +765,13 @@ impl<'a> AlphabetReader<'a> {
         for idx in 1..alphabet_len {
             let tile = alphabet.get(idx);
             let representative_idx = alphabet.representative_same_score_tile(idx);
-            supported_tiles.push((representative_idx, tile.label.as_bytes()));
-            for alias in tile.alias_labels {
-                supported_tiles.push((representative_idx, alias.as_bytes()));
+            supported_tiles.push((representative_idx, tile.label.as_bytes().into()));
+            for alias in tile.alias_labels.iter() {
+                supported_tiles.push((representative_idx, alias.as_bytes().into()));
             }
-            supported_tiles.push((representative_idx, tile.blank_label.as_bytes()));
-            for alias in tile.alias_blank_labels {
-                supported_tiles.push((representative_idx, alias.as_bytes()));
+            supported_tiles.push((representative_idx, tile.blank_label.as_bytes().into()));
+            for alias in tile.alias_blank_labels.iter() {
+                supported_tiles.push((representative_idx, alias.as_bytes().into()));
             }
         }
         let supported_tiles = supported_tiles.into_boxed_slice();
@@ -773,7 +779,7 @@ impl<'a> AlphabetReader<'a> {
     }
 
     // Recognizes [?A-Z] and [a-z] identically, as well as aliases.
-    pub fn new_for_racks(alphabet: &Alphabet<'a>) -> Self {
+    pub fn new_for_racks(alphabet: &Alphabet) -> Self {
         let alphabet_len = alphabet.len();
         let mut cap = 0;
         if alphabet_len > 0 {
@@ -787,20 +793,20 @@ impl<'a> AlphabetReader<'a> {
         let mut supported_tiles = Vec::with_capacity(cap);
         if alphabet_len > 0 {
             let tile = alphabet.get(0);
-            supported_tiles.push((0, tile.label.as_bytes()));
-            for alias in tile.alias_labels {
-                supported_tiles.push((0, alias.as_bytes()));
+            supported_tiles.push((0, tile.label.as_bytes().into()));
+            for alias in tile.alias_labels.iter() {
+                supported_tiles.push((0, alias.as_bytes().into()));
             }
         }
         for idx in 1..alphabet_len {
             let tile = alphabet.get(idx);
-            supported_tiles.push((idx, tile.label.as_bytes()));
-            for alias in tile.alias_labels {
-                supported_tiles.push((idx, alias.as_bytes()));
+            supported_tiles.push((idx, tile.label.as_bytes().into()));
+            for alias in tile.alias_labels.iter() {
+                supported_tiles.push((idx, alias.as_bytes().into()));
             }
-            supported_tiles.push((idx, tile.blank_label.as_bytes()));
-            for alias in tile.alias_blank_labels {
-                supported_tiles.push((idx, alias.as_bytes()));
+            supported_tiles.push((idx, tile.blank_label.as_bytes().into()));
+            for alias in tile.alias_blank_labels.iter() {
+                supported_tiles.push((idx, alias.as_bytes().into()));
             }
         }
         let supported_tiles = supported_tiles.into_boxed_slice();
@@ -808,7 +814,7 @@ impl<'a> AlphabetReader<'a> {
     }
 
     // Recognizes [A-Za-z] and aliases. Play-through needs to be dealt with separately.
-    pub fn new_for_plays(alphabet: &Alphabet<'a>) -> Self {
+    pub fn new_for_plays(alphabet: &Alphabet) -> Self {
         let alphabet_len = alphabet.len();
         let mut cap = 0;
         for idx in 1..alphabet_len {
@@ -818,14 +824,14 @@ impl<'a> AlphabetReader<'a> {
         let mut supported_tiles = Vec::with_capacity(cap);
         for idx in 1..alphabet_len {
             let tile = alphabet.get(idx);
-            supported_tiles.push((idx, tile.label.as_bytes()));
-            for alias in tile.alias_labels {
-                supported_tiles.push((idx, alias.as_bytes()));
+            supported_tiles.push((idx, tile.label.as_bytes().into()));
+            for alias in tile.alias_labels.iter() {
+                supported_tiles.push((idx, alias.as_bytes().into()));
             }
             let blank_idx = idx | 0x80;
-            supported_tiles.push((blank_idx, tile.blank_label.as_bytes()));
-            for alias in tile.alias_blank_labels {
-                supported_tiles.push((blank_idx, alias.as_bytes()));
+            supported_tiles.push((blank_idx, tile.blank_label.as_bytes().into()));
+            for alias in tile.alias_blank_labels.iter() {
+                supported_tiles.push((blank_idx, alias.as_bytes().into()));
             }
         }
         let supported_tiles = supported_tiles.into_boxed_slice();

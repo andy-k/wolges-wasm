@@ -11,7 +11,7 @@ macro_rules! mod_many {
     $(#[allow(dead_code)] mod $mod;)+
   };
 }
-mod_many!(alphabet bag bites board_layout display fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats);
+mod_many!(alphabet bag bites bites_str board_layout display fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats);
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
@@ -189,7 +189,7 @@ struct Candidate {
 // ongoing Sim Processes, only dropped on request.
 struct SimProc {
     initial_board_tiles: Vec<u8>,
-    game_config: std::sync::Arc<game_config::GameConfig<'static>>,
+    game_config: std::sync::Arc<game_config::GameConfig>,
     kwg: std::sync::Arc<kwg::Kwg>,
     klv: std::sync::Arc<klv::Klv>,
     simmer: simmer::Simmer,
@@ -204,7 +204,7 @@ type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T
 lazy_static::lazy_static! {
     static ref CACHED_KWG: WasmCache<kwg::Kwg> = Default::default();
     static ref CACHED_KLV: WasmCache<klv::Klv> = Default::default();
-    static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig<'static>> = Default::default();
+    static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig> = Default::default();
     static ref SIM_PROCS: WasmCacheInt<std::sync::RwLock<SimProc>> = Default::default();
 }
 
