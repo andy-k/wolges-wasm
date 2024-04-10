@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1.7"
-getrandom = { version = "0.2.13", features = ["js"] }
+getrandom = { version = "0.2.14", features = ["js"] }
 js-sys = "0.3.69"
 lazy_static = "1.4.0"
 rand = "0.8.5"
