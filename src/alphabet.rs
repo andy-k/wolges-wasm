@@ -318,9 +318,6 @@ pub fn make_polish_alphabet() -> Alphabet {
 }
 
 // https://en.wikipedia.org/wiki/Scrabble_letter_distributions#Slovenian
-// the additional letters are unofficial and experimental
-// (so data files may not be stable).
-// note: Å Ä Ç Ñ Ö Q Ü W X Y are experimental.
 pub fn make_slovene_alphabet() -> Alphabet {
     new_static_alphabet_from_file!("alphabets/slovene.txt")
 }
@@ -330,12 +327,6 @@ pub fn make_slovene_alphabet() -> Alphabet {
 // (CH/LL/RR are ambiguous and should not be supported)
 pub fn make_spanish_alphabet() -> Alphabet {
     new_static_alphabet_from_file!("alphabets/spanish.txt")
-}
-
-// TODO: find citeable source
-// https://discord.com/channels/741321677828522035/778469677588283403/1171937313224392704
-pub fn make_yupik_alphabet() -> Alphabet {
-    new_static_alphabet_from_file!("alphabets/yupik.txt")
 }
 
 pub struct AlphabetReader {

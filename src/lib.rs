@@ -102,14 +102,6 @@ pub fn do_this_on_startup() {
         "WordSmog/spanish".into(),
         game_config::make_jumbled_spanish_game_config().into(),
     );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/yupik".into(),
-        game_config::make_yupik_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/yupik".into(),
-        game_config::make_jumbled_yupik_game_config().into(),
-    );
 }
 
 fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
@@ -271,11 +263,12 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
         let mut seen_moves = fash::MyHashSet::default();
         let mut alpha_buf = Vec::new();
         move_generator
-            .async_gen_moves_filtered(
+            .gen_moves_filtered_async(
                 &movegen::GenMovesParams {
                     board_snapshot,
                     rack: &req.rack,
                     max_gen: req.max_gen,
+                    num_exchanges_by_this_player: 0, // TODO: this should be specified externally
                     always_include_pass: false,
                 },
                 |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
@@ -537,6 +530,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
         board_snapshot,
         rack: &req.rack,
         max_gen: req.max_gen,
+        num_exchanges_by_this_player: game_state.current_player().num_exchanges,
         always_include_pass: false,
     });
 
