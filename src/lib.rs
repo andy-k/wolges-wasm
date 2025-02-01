@@ -344,7 +344,7 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
         .sum::<usize>();
     let mut unseen_tiles = (0u8..)
         .zip(kibitzer.available_tally.iter())
-        .flat_map(|(tile, &count)| std::iter::repeat(tile).take(count as usize));
+        .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize));
     for i in 1..game_config.num_players() as usize {
         let len_this_rack = std::cmp::min(num_unseen_tiles, game_config.rack_size() as usize);
         let rack = &mut game_state.players[i].rack;
@@ -497,7 +497,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     game_state.bag.0.extend(
         (0u8..)
             .zip(kibitzer.available_tally.iter())
-            .flat_map(|(tile, &count)| std::iter::repeat(tile).take(count as usize)),
+            .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
     );
     RNG.with(|rng| {
         game_state.bag.shuffle(&mut *rng.borrow_mut());
