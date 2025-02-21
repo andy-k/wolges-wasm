@@ -18,7 +18,7 @@ macro_rules! console_log {
 }
 
 macro_rules! return_js_error {
-    ($error:expr_2021) => {
+    ($error: expr) => {
         return Err($error.into());
     };
 }
@@ -201,7 +201,7 @@ lazy_static::lazy_static! {
 }
 
 macro_rules! get_wasm_cache {
-    ($cache: expr_2021, $key: expr_2021, $err: expr_2021) => {
+    ($cache: expr, $key: expr, $err: expr) => {
         $cache
             .read()
             .map_err(err_to_str)?
@@ -212,7 +212,7 @@ macro_rules! get_wasm_cache {
 }
 
 macro_rules! use_wasm_cache {
-    ($var: ident, $cache: expr_2021, $key: expr_2021) => {
+    ($var: ident, $cache: expr, $key: expr) => {
         let $var = get_wasm_cache!($cache, $key, concat!("missing ", stringify!($var)));
     };
 }
