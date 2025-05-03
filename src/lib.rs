@@ -23,6 +23,11 @@ macro_rules! return_js_error {
     };
 }
 
+enum KwgEither {
+    Node22(kwg::Kwg<kwg::Node22>),
+    Node24(kwg::Kwg<kwg::Node24>),
+}
+
 #[wasm_bindgen(start)]
 pub fn do_this_on_startup() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
@@ -182,7 +187,7 @@ struct Candidate {
 struct SimProc {
     initial_board_tiles: Vec<u8>,
     game_config: std::sync::Arc<game_config::GameConfig>,
-    kwg: std::sync::Arc<kwg::Kwg<kwg::Node22>>,
+    kwg: std::sync::Arc<KwgEither>,
     klv: std::sync::Arc<klv::Klv<kwg::Node22>>,
     simmer: simmer::Simmer,
     plays: Vec<movegen::ValuedMove>,
@@ -194,7 +199,7 @@ type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>
 type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
 lazy_static::lazy_static! {
-    static ref CACHED_KWG: WasmCache<kwg::Kwg<kwg::Node22>> = Default::default();
+    static ref CACHED_KWG: WasmCache<KwgEither> = Default::default();
     static ref CACHED_KLV: WasmCache<klv::Klv<kwg::Node22>> = Default::default();
     static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig> = Default::default();
     static ref SIM_PROCS: WasmCacheInt<std::sync::RwLock<SimProc>> = Default::default();
@@ -224,10 +229,18 @@ thread_local! {
 
 #[wasm_bindgen]
 pub fn precache_kwg(key: String, value: &[u8]) {
-    CACHED_KWG
-        .write()
-        .unwrap()
-        .insert(key, kwg::Kwg::from_bytes_alloc(value).into());
+    CACHED_KWG.write().unwrap().insert(
+        key,
+        KwgEither::Node22(kwg::Kwg::from_bytes_alloc(value)).into(),
+    );
+}
+
+#[wasm_bindgen]
+pub fn precache_kbwg(key: String, value: &[u8]) {
+    CACHED_KWG.write().unwrap().insert(
+        key,
+        KwgEither::Node24(kwg::Kwg::from_bytes_alloc(value)).into(),
+    );
 }
 
 #[wasm_bindgen]
@@ -243,6 +256,17 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
     let req = serde_json::from_str::<AnalyzeRequest>(&req_str).map_err(err_to_str)?;
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
+
+    match *kwg {
+        KwgEither::Node22(ref kwg) => do_analyze(req, kwg).await,
+        KwgEither::Node24(ref kwg) => do_analyze(req, kwg).await,
+    }
+}
+
+async fn do_analyze<N: kwg::Node>(
+    req: AnalyzeRequest,
+    kwg: &kwg::Kwg<N>,
+) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -255,7 +279,7 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg: &kwg,
+        kwg,
         klv: &klv,
     };
 
@@ -326,6 +350,14 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     let req = serde_json::from_str::<ScoreRequest>(&req_str).map_err(err_to_str)?;
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
+
+    match *kwg {
+        KwgEither::Node22(ref kwg) => do_play_score(req, kwg),
+        KwgEither::Node24(ref kwg) => do_play_score(req, kwg),
+    }
+}
+
+fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -364,7 +396,7 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg: &kwg,
+        kwg,
         klv: &klv,
     };
 
@@ -520,19 +552,38 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     }
 
     let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
-    let board_snapshot = &movegen::BoardSnapshot {
-        board_tiles: &kibitzer.board_tiles,
-        game_config: &game_config,
-        kwg: &kwg,
-        klv: &klv,
-    };
-    move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
-        board_snapshot,
-        rack: &req.rack,
-        max_gen: req.max_gen,
-        num_exchanges_by_this_player: game_state.current_player().num_exchanges,
-        always_include_pass: false,
-    });
+    match *kwg {
+        KwgEither::Node22(ref kwg) => {
+            let board_snapshot = &movegen::BoardSnapshot {
+                board_tiles: &kibitzer.board_tiles,
+                game_config: &game_config,
+                kwg,
+                klv: &klv,
+            };
+            move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
+                board_snapshot,
+                rack: &req.rack,
+                max_gen: req.max_gen,
+                num_exchanges_by_this_player: game_state.current_player().num_exchanges,
+                always_include_pass: false,
+            });
+        }
+        KwgEither::Node24(ref kwg) => {
+            let board_snapshot = &movegen::BoardSnapshot {
+                board_tiles: &kibitzer.board_tiles,
+                game_config: &game_config,
+                kwg,
+                klv: &klv,
+            };
+            move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
+                board_snapshot,
+                rack: &req.rack,
+                max_gen: req.max_gen,
+                num_exchanges_by_this_player: game_state.current_player().num_exchanges,
+                always_include_pass: false,
+            });
+        }
+    }
 
     let mut sim_proc = SimProc {
         initial_board_tiles: kibitzer.board_tiles,
@@ -609,25 +660,52 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
     for _num in 1..=1000 {
         sim_proc.simmer.prepare_iteration();
         for play in plays.iter() {
-            let game_ended = sim_proc
-                .simmer
-                .simulate(&game_config, &kwg, &klv, &play.play);
+            let game_ended = match *kwg {
+                KwgEither::Node22(ref kwg) => {
+                    sim_proc
+                        .simmer
+                        .simulate(&game_config, kwg, &klv, &play.play)
+                }
+                KwgEither::Node24(ref kwg) => {
+                    sim_proc
+                        .simmer
+                        .simulate(&game_config, kwg, &klv, &play.play)
+                }
+            };
             let final_spread = sim_proc.simmer.final_equity_spread();
             let win_prob = sim_proc.simmer.compute_win_prob(game_ended, final_spread);
             let sim_spread = final_spread - sim_proc.simmer.initial_score_spread as f32;
             if false {
-                let board_snapshot = &movegen::BoardSnapshot {
-                    board_tiles: &sim_proc.initial_board_tiles,
-                    game_config: &sim_proc.game_config,
-                    kwg: &sim_proc.kwg,
-                    klv: &sim_proc.klv,
-                };
-                console_log!(
-                    "{} {} gets {}",
-                    play.equity,
-                    play.play.fmt(board_snapshot),
-                    sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
-                );
+                match *sim_proc.kwg {
+                    KwgEither::Node22(ref kwg) => {
+                        let board_snapshot = &movegen::BoardSnapshot {
+                            board_tiles: &sim_proc.initial_board_tiles,
+                            game_config: &sim_proc.game_config,
+                            kwg,
+                            klv: &sim_proc.klv,
+                        };
+                        console_log!(
+                            "{} {} gets {}",
+                            play.equity,
+                            play.play.fmt(board_snapshot),
+                            sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
+                        );
+                    }
+                    KwgEither::Node24(ref kwg) => {
+                        let board_snapshot = &movegen::BoardSnapshot {
+                            board_tiles: &sim_proc.initial_board_tiles,
+                            game_config: &sim_proc.game_config,
+                            kwg,
+                            klv: &sim_proc.klv,
+                        };
+                        console_log!(
+                            "{} {} gets {}",
+                            play.equity,
+                            play.play.fmt(board_snapshot),
+                            sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
+                        );
+                    }
+                }
             }
             stats.update(sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage());
         }
