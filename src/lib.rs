@@ -182,8 +182,8 @@ struct Candidate {
 struct SimProc {
     initial_board_tiles: Vec<u8>,
     game_config: std::sync::Arc<game_config::GameConfig>,
-    kwg: std::sync::Arc<kwg::Kwg>,
-    klv: std::sync::Arc<klv::Klv>,
+    kwg: std::sync::Arc<kwg::Kwg<kwg::Node22>>,
+    klv: std::sync::Arc<klv::Klv<kwg::Node22>>,
     simmer: simmer::Simmer,
     plays: Vec<movegen::ValuedMove>,
     candidates: Vec<Candidate>,
@@ -194,8 +194,8 @@ type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>
 type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
 lazy_static::lazy_static! {
-    static ref CACHED_KWG: WasmCache<kwg::Kwg> = Default::default();
-    static ref CACHED_KLV: WasmCache<klv::Klv> = Default::default();
+    static ref CACHED_KWG: WasmCache<kwg::Kwg<kwg::Node22>> = Default::default();
+    static ref CACHED_KLV: WasmCache<klv::Klv<kwg::Node22>> = Default::default();
     static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig> = Default::default();
     static ref SIM_PROCS: WasmCacheInt<std::sync::RwLock<SimProc>> = Default::default();
 }
