@@ -11,7 +11,7 @@ macro_rules! mod_many {
     $(#[allow(dead_code)] mod $mod;)+
   };
 }
-mod_many!(alphabet bag bites bites_str board_layout display fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats);
+mod_many!(alphabet bag bites bites_str board_layout display equity fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats);
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
@@ -306,7 +306,7 @@ async fn do_analyze<N: kwg::Node>(
                 },
                 |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
                 |leave_value: f32| leave_value,
-                |equity: f32, play: &movegen::Play| match game_config.game_rules() {
+                |equity: equity::Equity, play: &movegen::Play| match game_config.game_rules() {
                     game_config::GameRules::Classic => true,
                     game_config::GameRules::Jumbled => match play {
                         movegen::Play::Exchange { .. } => true,
@@ -321,7 +321,7 @@ async fn do_analyze<N: kwg::Node>(
                             alpha_buf.extend_from_slice(word);
                             alpha_buf.sort_unstable();
                             seen_moves.insert((
-                                equity.to_bits(),
+                                equity.raw().to_bits(),
                                 movegen::Play::Place {
                                     down: *down,
                                     lane: *lane,
