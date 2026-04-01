@@ -396,9 +396,7 @@ fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<J
         }
         num_unseen_tiles -= len_this_rack;
     }
-    game_state.bag.0.clear();
-    game_state.bag.0.reserve(num_unseen_tiles);
-    game_state.bag.0.extend(unseen_tiles);
+    game_state.bag.set_from_iter(unseen_tiles);
     game_state.players[0].rack.clear();
     game_state.players[0].rack.extend(&req.rack);
 
@@ -530,12 +528,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     game_state
         .board_tiles
         .copy_from_slice(&kibitzer.board_tiles);
-    game_state.bag.0.clear();
-    game_state
-        .bag
-        .0
-        .reserve(kibitzer.available_tally.iter().map(|&x| x as usize).sum());
-    game_state.bag.0.extend(
+    game_state.bag.set_from_iter(
         (0u8..)
             .zip(kibitzer.available_tally.iter())
             .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
@@ -543,13 +536,15 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     RNG.with(|rng| {
         game_state.bag.shuffle(&mut *rng.borrow_mut());
     });
-    let bag_size = game_state.bag.0.len();
+    let bag_size = game_state.bag.len();
     for i in 0..game_config.num_players() as usize {
         game_state.players[i].score = req.scores[i];
         if i != req.turn as usize {
-            game_state
-                .bag
-                .replenish(&mut game_state.players[i].rack, req.rack_sizes[i] as usize);
+            game_state.bag.replenish(
+                &mut game_state.players[i].rack,
+                req.rack_sizes[i] as usize,
+                i,
+            );
         }
         if game_state.players[i].rack.len() != req.rack_sizes[i] as usize {
             return_js_error!(format!(
