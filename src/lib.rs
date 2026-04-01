@@ -321,7 +321,7 @@ async fn do_analyze<N: kwg::Node>(
                             alpha_buf.extend_from_slice(word);
                             alpha_buf.sort_unstable();
                             seen_moves.insert((
-                                equity.raw().to_bits(),
+                                equity.raw(),
                                 movegen::Play::Place {
                                     down: *down,
                                     lane: *lane,

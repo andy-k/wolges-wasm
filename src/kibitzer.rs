@@ -56,7 +56,7 @@ impl From<&movegen::Play> for JsonPlay {
                     lane: *lane,
                     idx: *idx,
                     word: word_played.into(),
-                    score: *score,
+                    score: *score / equity::SCALE,
                 }
             }
         }
@@ -93,7 +93,7 @@ impl From<&JsonPlay> for movegen::Play {
                     lane: *lane,
                     idx: *idx,
                     word: word_played[..].into(),
-                    score: *score,
+                    score: *score * equity::SCALE,
                 }
             }
         }
@@ -111,7 +111,7 @@ impl From<&movegen::ValuedMove> for JsonPlayWithEquity {
     #[inline(always)]
     fn from(play: &movegen::ValuedMove) -> Self {
         Self {
-            equity: play.equity.raw(),
+            equity: play.equity.as_f64() as f32,
             play: (&play.play).into(),
         }
     }
@@ -121,7 +121,7 @@ impl From<&JsonPlayWithEquity> for movegen::ValuedMove {
     #[inline(always)]
     fn from(play: &JsonPlayWithEquity) -> Self {
         Self {
-            equity: equity::Equity::new(play.equity),
+            equity: equity::Equity::from_f32(play.equity),
             play: (&play.play).into(),
         }
     }
