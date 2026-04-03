@@ -305,7 +305,7 @@ async fn do_analyze<N: kwg::Node>(
                     always_include_pass: false,
                 },
                 |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
-                |leave_value: f32| leave_value,
+                |leave_value: i32| leave_value,
                 |equity: equity::Equity, play: &movegen::Play| match game_config.game_rules() {
                     game_config::GameRules::Classic => true,
                     game_config::GameRules::Jumbled => match play {
