@@ -445,7 +445,7 @@ fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<J
                         valid: invalid_words.is_empty(),
                         invalid_words,
                         json_play_with_equity: kibitzer::JsonPlayWithEquity {
-                            equity: recounted_equity,
+                            equity: recounted_equity as f32 / equity::SCALE as f32,
                             play: (&canonical_play).into(),
                         },
                     }
