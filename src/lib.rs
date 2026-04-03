@@ -678,7 +678,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
             };
             let final_spread = sim_proc.simmer.final_equity_spread();
             let win_prob = sim_proc.simmer.compute_win_prob(game_ended, final_spread);
-            let sim_spread = final_spread - sim_proc.simmer.initial_score_spread as f32;
+            let sim_spread = final_spread - sim_proc.simmer.initial_score_spread;
             if false {
                 match *sim_proc.kwg {
                     KwgEither::Node22(ref kwg) => {
