@@ -433,7 +433,7 @@ fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<J
                         board_snapshot,
                         &game_state,
                         &canonical_play,
-                        1.0,
+                        move_filter::LEAVE_SCALE_DENOM,
                         recounted_score,
                     );
                     let mut invalid_words = Vec::new();
