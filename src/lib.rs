@@ -108,6 +108,14 @@ pub fn do_this_on_startup() {
         game_config::make_jumbled_polish_game_config().into(),
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGame/slovene".into(),
+        game_config::make_slovene_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmog/slovene".into(),
+        game_config::make_jumbled_slovene_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame/spanish".into(),
         game_config::make_spanish_game_config().into(),
     );
