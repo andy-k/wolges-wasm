@@ -11,7 +11,7 @@ macro_rules! mod_many {
     $(#[allow(dead_code)] mod $mod;)+
   };
 }
-mod_many!(alphabet bag bites bites_str board_layout display equity fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats);
+mod_many!(alphabet bag bites bites_str board_layout census display equity fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats win_pct);
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
@@ -319,6 +319,7 @@ async fn do_analyze<N: kwg::Node>(
                     max_gen: req.max_gen,
                     num_exchanges_by_this_player: 0, // TODO: this should be specified externally
                     always_include_pass: false,
+                    dynamic_leaves: None,
                 },
                 |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
                 |leave_value: i32| leave_value,
@@ -586,6 +587,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
                 max_gen: req.max_gen,
                 num_exchanges_by_this_player: game_state.current_player().num_exchanges,
                 always_include_pass: false,
+                dynamic_leaves: None,
             });
         }
         KwgEither::Node24(ref kwg) => {
@@ -601,6 +603,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
                 max_gen: req.max_gen,
                 num_exchanges_by_this_player: game_state.current_player().num_exchanges,
                 always_include_pass: false,
+                dynamic_leaves: None,
             });
         }
     }
@@ -693,7 +696,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
                 }
             };
             let final_spread = sim_proc.simmer.final_equity_spread();
-            let win_prob = sim_proc.simmer.compute_win_prob(game_ended, final_spread);
+            let win_prob = sim_proc.simmer.compute_win_prob(game_ended, final_spread, None);
             let sim_spread = final_spread - sim_proc.simmer.initial_score_spread;
             if false {
                 match *sim_proc.kwg {

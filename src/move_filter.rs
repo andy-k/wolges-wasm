@@ -153,7 +153,7 @@ impl<'a> Tilt<'a> {
             false
         } else {
             let word_len = word.len();
-            let this_wp = self.word_prob.count_ways(word);
+            let this_wp = self.word_prob.word_draw_ways(word);
             let max_wp = self.max_prob_by_len[word_len];
             // Accept if: importance[len] * p*(2-p) >= tilt_factor,
             // where p = this_wp / max_wp.
@@ -207,6 +207,7 @@ impl GenMoves<'_> {
                     max_gen,
                     num_exchanges_by_this_player,
                     always_include_pass: false,
+                    dynamic_leaves: None,
                 });
             }
             Self::Tilt { tilt, bot_level: _ } => {
@@ -219,6 +220,7 @@ impl GenMoves<'_> {
                         max_gen,
                         num_exchanges_by_this_player,
                         always_include_pass: false,
+                        dynamic_leaves: None,
                     },
                     |down: bool, lane: i8, idx: i8, word: &[u8], _score: i32| {
                         limited_vocab_checker.words_placed_are_ok(
