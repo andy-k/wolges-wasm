@@ -3,15 +3,7 @@
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
 
-#[macro_use]
-mod error;
-
-macro_rules! mod_many {
-  ($($mod: ident)+) => {
-    $(#[allow(dead_code)] mod $mod;)+
-  };
-}
-mod_many!(alphabet bag bites bites_str board_layout census display equity fash game_config game_state game_timers kibitzer klv kwg matrix move_filter movegen play_scorer prob simmer stats win_pct);
+use wolges::*;
 
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
