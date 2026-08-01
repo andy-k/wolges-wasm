@@ -268,6 +268,25 @@ pub fn precache_klv(key: String, value: &[u8]) {
         .insert(key, klv::Klv::from_bytes_alloc(value).into());
 }
 
+// Forget a cached word graph. Callers that load lexicons on demand need a way
+// to give the memory back; without one, a long-lived instance keeps every
+// lexicon it has ever been asked for. Returns whether the key was there.
+//
+// A call already in flight is unaffected: get_wasm_cache! clones the Arc before
+// doing any work, so this drops the name and the memory goes back to the
+// allocator when the last user is done with it. A later call naming an evicted
+// key gets the usual "missing kwg", which is the point -- the failure is loud.
+#[wasm_bindgen]
+pub fn evict_kwg(key: String) -> bool {
+    CACHED_KWG.write().unwrap().remove(&key).is_some()
+}
+
+// Same, for a leave-value table. See evict_kwg.
+#[wasm_bindgen]
+pub fn evict_klv(key: String) -> bool {
+    CACHED_KLV.write().unwrap().remove(&key).is_some()
+}
+
 #[wasm_bindgen]
 pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
     let req = serde_json::from_str::<AnalyzeRequest>(&req_str).map_err(err_to_str)?;
