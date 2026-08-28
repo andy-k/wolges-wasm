@@ -20,6 +20,15 @@ enum KwgEither {
     Node24(kwg::Kwg<kwg::Node24>),
 }
 
+impl KwgEither {
+    fn fits_alphabet(&self, alphabet_len: u8) -> bool {
+        match self {
+            KwgEither::Node22(kwg) => kwg.fits_alphabet(alphabet_len),
+            KwgEither::Node24(kwg) => kwg.fits_alphabet(alphabet_len),
+        }
+    }
+}
+
 #[wasm_bindgen(start)]
 pub fn do_this_on_startup() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
@@ -306,6 +315,13 @@ async fn do_analyze<N: kwg::Node>(
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return_js_error!(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
+
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
@@ -400,6 +416,13 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
 fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
+
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return_js_error!(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
 
     let mut game_state = game_state::GameState::new(&game_config);
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -498,6 +521,12 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return_js_error!(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
     if req.rack.len() > game_config.rack_size() as usize {
         // It is intentional that analyze() doesn't enforce this.
         return_js_error!(format!(
