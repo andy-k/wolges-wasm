@@ -223,12 +223,14 @@ struct SimProc {
 type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>>;
 type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
-lazy_static::lazy_static! {
-    static ref CACHED_KWG: WasmCache<KwgEither> = Default::default();
-    static ref CACHED_KLV: WasmCache<klv::Klv<kwg::Node22>> = Default::default();
-    static ref CACHED_GAME_CONFIG: WasmCache<game_config::GameConfig> = Default::default();
-    static ref SIM_PROCS: WasmCacheInt<std::sync::RwLock<SimProc>> = Default::default();
-}
+static CACHED_KWG: std::sync::LazyLock<WasmCache<KwgEither>> =
+    std::sync::LazyLock::new(Default::default);
+static CACHED_KLV: std::sync::LazyLock<WasmCache<klv::Klv<kwg::Node22>>> =
+    std::sync::LazyLock::new(Default::default);
+static CACHED_GAME_CONFIG: std::sync::LazyLock<WasmCache<game_config::GameConfig>> =
+    std::sync::LazyLock::new(Default::default);
+static SIM_PROCS: std::sync::LazyLock<WasmCacheInt<std::sync::RwLock<SimProc>>> =
+    std::sync::LazyLock::new(Default::default);
 
 macro_rules! get_wasm_cache {
     ($cache: expr, $key: expr, $err: expr) => {
