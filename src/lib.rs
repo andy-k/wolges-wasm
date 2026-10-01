@@ -316,50 +316,53 @@ async fn do_analyze<N: kwg::Node>(
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
         kwg,
+        anagrams: None,
+        rack_lengths: None,
         klv: &klv,
     };
 
     {
         let mut seen_moves = fash::MyHashSet::default();
         let mut alpha_buf = Vec::new();
+        let mut dedup = |equity: equity::Equity, play: &movegen::Play| match play {
+            movegen::Play::Exchange { .. } => true,
+            movegen::Play::Place {
+                down,
+                lane,
+                idx,
+                word,
+                score,
+            } => {
+                alpha_buf.clear();
+                alpha_buf.extend_from_slice(word);
+                alpha_buf.sort_unstable();
+                seen_moves.insert((
+                    equity.raw(),
+                    movegen::Play::Place {
+                        down: *down,
+                        lane: *lane,
+                        idx: *idx,
+                        word: alpha_buf[..].into(),
+                        score: *score,
+                    },
+                ))
+            }
+        };
         move_generator
-            .gen_moves_filtered_async(
+            .gen_moves_filtered_async_lean(
                 &movegen::GenMovesParams {
                     board_snapshot,
                     rack: &req.rack,
                     max_gen: req.max_gen,
                     num_exchanges_by_this_player: 0, // TODO: this should be specified externally
-                    always_include_pass: false,
+                    pass_policy: movegen::PassPolicy::OnlyWhenForced,
                     dynamic_leaves: None,
                 },
-                |_down: bool, _lane: i8, _idx: i8, _word: &[u8], _score: i32| true,
-                |leave_value: i32| leave_value,
-                |equity: equity::Equity, play: &movegen::Play| match game_config.game_rules() {
-                    game_config::GameRules::Classic => true,
-                    game_config::GameRules::Jumbled => match play {
-                        movegen::Play::Exchange { .. } => true,
-                        movegen::Play::Place {
-                            down,
-                            lane,
-                            idx,
-                            word,
-                            score,
-                        } => {
-                            alpha_buf.clear();
-                            alpha_buf.extend_from_slice(word);
-                            alpha_buf.sort_unstable();
-                            seen_moves.insert((
-                                equity.raw(),
-                                movegen::Play::Place {
-                                    down: *down,
-                                    lane: *lane,
-                                    idx: *idx,
-                                    word: alpha_buf[..].into(),
-                                    score: *score,
-                                },
-                            ))
-                        }
-                    },
+                movegen::PlacePredicate::AcceptAll,
+                klv::AdjustLeave::Identity,
+                match game_config.game_rules() {
+                    game_config::GameRules::Classic => movegen::EquityPredicate::AcceptAll,
+                    game_config::GameRules::Jumbled => movegen::EquityPredicate::Dyn(&mut dedup),
                 },
                 || wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)),
             )
@@ -432,6 +435,8 @@ fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<J
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
         kwg,
+        anagrams: None,
+        rack_lengths: None,
         klv: &klv,
     };
 
@@ -590,14 +595,16 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
                 board_tiles: &kibitzer.board_tiles,
                 game_config: &game_config,
                 kwg,
+                anagrams: None,
+                rack_lengths: None,
                 klv: &klv,
             };
-            move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
+            move_generator.gen_moves_unfiltered_lean(&movegen::GenMovesParams {
                 board_snapshot,
                 rack: &req.rack,
                 max_gen: req.max_gen,
                 num_exchanges_by_this_player: game_state.current_player().num_exchanges,
-                always_include_pass: false,
+                pass_policy: movegen::PassPolicy::OnlyWhenForced,
                 dynamic_leaves: None,
             });
         }
@@ -606,14 +613,16 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
                 board_tiles: &kibitzer.board_tiles,
                 game_config: &game_config,
                 kwg,
+                anagrams: None,
+                rack_lengths: None,
                 klv: &klv,
             };
-            move_generator.gen_moves_unfiltered(&movegen::GenMovesParams {
+            move_generator.gen_moves_unfiltered_lean(&movegen::GenMovesParams {
                 board_snapshot,
                 rack: &req.rack,
                 max_gen: req.max_gen,
                 num_exchanges_by_this_player: game_state.current_player().num_exchanges,
-                always_include_pass: false,
+                pass_policy: movegen::PassPolicy::OnlyWhenForced,
                 dynamic_leaves: None,
             });
         }
@@ -639,7 +648,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     }
     sim_proc
         .simmer
-        .prepare(&game_config, &game_state, req.num_sim_plies);
+        .prepare(&game_config, &game_state, req.num_sim_plies, false);
 
     let mut sim_pid;
     {
@@ -718,6 +727,8 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
                             board_tiles: &sim_proc.initial_board_tiles,
                             game_config: &sim_proc.game_config,
                             kwg,
+                            anagrams: None,
+                            rack_lengths: None,
                             klv: &sim_proc.klv,
                         };
                         console_log!(
@@ -732,6 +743,8 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
                             board_tiles: &sim_proc.initial_board_tiles,
                             game_config: &sim_proc.game_config,
                             kwg,
+                            anagrams: None,
+                            rack_lengths: None,
                             klv: &sim_proc.klv,
                         };
                         console_log!(
