@@ -5,5 +5,9 @@ run ["rustup", "target", "add", "wasm32-unknown-unknown"]
 
 workdir /workdir
 
+# panic messages carry source paths: name this container's the same as a
+# build anywhere else would
+env RUSTFLAGS="--remap-path-prefix=/usr/local/cargo/registry/src=/cargo --remap-path-prefix=/workdir=/wolges-wasm"
+
 # for webpack and deno
 cmd ["bash", "-c", "wasm-pack build && wasm-pack build -t web -d pkg-web"]
