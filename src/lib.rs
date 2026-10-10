@@ -30,11 +30,13 @@ impl KwgEither {
 }
 
 #[wasm_bindgen(start)]
-pub fn do_this_on_startup() {
+pub fn do_this_on_startup() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     CACHED_KLV.write().unwrap().insert(
         "noleave".into(),
-        klv::Klv::from_bytes_alloc(klv::EMPTY_KLV_BYTES).into(),
+        klv::Klv::from_bytes_alloc(klv::EMPTY_KLV_BYTES)
+            .map_err(err_to_str)?
+            .into(),
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame".into(),
@@ -132,6 +134,7 @@ pub fn do_this_on_startup() {
         "WordSmog/swedish".into(),
         game_config::make_jumbled_swedish_game_config().into(),
     );
+    Ok(())
 }
 
 fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
@@ -256,27 +259,32 @@ thread_local! {
 }
 
 #[wasm_bindgen]
-pub fn precache_kwg(key: String, value: &[u8]) {
+pub fn precache_kwg(key: String, value: &[u8]) -> Result<(), JsValue> {
     CACHED_KWG.write().unwrap().insert(
         key,
-        KwgEither::Node22(kwg::Kwg::from_bytes_alloc(value)).into(),
+        KwgEither::Node22(kwg::Kwg::from_bytes_alloc(value).map_err(err_to_str)?).into(),
     );
+    Ok(())
 }
 
 #[wasm_bindgen]
-pub fn precache_kbwg(key: String, value: &[u8]) {
+pub fn precache_kbwg(key: String, value: &[u8]) -> Result<(), JsValue> {
     CACHED_KWG.write().unwrap().insert(
         key,
-        KwgEither::Node24(kwg::Kwg::from_bytes_alloc(value)).into(),
+        KwgEither::Node24(kwg::Kwg::from_bytes_alloc(value).map_err(err_to_str)?).into(),
     );
+    Ok(())
 }
 
 #[wasm_bindgen]
-pub fn precache_klv(key: String, value: &[u8]) {
-    CACHED_KLV
-        .write()
-        .unwrap()
-        .insert(key, klv::Klv::from_bytes_alloc(value).into());
+pub fn precache_klv(key: String, value: &[u8]) -> Result<(), JsValue> {
+    CACHED_KLV.write().unwrap().insert(
+        key,
+        klv::Klv::from_bytes_alloc(value)
+            .map_err(err_to_str)?
+            .into(),
+    );
+    Ok(())
 }
 
 // Forget a cached word graph. Callers that load lexicons on demand need a way
@@ -671,7 +679,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
                 stats: stats::Stats::new(),
             })
             .collect(),
-        simmer: simmer::Simmer::new(&game_config),
+        simmer: simmer::Simmer::new(&game_config).map_err(err_to_str)?,
         play_finder: Default::default(),
     };
     for (i, play) in sim_proc.plays.iter().enumerate() {
@@ -730,23 +738,23 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
     if false {
         console_log!("begin!");
     }
+    // the rollouts generate with no tables, as everything here does
+    let no_tables = anagrams::ArmTables::None;
     let mut stats = stats::Stats::new();
     for _num in 1..=1000 {
         sim_proc.simmer.prepare_iteration();
         for play in plays.iter() {
             let game_ended = match *kwg {
-                KwgEither::Node22(ref kwg) => {
-                    sim_proc
-                        .simmer
-                        .simulate(&game_config, kwg, &klv, &play.play)
-                }
-                KwgEither::Node24(ref kwg) => {
-                    sim_proc
-                        .simmer
-                        .simulate(&game_config, kwg, &klv, &play.play)
-                }
+                KwgEither::Node22(ref kwg) => sim_proc
+                    .simmer
+                    .simulate(&game_config, kwg, &no_tables, &klv, &play.play)
+                    .map_err(err_to_str)?,
+                KwgEither::Node24(ref kwg) => sim_proc
+                    .simmer
+                    .simulate(&game_config, kwg, &no_tables, &klv, &play.play)
+                    .map_err(err_to_str)?,
             };
-            let final_spread = sim_proc.simmer.final_equity_spread();
+            let final_spread = sim_proc.simmer.final_equity_spread().map_err(err_to_str)?;
             let win_prob = sim_proc
                 .simmer
                 .compute_win_prob(game_ended, final_spread, None);
