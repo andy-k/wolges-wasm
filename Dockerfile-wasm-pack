@@ -1,6 +1,6 @@
 from rust:1.99.0
 
-run ["cargo", "install", "wasm-pack"]
+run ["cargo", "install", "wasm-pack", "--locked"]
 run ["rustup", "target", "add", "wasm32-unknown-unknown"]
 
 workdir /workdir
