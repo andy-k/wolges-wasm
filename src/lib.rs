@@ -29,6 +29,17 @@ impl KwgEither {
     }
 }
 
+// the commits this wasm was built from: wolges-wasm's, then wolges's, each with
+// the target, as their build.rs files stamp them
+#[wasm_bindgen]
+pub fn version() -> String {
+    format!(
+        "wolges-wasm {} wolges {}",
+        env!("WOLGES_WASM_VERSION"),
+        wolges::VERSION
+    )
+}
+
 #[wasm_bindgen(start)]
 pub fn do_this_on_startup() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
