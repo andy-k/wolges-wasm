@@ -698,7 +698,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     }
     sim_proc
         .simmer
-        .prepare(&game_config, &game_state, req.num_sim_plies, false);
+        .prepare(&game_config, &game_state, req.num_sim_plies, false, &[]);
 
     let mut sim_pid;
     {
