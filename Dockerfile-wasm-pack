@@ -11,7 +11,7 @@ env RUSTFLAGS="--remap-path-prefix=/usr/local/cargo/registry/src=/cargo --remap-
 
 # the build reads its commits with git, which refuses a repository another
 # user owns, as a mounted one is on a Linux host
-env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=*
+run ["git", "config", "--system", "--add", "safe.directory", "*"]
 
 # for webpack and deno
 cmd ["bash", "-c", "wasm-pack build && wasm-pack build -t web -d pkg-web"]
