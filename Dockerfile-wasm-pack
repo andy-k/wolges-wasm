@@ -64,5 +64,22 @@ if restored:
     print(f"restore-cargo-times: {restored} restored", file=sys.stderr)
 EOF
 
+copy --chmod=755 <<'EOF' /usr/local/bin/build-packages
+#!/usr/bin/env bash
+set -euo pipefail
+# wasm-pack lists in package.json's "files" only the license files the out
+# directory holds as it writes package.json, and it copies the crate's there
+# afterward: a first build in a fresh tree would leave LICENSE.txt out. So
+# each out directory gets a copy first
+for dir in pkg pkg-web; do
+  mkdir -p "$dir"
+  [ -e "$dir/LICENSE.txt" ] || cp -npv LICENSE.txt "$dir/"
+done
 # for webpack and deno
-cmd ["bash", "-c", "wasm-pack build && restore-cargo-times && wasm-pack build -t web -d pkg-web && restore-cargo-times"]
+wasm-pack build
+restore-cargo-times
+wasm-pack build -t web -d pkg-web
+restore-cargo-times
+EOF
+
+cmd ["build-packages"]
