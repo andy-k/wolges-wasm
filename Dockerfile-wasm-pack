@@ -13,5 +13,56 @@ env RUSTFLAGS="--remap-path-prefix=/usr/local/cargo/registry/src=/cargo --remap-
 # user owns, as a mounted one is on a Linux host
 run ["git", "config", "--system", "--add", "safe.directory", "*"]
 
+# cargo sets each job's dep-info file, and each build script's output, to the
+# time the job started. On a directory shared from a Mac, Docker Desktop keeps
+# only the whole seconds of a time set on a file that already exists, so a
+# file written in that second looks newer, and the next build compiles again
+# what this one just did. A time set through the open that creates a file
+# keeps its fraction: this writes each such file anew that way and renames it
+# over the old one. Where the times already match, it touches nothing
+copy --chmod=755 <<'EOF' /usr/local/bin/restore-cargo-times
+#!/usr/bin/env python3
+import glob
+import os
+import sys
+
+NS = 10**9
+target = os.environ.get("CARGO_TARGET_DIR", "target")
+restored = 0
+for profile in glob.glob(f"{target}/*/") + glob.glob(f"{target}/*/*/"):
+    pairs = [
+        (dep, os.path.join(os.path.dirname(dep), "invoked.timestamp"))
+        for dep in glob.glob(f"{profile}.fingerprint/*/dep-*")
+    ]
+    pairs += [
+        (run + "output", run + "invoked.timestamp")
+        for run in glob.glob(f"{profile}build/*/")
+    ]
+    for path, stamp in pairs:
+        try:
+            start = os.stat(stamp).st_mtime_ns
+            st = os.stat(path)
+        except FileNotFoundError:
+            continue
+        # only the job's start time with its fraction cut off
+        if start % NS == 0 or st.st_mtime_ns != start - start % NS:
+            continue
+        with open(path, "rb") as f:
+            data = f.read()
+        new = path + ".new"
+        if os.path.exists(new):
+            os.unlink(new)
+        fd = os.open(new, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                     st.st_mode & 0o7777)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.utime(f.fileno(), ns=(start, start))
+        os.replace(new, path)
+        restored += 1
+if restored:
+    print(f"restore-cargo-times: {restored} restored", file=sys.stderr)
+EOF
+
 # for webpack and deno
-cmd ["bash", "-c", "wasm-pack build && wasm-pack build -t web -d pkg-web"]
+cmd ["bash", "-c", "wasm-pack build && restore-cargo-times && wasm-pack build -t web -d pkg-web && restore-cargo-times"]
