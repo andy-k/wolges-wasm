@@ -78,8 +78,19 @@ done
 # for webpack and deno
 wasm-pack build
 restore-cargo-times
-wasm-pack build -t web -d pkg-web
+# wasm-opt takes most of a build, and both targets get the same wasm, so it
+# runs once: the web build skips it and takes the bundler's output, after a
+# third build (the bundler's without wasm-opt) shows that the two still match
+wasm-pack build -t web -d pkg-web --no-opt
 restore-cargo-times
+wasm-pack build -d target/pkg-no-opt --no-opt
+restore-cargo-times
+if ! cmp target/pkg-no-opt/wolges_wasm_bg.wasm pkg-web/wolges_wasm_bg.wasm; then
+  printf '%s\n' "the web target's wasm is not the bundler's: it needs its own wasm-opt" >&2
+  exit 1
+fi
+rm pkg-web/wolges_wasm_bg.wasm
+cp -npv pkg/wolges_wasm_bg.wasm pkg-web/
 EOF
 
 cmd ["build-packages"]
