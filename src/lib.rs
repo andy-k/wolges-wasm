@@ -106,6 +106,14 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
         game_config::make_jumbled_german_game_config().into(),
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
+        "CrosswordGameSuper/german".into(),
+        game_config::make_super_german_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
+        "WordSmogSuper/german".into(),
+        game_config::make_jumbled_super_german_game_config().into(),
+    );
+    CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame/norwegian".into(),
         game_config::make_norwegian_game_config().into(),
     );
