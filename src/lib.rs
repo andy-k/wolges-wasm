@@ -15,19 +15,13 @@ macro_rules! return_js_error {
     };
 }
 
-enum KwgEither {
-    Node22(kwg::Kwg<kwg::Node22>),
-    Node24(kwg::Kwg<kwg::Node24>),
-}
-
-impl KwgEither {
-    fn fits_alphabet(&self, alphabet_len: u8) -> bool {
-        match self {
-            KwgEither::Node22(kwg) => kwg.fits_alphabet(alphabet_len),
-            KwgEither::Node24(kwg) => kwg.fits_alphabet(alphabet_len),
-        }
-    }
-}
+// every word graph is kept in kbwg's layout, which holds any graph a kwg does
+// as well as the larger ones only a kbwg can. So the move generator, with all
+// that is generic over the node, is built once, not once a layout. A kwg is
+// repacked in place as it loads (kwg::repack_in_place), so a load holds no
+// third copy of it. A leave table keeps its own graph in kwg's layout:
+// repacking it as well left the wasm no smaller, no faster.
+type Kwg = kwg::Kwg<kwg::Node24>;
 
 // the commits this wasm was built from: wolges-wasm's, then wolges's, each with
 // the target, as their build.rs files stamp them
@@ -234,7 +228,7 @@ struct Candidate {
 struct SimProc {
     initial_board_tiles: Vec<u8>,
     game_config: std::sync::Arc<game_config::GameConfig>,
-    kwg: std::sync::Arc<KwgEither>,
+    kwg: std::sync::Arc<Kwg>,
     klv: std::sync::Arc<klv::Klv<kwg::Node22>>,
     simmer: simmer::Simmer,
     plays: Vec<movegen::ValuedMove>,
@@ -245,8 +239,7 @@ struct SimProc {
 type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>>;
 type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
-static CACHED_KWG: std::sync::LazyLock<WasmCache<KwgEither>> =
-    std::sync::LazyLock::new(Default::default);
+static CACHED_KWG: std::sync::LazyLock<WasmCache<Kwg>> = std::sync::LazyLock::new(Default::default);
 static CACHED_KLV: std::sync::LazyLock<WasmCache<klv::Klv<kwg::Node22>>> =
     std::sync::LazyLock::new(Default::default);
 static CACHED_GAME_CONFIG: std::sync::LazyLock<WasmCache<game_config::GameConfig>> =
@@ -278,10 +271,11 @@ thread_local! {
 }
 
 #[wasm_bindgen]
-pub fn precache_kwg(key: String, value: &[u8]) -> Result<(), JsValue> {
+pub fn precache_kwg(key: String, mut value: Vec<u8>) -> Result<(), JsValue> {
+    kwg::repack_in_place::<kwg::Node22, kwg::Node24>(&mut value).map_err(err_to_str)?;
     CACHED_KWG.write().unwrap().insert(
         key,
-        KwgEither::Node22(kwg::Kwg::from_bytes_alloc(value).map_err(err_to_str)?).into(),
+        Kwg::from_bytes_alloc(&value).map_err(err_to_str)?.into(),
     );
     Ok(())
 }
@@ -290,7 +284,7 @@ pub fn precache_kwg(key: String, value: &[u8]) -> Result<(), JsValue> {
 pub fn precache_kbwg(key: String, value: &[u8]) -> Result<(), JsValue> {
     CACHED_KWG.write().unwrap().insert(
         key,
-        KwgEither::Node24(kwg::Kwg::from_bytes_alloc(value).map_err(err_to_str)?).into(),
+        Kwg::from_bytes_alloc(value).map_err(err_to_str)?.into(),
     );
     Ok(())
 }
@@ -331,16 +325,10 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
 
-    match *kwg {
-        KwgEither::Node22(ref kwg) => do_analyze(req, kwg).await,
-        KwgEither::Node24(ref kwg) => do_analyze(req, kwg).await,
-    }
+    do_analyze(req, &kwg).await
 }
 
-async fn do_analyze<N: kwg::Node>(
-    req: AnalyzeRequest,
-    kwg: &kwg::Kwg<N>,
-) -> Result<JsValue, JsValue> {
+async fn do_analyze(req: AnalyzeRequest, kwg: &Kwg) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -436,13 +424,10 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
 
-    match *kwg {
-        KwgEither::Node22(ref kwg) => do_play_score(req, kwg),
-        KwgEither::Node24(ref kwg) => do_play_score(req, kwg),
-    }
+    do_play_score(req, &kwg)
 }
 
-fn do_play_score<N: kwg::Node>(req: ScoreRequest, kwg: &kwg::Kwg<N>) -> Result<JsValue, JsValue> {
+fn do_play_score(req: ScoreRequest, kwg: &Kwg) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -647,44 +632,22 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     }
 
     let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
-    match *kwg {
-        KwgEither::Node22(ref kwg) => {
-            let board_snapshot = &movegen::BoardSnapshot {
-                board_tiles: &kibitzer.board_tiles,
-                game_config: &game_config,
-                kwg,
-                anagrams: None,
-                rack_lengths: None,
-                klv: &klv,
-            };
-            move_generator.gen_moves_unfiltered_lean(&movegen::GenMovesParams {
-                board_snapshot,
-                rack: &req.rack,
-                max_gen: req.max_gen,
-                num_exchanges_by_this_player: game_state.current_player().num_exchanges,
-                pass_policy: movegen::PassPolicy::OnlyWhenForced,
-                dynamic_leaves: None,
-            });
-        }
-        KwgEither::Node24(ref kwg) => {
-            let board_snapshot = &movegen::BoardSnapshot {
-                board_tiles: &kibitzer.board_tiles,
-                game_config: &game_config,
-                kwg,
-                anagrams: None,
-                rack_lengths: None,
-                klv: &klv,
-            };
-            move_generator.gen_moves_unfiltered_lean(&movegen::GenMovesParams {
-                board_snapshot,
-                rack: &req.rack,
-                max_gen: req.max_gen,
-                num_exchanges_by_this_player: game_state.current_player().num_exchanges,
-                pass_policy: movegen::PassPolicy::OnlyWhenForced,
-                dynamic_leaves: None,
-            });
-        }
-    }
+    let board_snapshot = &movegen::BoardSnapshot {
+        board_tiles: &kibitzer.board_tiles,
+        game_config: &game_config,
+        kwg: &kwg,
+        anagrams: None,
+        rack_lengths: None,
+        klv: &klv,
+    };
+    move_generator.gen_moves_unfiltered_lean(&movegen::GenMovesParams {
+        board_snapshot,
+        rack: &req.rack,
+        max_gen: req.max_gen,
+        num_exchanges_by_this_player: game_state.current_player().num_exchanges,
+        pass_policy: movegen::PassPolicy::OnlyWhenForced,
+        dynamic_leaves: None,
+    });
 
     let mut sim_proc = SimProc {
         initial_board_tiles: kibitzer.board_tiles,
@@ -763,56 +726,30 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
     for _num in 1..=1000 {
         sim_proc.simmer.prepare_iteration();
         for play in plays.iter() {
-            let game_ended = match *kwg {
-                KwgEither::Node22(ref kwg) => sim_proc
-                    .simmer
-                    .simulate(&game_config, kwg, &no_tables, &klv, &play.play)
-                    .map_err(err_to_str)?,
-                KwgEither::Node24(ref kwg) => sim_proc
-                    .simmer
-                    .simulate(&game_config, kwg, &no_tables, &klv, &play.play)
-                    .map_err(err_to_str)?,
-            };
+            let game_ended = sim_proc
+                .simmer
+                .simulate(&game_config, &kwg, &no_tables, &klv, &play.play)
+                .map_err(err_to_str)?;
             let final_spread = sim_proc.simmer.final_equity_spread().map_err(err_to_str)?;
             let win_prob = sim_proc
                 .simmer
                 .compute_win_prob(game_ended, final_spread, None);
             let sim_spread = final_spread - sim_proc.simmer.initial_score_spread;
             if false {
-                match *sim_proc.kwg {
-                    KwgEither::Node22(ref kwg) => {
-                        let board_snapshot = &movegen::BoardSnapshot {
-                            board_tiles: &sim_proc.initial_board_tiles,
-                            game_config: &sim_proc.game_config,
-                            kwg,
-                            anagrams: None,
-                            rack_lengths: None,
-                            klv: &sim_proc.klv,
-                        };
-                        console_log!(
-                            "{} {} gets {}",
-                            play.equity,
-                            play.play.fmt(board_snapshot),
-                            sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
-                        );
-                    }
-                    KwgEither::Node24(ref kwg) => {
-                        let board_snapshot = &movegen::BoardSnapshot {
-                            board_tiles: &sim_proc.initial_board_tiles,
-                            game_config: &sim_proc.game_config,
-                            kwg,
-                            anagrams: None,
-                            rack_lengths: None,
-                            klv: &sim_proc.klv,
-                        };
-                        console_log!(
-                            "{} {} gets {}",
-                            play.equity,
-                            play.play.fmt(board_snapshot),
-                            sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
-                        );
-                    }
-                }
+                let board_snapshot = &movegen::BoardSnapshot {
+                    board_tiles: &sim_proc.initial_board_tiles,
+                    game_config: &sim_proc.game_config,
+                    kwg: &sim_proc.kwg,
+                    anagrams: None,
+                    rack_lengths: None,
+                    klv: &sim_proc.klv,
+                };
+                console_log!(
+                    "{} {} gets {}",
+                    play.equity,
+                    play.play.fmt(board_snapshot),
+                    sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage(),
+                );
             }
             stats.update(sim_spread as f64 + win_prob * sim_proc.simmer.win_prob_weightage());
         }
