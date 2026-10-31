@@ -19,9 +19,11 @@ macro_rules! return_js_error {
 // as well as the larger ones only a kbwg can. So the move generator, with all
 // that is generic over the node, is built once, not once a layout. A kwg is
 // repacked in place as it loads (kwg::repack_in_place), so a load holds no
-// third copy of it. A leave table keeps its own graph in kwg's layout:
-// repacking it as well left the wasm no smaller, no faster.
+// third copy of it. A leave table's graph is repacked the same way
+// (klv::repack_in_place), so no code of kwg's layout is built at all but the
+// two repacks.
 type Kwg = kwg::Kwg<kwg::Node24>;
+type Klv = klv::Klv<kwg::Node24>;
 
 // the commits this wasm was built from: wolges-wasm's, then wolges's, each with
 // the target, as their build.rs files stamp them
@@ -39,9 +41,7 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     CACHED_KLV.write().unwrap().insert(
         "noleave".into(),
-        klv::Klv::from_bytes_alloc(klv::EMPTY_KLV_BYTES)
-            .map_err(err_to_str)?
-            .into(),
+        CachedKlv::new(Klv::empty().map_err(err_to_str)?)?.into(),
     );
     CACHED_GAME_CONFIG.write().unwrap().insert(
         "CrosswordGame".into(),
@@ -229,7 +229,7 @@ struct SimProc {
     initial_board_tiles: Vec<u8>,
     game_config: std::sync::Arc<game_config::GameConfig>,
     kwg: std::sync::Arc<CachedKwg>,
-    klv: std::sync::Arc<klv::Klv<kwg::Node22>>,
+    klv: std::sync::Arc<CachedKlv>,
     simmer: simmer::Simmer,
     plays: Vec<movegen::ValuedMove>,
     candidates: Vec<Candidate>,
@@ -259,12 +259,45 @@ impl CachedKwg {
     }
 }
 
+// the most a leave may be worth either way, in thousandths of a point: half of
+// what an equity holds, the other half left for a play's score, which no rules
+// here can outgrow (the test below checks each). A leave table with a value
+// past it is refused as it loads, so no request needs to check its values.
+const LEAVE_LIMIT: i32 = i32::MAX / 2;
+
+// a cached leave table with its largest tile, found once as it loads, so that
+// checking it against a request's rules is one comparison, as for a word graph.
+struct CachedKlv {
+    klv: Klv,
+    max_tile: Option<u8>,
+}
+
+impl CachedKlv {
+    fn new(table: Klv) -> Result<Self, JsValue> {
+        let (min_leave, max_leave) = table.leave_range();
+        if min_leave < -LEAVE_LIMIT || max_leave > LEAVE_LIMIT {
+            return_js_error!(format!(
+                "leave: has values from {min_leave} to {max_leave} thousandths of a point, past {LEAVE_LIMIT} either way"
+            ));
+        }
+        Ok(Self {
+            max_tile: table.max_tile(),
+            klv: table,
+        })
+    }
+
+    // klv::Klv::fits_alphabet's answer, from the tile found at load
+    fn fits_alphabet(&self, alphabet_len: u8) -> bool {
+        self.max_tile.is_none_or(|tile| tile < alphabet_len)
+    }
+}
+
 type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>>;
 type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
 static CACHED_KWG: std::sync::LazyLock<WasmCache<CachedKwg>> =
     std::sync::LazyLock::new(Default::default);
-static CACHED_KLV: std::sync::LazyLock<WasmCache<klv::Klv<kwg::Node22>>> =
+static CACHED_KLV: std::sync::LazyLock<WasmCache<CachedKlv>> =
     std::sync::LazyLock::new(Default::default);
 static CACHED_GAME_CONFIG: std::sync::LazyLock<WasmCache<game_config::GameConfig>> =
     std::sync::LazyLock::new(Default::default);
@@ -314,13 +347,19 @@ pub fn precache_kbwg(key: String, value: &[u8]) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn precache_klv(key: String, value: &[u8]) -> Result<(), JsValue> {
-    CACHED_KLV.write().unwrap().insert(
-        key,
-        klv::Klv::from_bytes_alloc(value)
-            .map_err(err_to_str)?
-            .into(),
-    );
+pub fn precache_klv(key: String, mut value: Vec<u8>) -> Result<(), JsValue> {
+    klv::repack_in_place::<kwg::Node22, kwg::Node24>(&mut value).map_err(err_to_str)?;
+    let table = CachedKlv::new(Klv::from_bytes_alloc(&value).map_err(err_to_str)?)?;
+    CACHED_KLV.write().unwrap().insert(key, table.into());
+    Ok(())
+}
+
+// a leave table whose graph is already in kbwg's layout (a kblv2), taken as it
+// is, as precache_kbwg takes a kbwg
+#[wasm_bindgen]
+pub fn precache_kblv2(key: String, value: &[u8]) -> Result<(), JsValue> {
+    let table = CachedKlv::new(Klv::from_bytes_alloc(value).map_err(err_to_str)?)?;
+    CACHED_KLV.write().unwrap().insert(key, table.into());
     Ok(())
 }
 
@@ -362,6 +401,12 @@ async fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsV
             req.rules
         ));
     }
+    if !klv.fits_alphabet(game_config.alphabet().len()) {
+        return_js_error!(format!(
+            "leave: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
 
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
@@ -375,7 +420,7 @@ async fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsV
         kwg: &kwg.kwg,
         anagrams: None,
         rack_lengths: None,
-        klv: &klv,
+        klv: &klv.klv,
     };
 
     {
@@ -461,6 +506,12 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue>
             req.rules
         ));
     }
+    if !klv.fits_alphabet(game_config.alphabet().len()) {
+        return_js_error!(format!(
+            "leave: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
 
     let mut game_state = game_state::GameState::new(&game_config);
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -498,7 +549,7 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue>
         kwg: &kwg.kwg,
         anagrams: None,
         rack_lengths: None,
-        klv: &klv,
+        klv: &klv.klv,
     };
 
     let mut ps = play_scorer::PlayScorer::new();
@@ -562,6 +613,12 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     if !kwg.fits_alphabet(game_config.alphabet().len()) {
         return_js_error!(format!(
             "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
+    if !klv.fits_alphabet(game_config.alphabet().len()) {
+        return_js_error!(format!(
+            "leave: has tiles the {:?} rules do not have",
             req.rules
         ));
     }
@@ -662,7 +719,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
         kwg: &kwg.kwg,
         anagrams: None,
         rack_lengths: None,
-        klv: &klv,
+        klv: &klv.klv,
     };
     move_generator.gen_moves_unfiltered_lean(&movegen::GenMovesParams {
         board_snapshot,
@@ -752,7 +809,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
         for play in plays.iter() {
             let game_ended = sim_proc
                 .simmer
-                .simulate(&game_config, &kwg.kwg, &no_tables, &klv, &play.play)
+                .simulate(&game_config, &kwg.kwg, &no_tables, &klv.klv, &play.play)
                 .map_err(err_to_str)?;
             let final_spread = sim_proc.simmer.final_equity_spread().map_err(err_to_str)?;
             let win_prob = sim_proc
@@ -766,7 +823,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
                     kwg: &sim_proc.kwg.kwg,
                     anagrams: None,
                     rack_lengths: None,
-                    klv: &sim_proc.klv,
+                    klv: &sim_proc.klv.klv,
                 };
                 console_log!(
                     "{} {} gets {}",
@@ -801,4 +858,28 @@ pub fn sim_drop(sim_pid: usize) -> Result<JsValue, JsValue> {
         .remove(&sim_pid)
         .is_some()
         .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the rules are wolges's own, fixed when the wasm is built, so the
+    // reckoning of each one's best play that a game made at run time needs is
+    // done here, not as a table loads: each must leave a play's score the half
+    // of an equity LEAVE_LIMIT does not take
+    #[test]
+    fn every_rules_takes_leaves_up_to_the_limit() {
+        do_this_on_startup().unwrap();
+        let rules = CACHED_GAME_CONFIG.read().unwrap();
+        assert!(!rules.is_empty());
+        for (name, game_config) in rules.iter() {
+            assert!(
+                game_config
+                    .check_leaves((-LEAVE_LIMIT, LEAVE_LIMIT))
+                    .is_ok(),
+                "{name}"
+            );
+        }
+    }
 }
