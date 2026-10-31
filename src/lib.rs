@@ -228,7 +228,7 @@ struct Candidate {
 struct SimProc {
     initial_board_tiles: Vec<u8>,
     game_config: std::sync::Arc<game_config::GameConfig>,
-    kwg: std::sync::Arc<Kwg>,
+    kwg: std::sync::Arc<CachedKwg>,
     klv: std::sync::Arc<klv::Klv<kwg::Node22>>,
     simmer: simmer::Simmer,
     plays: Vec<movegen::ValuedMove>,
@@ -236,10 +236,34 @@ struct SimProc {
     play_finder: fash::MyHashMap<movegen::Play, usize>,
 }
 
+// a cached word graph with its largest tile, found once as it loads, so that
+// checking it against a request's rules is one comparison instead of a read of
+// every node (kwg::Kwg::fits_alphabet) on every request.
+struct CachedKwg {
+    kwg: Kwg,
+    max_tile: Option<u8>,
+}
+
+impl CachedKwg {
+    fn new(graph: Kwg) -> Self {
+        let max_tile = graph.0.iter().map(kwg::Node::tile).max();
+        Self {
+            kwg: graph,
+            max_tile,
+        }
+    }
+
+    // kwg::Kwg::fits_alphabet's answer, from the tile found at load
+    fn fits_alphabet(&self, alphabet_len: u8) -> bool {
+        self.max_tile.is_none_or(|tile| tile < alphabet_len)
+    }
+}
+
 type WasmCache<T> = std::sync::RwLock<fash::MyHashMap<String, std::sync::Arc<T>>>;
 type WasmCacheInt<T> = std::sync::RwLock<fash::MyHashMap<usize, std::sync::Arc<T>>>;
 
-static CACHED_KWG: std::sync::LazyLock<WasmCache<Kwg>> = std::sync::LazyLock::new(Default::default);
+static CACHED_KWG: std::sync::LazyLock<WasmCache<CachedKwg>> =
+    std::sync::LazyLock::new(Default::default);
 static CACHED_KLV: std::sync::LazyLock<WasmCache<klv::Klv<kwg::Node22>>> =
     std::sync::LazyLock::new(Default::default);
 static CACHED_GAME_CONFIG: std::sync::LazyLock<WasmCache<game_config::GameConfig>> =
@@ -275,7 +299,7 @@ pub fn precache_kwg(key: String, mut value: Vec<u8>) -> Result<(), JsValue> {
     kwg::repack_in_place::<kwg::Node22, kwg::Node24>(&mut value).map_err(err_to_str)?;
     CACHED_KWG.write().unwrap().insert(
         key,
-        Kwg::from_bytes_alloc(&value).map_err(err_to_str)?.into(),
+        CachedKwg::new(Kwg::from_bytes_alloc(&value).map_err(err_to_str)?).into(),
     );
     Ok(())
 }
@@ -284,7 +308,7 @@ pub fn precache_kwg(key: String, mut value: Vec<u8>) -> Result<(), JsValue> {
 pub fn precache_kbwg(key: String, value: &[u8]) -> Result<(), JsValue> {
     CACHED_KWG.write().unwrap().insert(
         key,
-        Kwg::from_bytes_alloc(value).map_err(err_to_str)?.into(),
+        CachedKwg::new(Kwg::from_bytes_alloc(value).map_err(err_to_str)?).into(),
     );
     Ok(())
 }
@@ -328,7 +352,7 @@ pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
     do_analyze(req, &kwg).await
 }
 
-async fn do_analyze(req: AnalyzeRequest, kwg: &Kwg) -> Result<JsValue, JsValue> {
+async fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -348,7 +372,7 @@ async fn do_analyze(req: AnalyzeRequest, kwg: &Kwg) -> Result<JsValue, JsValue> 
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg,
+        kwg: &kwg.kwg,
         anagrams: None,
         rack_lengths: None,
         klv: &klv,
@@ -427,7 +451,7 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     do_play_score(req, &kwg)
 }
 
-fn do_play_score(req: ScoreRequest, kwg: &Kwg) -> Result<JsValue, JsValue> {
+fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -471,7 +495,7 @@ fn do_play_score(req: ScoreRequest, kwg: &Kwg) -> Result<JsValue, JsValue> {
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg,
+        kwg: &kwg.kwg,
         anagrams: None,
         rack_lengths: None,
         klv: &klv,
@@ -635,7 +659,7 @@ pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg: &kwg,
+        kwg: &kwg.kwg,
         anagrams: None,
         rack_lengths: None,
         klv: &klv,
@@ -728,7 +752,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
         for play in plays.iter() {
             let game_ended = sim_proc
                 .simmer
-                .simulate(&game_config, &kwg, &no_tables, &klv, &play.play)
+                .simulate(&game_config, &kwg.kwg, &no_tables, &klv, &play.play)
                 .map_err(err_to_str)?;
             let final_spread = sim_proc.simmer.final_equity_spread().map_err(err_to_str)?;
             let win_prob = sim_proc
@@ -739,7 +763,7 @@ pub fn sim_test(sim_pid: usize) -> Result<JsValue, JsValue> {
                 let board_snapshot = &movegen::BoardSnapshot {
                     board_tiles: &sim_proc.initial_board_tiles,
                     game_config: &sim_proc.game_config,
-                    kwg: &sim_proc.kwg,
+                    kwg: &sim_proc.kwg.kwg,
                     anagrams: None,
                     rack_lengths: None,
                     klv: &sim_proc.klv,
