@@ -18,10 +18,9 @@ macro_rules! return_js_error {
 // every word graph is kept in kbwg's layout, which holds any graph a kwg does
 // as well as the larger ones only a kbwg can. So the move generator, with all
 // that is generic over the node, is built once, not once a layout. A kwg is
-// repacked in place as it loads (kwg::repack_in_place), so a load holds no
-// third copy of it. A leave table's graph is repacked the same way
-// (klv::repack_in_place), so no code of kwg's layout is built at all but the
-// two repacks.
+// read from the caller's bytes a piece at a time, each node put in kbwg's
+// layout as it comes (kwg::Kwg::from_reader), so a load holds one copy of it in
+// the wasm's memory, not two; a leave table likewise (klv::Klv::from_reader).
 type Kwg = kwg::Kwg<kwg::Node24>;
 type Klv = klv::Klv<kwg::Node24>;
 
@@ -327,39 +326,87 @@ thread_local! {
     ));
 }
 
+// a JS byte array read into wolges' readers a piece at a time, so that a file
+// is never copied whole into the wasm's memory beside the table it makes
+fn js_pieces(bytes: &js_sys::Uint8Array) -> impl FnMut(usize, &mut [u8]) + '_ {
+    |at, piece| {
+        bytes
+            .subarray(at as u32, (at + piece.len()) as u32)
+            .copy_to(piece)
+    }
+}
+
+// the bytes a precache call is given, a Uint8Array; anything else is an error
+// thrown before a byte is read
+fn js_bytes(value: JsValue) -> Result<js_sys::Uint8Array, JsValue> {
+    value
+        .dyn_into::<js_sys::Uint8Array>()
+        .map_err(|_| JsValue::from_str("not a Uint8Array"))
+}
+
 #[wasm_bindgen]
-pub fn precache_kwg(key: String, mut value: Vec<u8>) -> Result<(), JsValue> {
-    kwg::repack_in_place::<kwg::Node22, kwg::Node24>(&mut value).map_err(err_to_str)?;
-    CACHED_KWG.write().unwrap().insert(
-        key,
-        CachedKwg::new(Kwg::from_bytes_alloc(&value).map_err(err_to_str)?).into(),
-    );
+pub fn precache_kwg(
+    key: String,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] value: JsValue,
+) -> Result<(), JsValue> {
+    let value = js_bytes(value)?;
+    let graph = Kwg::from_reader::<kwg::Node22>(value.length() as usize, js_pieces(&value))
+        .map_err(err_to_str)?;
+    CACHED_KWG
+        .write()
+        .map_err(err_to_str)?
+        .insert(key, CachedKwg::new(graph).into());
     Ok(())
 }
 
 #[wasm_bindgen]
-pub fn precache_kbwg(key: String, value: &[u8]) -> Result<(), JsValue> {
-    CACHED_KWG.write().unwrap().insert(
-        key,
-        CachedKwg::new(Kwg::from_bytes_alloc(value).map_err(err_to_str)?).into(),
-    );
+pub fn precache_kbwg(
+    key: String,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] value: JsValue,
+) -> Result<(), JsValue> {
+    let value = js_bytes(value)?;
+    let graph = Kwg::from_reader::<kwg::Node24>(value.length() as usize, js_pieces(&value))
+        .map_err(err_to_str)?;
+    CACHED_KWG
+        .write()
+        .map_err(err_to_str)?
+        .insert(key, CachedKwg::new(graph).into());
     Ok(())
 }
 
 #[wasm_bindgen]
-pub fn precache_klv(key: String, mut value: Vec<u8>) -> Result<(), JsValue> {
-    klv::repack_in_place::<kwg::Node22, kwg::Node24>(&mut value).map_err(err_to_str)?;
-    let table = CachedKlv::new(Klv::from_bytes_alloc(&value).map_err(err_to_str)?)?;
-    CACHED_KLV.write().unwrap().insert(key, table.into());
+pub fn precache_klv(
+    key: String,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] value: JsValue,
+) -> Result<(), JsValue> {
+    let value = js_bytes(value)?;
+    let table = CachedKlv::new(
+        Klv::from_reader::<kwg::Node22>(value.length() as usize, js_pieces(&value))
+            .map_err(err_to_str)?,
+    )?;
+    CACHED_KLV
+        .write()
+        .map_err(err_to_str)?
+        .insert(key, table.into());
     Ok(())
 }
 
 // a leave table whose graph is already in kbwg's layout (a kblv2), taken as it
 // is, as precache_kbwg takes a kbwg
 #[wasm_bindgen]
-pub fn precache_kblv2(key: String, value: &[u8]) -> Result<(), JsValue> {
-    let table = CachedKlv::new(Klv::from_bytes_alloc(value).map_err(err_to_str)?)?;
-    CACHED_KLV.write().unwrap().insert(key, table.into());
+pub fn precache_kblv2(
+    key: String,
+    #[wasm_bindgen(unchecked_param_type = "Uint8Array")] value: JsValue,
+) -> Result<(), JsValue> {
+    let value = js_bytes(value)?;
+    let table = CachedKlv::new(
+        Klv::from_reader::<kwg::Node24>(value.length() as usize, js_pieces(&value))
+            .map_err(err_to_str)?,
+    )?;
+    CACHED_KLV
+        .write()
+        .map_err(err_to_str)?
+        .insert(key, table.into());
     Ok(())
 }
 
