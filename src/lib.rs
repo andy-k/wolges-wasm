@@ -430,7 +430,7 @@ pub fn evict_klv(key: String) -> bool {
 }
 
 #[wasm_bindgen]
-pub fn analyze(req_str: String) -> Result<JsValue, JsValue> {
+pub fn analyze(req_str: String) -> Result<String, JsValue> {
     let req = serde_json::from_str::<AnalyzeRequest>(&req_str).map_err(err_to_str)?;
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
@@ -438,7 +438,7 @@ pub fn analyze(req_str: String) -> Result<JsValue, JsValue> {
     do_analyze(req, &kwg)
 }
 
-fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> {
+fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -528,11 +528,11 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> 
         .map(|x| x.into())
         .collect::<Vec<kibitzer::JsonPlayWithEquity>>();
 
-    Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
+    Ok(serde_json::to_string(&result).map_err(err_to_str)?)
 }
 
 #[wasm_bindgen]
-pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
+pub fn play_score(req_str: String) -> Result<String, JsValue> {
     let req = serde_json::from_str::<ScoreRequest>(&req_str).map_err(err_to_str)?;
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
@@ -540,7 +540,7 @@ pub fn play_score(req_str: String) -> Result<JsValue, JsValue> {
     do_play_score(req, &kwg)
 }
 
-fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> {
+fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -643,7 +643,7 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue>
         })
         .collect::<Vec<_>>();
 
-    Ok(serde_json::to_string(&result).map_err(err_to_str)?.into())
+    Ok(serde_json::to_string(&result).map_err(err_to_str)?)
 }
 
 //#[wasm_bindgen]
