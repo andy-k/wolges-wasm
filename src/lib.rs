@@ -430,15 +430,15 @@ pub fn evict_klv(key: String) -> bool {
 }
 
 #[wasm_bindgen]
-pub async fn analyze(req_str: String) -> Result<JsValue, JsValue> {
+pub fn analyze(req_str: String) -> Result<JsValue, JsValue> {
     let req = serde_json::from_str::<AnalyzeRequest>(&req_str).map_err(err_to_str)?;
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
 
-    do_analyze(req, &kwg).await
+    do_analyze(req, &kwg)
 }
 
-async fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> {
+fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -497,25 +497,22 @@ async fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<JsValue, JsV
                 ))
             }
         };
-        move_generator
-            .gen_moves_filtered_async_lean(
-                &movegen::GenMovesParams {
-                    board_snapshot,
-                    rack: &req.rack,
-                    max_gen: req.max_gen,
-                    num_exchanges_by_this_player: 0, // TODO: this should be specified externally
-                    pass_policy: movegen::PassPolicy::OnlyWhenForced,
-                    dynamic_leaves: None,
-                },
-                movegen::PlacePredicate::AcceptAll,
-                klv::AdjustLeave::Identity,
-                match game_config.game_rules() {
-                    game_config::GameRules::Classic => movegen::EquityPredicate::AcceptAll,
-                    game_config::GameRules::Jumbled => movegen::EquityPredicate::Dyn(&mut dedup),
-                },
-                || wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)),
-            )
-            .await;
+        move_generator.gen_moves_filtered_lean(
+            &movegen::GenMovesParams {
+                board_snapshot,
+                rack: &req.rack,
+                max_gen: req.max_gen,
+                num_exchanges_by_this_player: 0, // TODO: this should be specified externally
+                pass_policy: movegen::PassPolicy::OnlyWhenForced,
+                dynamic_leaves: None,
+            },
+            movegen::PlacePredicate::AcceptAll,
+            klv::AdjustLeave::Identity,
+            match game_config.game_rules() {
+                game_config::GameRules::Classic => movegen::EquityPredicate::AcceptAll,
+                game_config::GameRules::Jumbled => movegen::EquityPredicate::Dyn(&mut dedup),
+            },
+        );
     }
     let plays = &move_generator.plays;
 
