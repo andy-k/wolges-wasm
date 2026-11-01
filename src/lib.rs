@@ -671,38 +671,6 @@ fn tables(lexicon: &str, leave: &str, rules: &str) -> Result<Tables, String> {
     })
 }
 
-// the letters that, put between the tiles before a square (nearest last) and
-// the tiles after it, make a word of the lexicon; under jumbled rules, whose
-// graph holds each word's tiles in order, any order of them
-fn letters_that_fit(
-    kwg: &Kwg,
-    jumbled: bool,
-    alphabet_len: u8,
-    before: &[u8],
-    after: &[u8],
-    word: &mut Vec<u8>,
-) -> Vec<u8> {
-    (1..alphabet_len)
-        .filter(|&letter| {
-            word.clear();
-            word.extend_from_slice(before);
-            word.push(letter);
-            word.extend_from_slice(after);
-            if jumbled {
-                word.sort_unstable();
-            }
-            let mut p = 0;
-            for &tile in word.iter() {
-                p = kwg.seek(p, tile);
-                if p < 0 {
-                    return false;
-                }
-            }
-            kwg::Node::accepts(&kwg[p])
-        })
-        .collect()
-}
-
 // hooks: a board, as analyze's, with its lexicon and rules
 #[derive(serde::Deserialize)]
 struct HooksRequest {
@@ -759,53 +727,42 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
         .prepare(&game_config, &[], &req.board_tiles)
         .map_err(err_to_str)?;
     let dim = game_config.board_layout().dim();
-    let tile_at = |r: i8, c: i8| {
-        if (0..dim.rows).contains(&r) && (0..dim.cols).contains(&c) {
-            kibitzer.board_tiles[r as usize * dim.cols as usize + c as usize]
-        } else {
-            0
-        }
-    };
-    let jumbled = matches!(game_config.game_rules(), game_config::GameRules::Jumbled);
+    // the cross sets wolges's move generator reads: for each square, the letters
+    // that make the run of tiles down through it a word and those that make the
+    // run across one, each 0 when no tile is beside it that way
+    let mut hooks = vec![(0u64, 0u64); kibitzer.board_tiles.len()];
+    movegen::KurniaMoveGenerator::new(&game_config).gen_hooks(
+        &movegen::BoardSnapshot {
+            board_tiles: &kibitzer.board_tiles,
+            game_config: &game_config,
+            kwg: &kwg.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &Klv::empty().map_err(err_to_str)?,
+        },
+        |idx, down, across| hooks[idx] = (down, across),
+    );
     let alphabet_len = game_config.alphabet().len();
-    // the letters of the tiles from (r, c) on, a step of (dr, dc) at a time, as
-    // long as there are tiles; a blank's is the letter it stands for
-    let run = |mut r: i8, mut c: i8, dr: i8, dc: i8| {
-        let mut letters = Vec::new();
-        loop {
-            r += dr;
-            c += dc;
-            match tile_at(r, c) {
-                0 => return letters,
-                tile => letters.push(tile & 0x7f),
-            }
-        }
+    let letters = |bits: u64| {
+        (bits != 0).then(|| {
+            (1..alphabet_len)
+                .filter(|&tile| bits >> tile & 1 != 0)
+                .collect::<Vec<_>>()
+        })
     };
-    let mut word = Vec::new();
     let mut squares = Vec::new();
     for r in 0..dim.rows {
         for c in 0..dim.cols {
-            let beside_a_tile = [(r - 1, c), (r, c - 1), (r, c + 1), (r + 1, c)]
-                .iter()
-                .any(|&(r, c)| tile_at(r, c) != 0);
-            if tile_at(r, c) != 0 || !beside_a_tile {
+            let idx = r as usize * dim.cols as usize + c as usize;
+            let (down, across) = hooks[idx];
+            if kibitzer.board_tiles[idx] != 0 || down | across == 0 {
                 continue;
             }
-            let mut fit = |dr: i8, dc: i8| {
-                let mut before = run(r, c, -dr, -dc);
-                before.reverse();
-                let after = run(r, c, dr, dc);
-                (!before.is_empty() || !after.is_empty()).then(|| {
-                    letters_that_fit(&kwg.kwg, jumbled, alphabet_len, &before, &after, &mut word)
-                })
-            };
-            let across = fit(0, 1);
-            let down = fit(1, 0);
             squares.push(HookSquare {
                 row: r,
                 col: c,
-                across,
-                down,
+                across: letters(across),
+                down: letters(down),
             });
         }
     }
