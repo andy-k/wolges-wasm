@@ -2359,6 +2359,32 @@ mod tests {
         );
     }
 
+    // the same under jumbled rules, on a graph of the words' alphagrams: a
+    // run's tiles and the letter make a word in any order, so above A, S as
+    // well as T (as), and below T, E as well as A (et)
+    #[test]
+    fn hooks_under_jumbled_rules_take_the_letters_in_any_order() {
+        tiny_lexicon_for("tiny-hooks-jumbled", true);
+        let req = format!(
+            r#"{{"board":{},"lexicon":"tiny-hooks-jumbled","rules":"WordSmog"}}"#,
+            cat_board()
+        );
+        let answer = serde_json::from_str::<serde_json::Value>(&do_hooks(&req).unwrap()).unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({"squares": [
+                {"row": 6, "col": 6, "across": null, "down": []},
+                {"row": 6, "col": 7, "across": null, "down": [S, T]},
+                {"row": 6, "col": 8, "across": null, "down": [A, E]},
+                {"row": 7, "col": 5, "across": [S], "down": null},
+                {"row": 7, "col": 9, "across": [S], "down": null},
+                {"row": 8, "col": 6, "across": null, "down": []},
+                {"row": 8, "col": 7, "across": null, "down": [S, T]},
+                {"row": 8, "col": 8, "across": null, "down": [A, E]},
+            ]})
+        );
+    }
+
     // a sim of this board, seed 7, scores level, with what more is given
     fn sim_of(lexicon: &str, board: &str, more: &str) -> u32 {
         tiny_lexicon(lexicon);
