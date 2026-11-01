@@ -288,7 +288,7 @@ thread_local! {
     ));
 }
 
-// a JS byte array read into wolges' readers a piece at a time, so that a file
+// a JS byte array read into wolges's readers a piece at a time, so that a file
 // is never copied whole into the wasm's memory beside the table it makes
 fn js_pieces(bytes: &js_sys::Uint8Array) -> impl FnMut(usize, &mut [u8]) + '_ {
     |at, piece| {
@@ -820,7 +820,7 @@ const MAX_SIM_PLIES: usize = 16;
 // far; each seat's rack size, by default the mover's rack with full racks for
 // the others dealt in turn from the tiles unseen while enough are left), the
 // tiles known to be on the opponent's rack (none by default), the plies each
-// rollout plays (by default as many as wolges' own sims play), the seed its
+// rollout plays (by default as many as wolges's own sims play), the seed its
 // draws come from (a random one if none), and, for a sim run in parts, which
 // part of how many this is. A new sim holds no candidates.
 #[derive(serde::Deserialize)]
@@ -989,7 +989,7 @@ fn no_sim(handle: u32) -> String {
 }
 
 // an iteration's seed from the sim's seed and the iteration's number alone, as
-// wolges' move_picker seeds its iterations: a sim's results are the same
+// wolges's move_picker seeds its iterations: a sim's results are the same
 // however its steps split it, and sims of other seeds draw apart. A sim run in
 // parts numbers its iterations part + 1, part + 1 + parts, and so on, so that
 // the parts together run one sim's. The mix is splitmix64's:
@@ -1001,7 +1001,7 @@ fn iteration_seed(seed: u64, iteration: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-// one rollout of a play, as wolges' move_picker rolls one out, by the move
+// one rollout of a play, as wolges's move_picker rolls one out, by the move
 // generator's lean arm, the one arm the wasm carries: its objective (the change
 // in spread in points, plus the chance to win weighted as the simmer weighs
 // it), the change in spread, and the chance to win; its plies are the simmer's
@@ -1243,7 +1243,7 @@ fn by_equity(win: f64, lead_win: f64) -> bool {
 
 // the running candidates behind the leader on the iterations both ran, pruned:
 // behind by the chance to win, or, where the chance to win cannot tell them
-// apart, by equity, each as wolges' move picker tells a candidate behind
+// apart, by equity, each as wolges's move picker tells a candidate behind
 fn prune_behind(candidates: &mut [SimCandidate], z: f64) {
     let Some(lead) = leader(candidates) else {
         return;
@@ -1886,7 +1886,7 @@ mod tests {
         assert_eq!(first["play"]["word"], serde_json::json!([0, 0, 0, S]));
         // the hooked S scores C, A, T, and S: 3, 1, 1, and 1
         assert_eq!(first["play"]["score"], 6);
-        // the plies wolges' own sims play by default, each reached by every
+        // the plies wolges's own sims play by default, each reached by every
         // rollout here, none taking a whole rack: the tiny lexicon's words are
         // four tiles at most
         let plies = first["plies"].as_array().unwrap();
@@ -2191,7 +2191,7 @@ mod tests {
     }
 
     // a one-tile play is one candidate whichever way it is written: held across
-    // where its tile makes an across word, as wolges' scorer holds it
+    // where its tile makes an across word, as wolges's scorer holds it
     #[test]
     fn a_one_tile_play_is_one_candidate_whichever_way_it_is_written() {
         // CAT, and an A below its C: a T right of that A makes AT across and,
