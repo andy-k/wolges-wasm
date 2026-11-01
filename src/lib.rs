@@ -1708,6 +1708,531 @@ fn sims_holding(holds: impl Fn(&Sim) -> bool) -> Result<Vec<u32>, String> {
     Ok(handles)
 }
 
+// the bytes allocated and not yet freed, which an endgame's memory cap reads: a
+// wasm's memory only grows, so its size says nothing of what is held once a
+// solve's table is freed
+static HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct Counting;
+
+// every allocation counted onto the bytes held as it is made and off as it is
+// freed
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            HELD.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            HELD.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, layout) };
+        HELD.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let q = unsafe { std::alloc::System.realloc(p, layout, new_size) };
+        if !q.is_null() {
+            HELD.fetch_add(new_size, std::sync::atomic::Ordering::Relaxed);
+            HELD.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+fn held_bytes() -> usize {
+    HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// the page's clock as an endgame reads it: performance.now, as a sim's step's
+fn page_clock() -> std::time::Duration {
+    std::time::Duration::from_secs_f64(step_clock().max(0.0) / 1000.0)
+}
+
+// the memory the wasm may hold while an endgame solves, in MiB, unless its
+// request says: a phone's browser may refuse a page much more
+fn default_max_memory_mb() -> usize {
+    256
+}
+
+// endgame_new: a position whose bag holds at most one tile (rack, board,
+// lexicon, rules, each seat's score in points, the seat to move, and the
+// scoreless turns and the passes in a row so far), and the most memory the wasm
+// may hold while it solves
+#[derive(serde::Deserialize)]
+struct EndgameNewRequest {
+    rack: Vec<u8>,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    lexicon: String,
+    rules: String,
+    scores: Vec<i32>,
+    turn: u8,
+    zero_turns: u16,
+    pass_turns: u16,
+    #[serde(default = "default_max_memory_mb")]
+    max_memory_mb: usize,
+}
+
+// endgame_step: at most this many milliseconds; 0 reads the last answer
+#[derive(serde::Deserialize)]
+struct EndgameStepRequest {
+    ms: Option<f64>,
+}
+
+// a ply of an endgame's line: the play, and its mover's gain on the other from
+// there to the game's end, in points
+#[derive(serde::Serialize)]
+struct EndgamePly {
+    play: kibitzer::JsonPlay,
+    value: f64,
+}
+
+// a tile the bag may hold: how many of it are unseen, and the play's gain if it
+// is the one in the bag, in points
+#[derive(serde::Serialize)]
+struct EndgameBagTile {
+    tile: u8,
+    count: u32,
+    value: f64,
+}
+
+// endgame_step's answer: the bag's tiles (0 or 1), the steps that solved,
+// whether the answer is the endgame's own (the solve finished), the play to
+// make (none before a step solved), its gain for the side to move from now to
+// the game's end, and the lead it then ends with, in points; with an empty bag
+// the depth searched and the line, with a tile in it the share of the tiles it
+// may be that the play wins and the gain for each
+#[derive(serde::Serialize)]
+struct EndgameAnswer {
+    bag: u8,
+    steps: u64,
+    exact: bool,
+    play: Option<kibitzer::JsonPlay>,
+    value: f64,
+    spread: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<Vec<EndgamePly>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    win: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tiles: Option<Vec<EndgameBagTile>>,
+}
+
+// an endgame a caller steps and frees: its rules and its own word graph, of the
+// lexicon's words its board can still take, as wolges's endgame command prunes
+// its graph (each held here at one address, for the solver's table to be given
+// back to, so the lexicon's name may be evicted while it lives), the position
+// (the board, the side to move's rack, the tiles it cannot see with each one's
+// count, whether one is in the bag, the seat to move, its lead in millipoints,
+// and the passes and scoreless turns before it), the memory cap, the solver's
+// table between steps, with a tile in the bag the search so far, and the last
+// answer
+struct Endgame {
+    game_config: std::sync::Arc<game_config::GameConfig>,
+    kwg: Box<Kwg>,
+    arm_tables: Box<anagrams::ArmTables>,
+    board_tiles: Vec<u8>,
+    rack: Vec<u8>,
+    unseen: Vec<u8>,
+    in_bag: bool,
+    turn: u8,
+    lead: i32,
+    pass_turns: u16,
+    zero_turns: u16,
+    max_memory: usize,
+    table: Option<endgame::KeptTable>,
+    peg: Option<endgame::PegProgress>,
+    answer: EndgameAnswer,
+}
+
+impl EndgameAnswer {
+    // whether an empty bag's answer gives way to a later step's: the step's is
+    // exact, or deeper, or at its depth worth more (a play the step proved
+    // better); a step starts its solve again on the kept table, and may stop
+    // sooner than one before it did
+    fn gives_way_to(&self, step: &EndgameAnswer) -> bool {
+        self.play.is_none()
+            || step.exact
+            || step.depth > self.depth
+            || (step.depth == self.depth && step.value > self.value)
+    }
+
+    // a later step's answer taken when this one gives way to it, always with a
+    // tile in the bag (its search resumes, so its answer only deepens); the
+    // depth never falls, as an exact answer may come from a shallower search
+    // than one before it, the table holding what that one finished
+    fn take(&mut self, step: EndgameAnswer, in_bag: bool) {
+        if in_bag || self.gives_way_to(&step) {
+            let depth = step.depth.max(self.depth);
+            *self = EndgameAnswer { depth, ..step };
+        } else {
+            self.steps = step.steps;
+        }
+    }
+}
+
+// the endgames made, by handle; a handle is never used twice
+#[derive(Default)]
+struct Endgames {
+    made: u32,
+    live: fash::MyHashMap<u32, Endgame>,
+}
+
+static ENDGAMES: std::sync::LazyLock<std::sync::Mutex<Endgames>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn no_endgame(handle: u32) -> String {
+    format!("endgame {handle}: none such, or freed")
+}
+
+fn points(equity: equity::Equity) -> f64 {
+    equity.raw() as f64 / equity::SCALE as f64
+}
+
+impl Endgame {
+    // one solve of at most ms on the clock, on the table earlier steps kept
+    fn solve(&mut self, ms: f64, clock: endgame::Clock) -> Result<(), String> {
+        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+            &self.game_config,
+            &self.kwg,
+            &self.arm_tables,
+        )
+        .map_err(err_to_str)?;
+        if let Some(table) = self.table.take()
+            && solver.give_table(table).is_err()
+        {
+            return Err("endgame: its table belongs to other tables".into());
+        }
+        solver.set_clock(clock);
+        let limits = endgame::Limits {
+            time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+            states: None,
+            memory: Some(endgame::MemoryLimit {
+                bytes: self.max_memory,
+                held: held_bytes,
+            }),
+        };
+        let lead = points(equity::Equity::new(self.lead));
+        let steps = self.answer.steps + 1;
+        let answer = if let Some(progress) = self.peg.as_mut() {
+            solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
+            let peg = solver.resume_peg_one_in_bag(progress, &limits);
+            let peg = peg
+                .map_err(err_to_str)
+                .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
+            let peg = match peg {
+                Ok(peg) => peg,
+                Err(e) => {
+                    self.table = Some(solver.take_table());
+                    return Err(e);
+                }
+            };
+            // the search's margins are the leads the game ends with
+            let value = points(peg.expected_margin) - lead;
+            EndgameAnswer {
+                bag: 1,
+                steps,
+                exact: peg.exact,
+                play: peg.best_move.map(|best| match best {
+                    endgame::PegMove::Pass => kibitzer::JsonPlay::Exchange {
+                        tiles: Vec::new().into(),
+                    },
+                    endgame::PegMove::Place(play) => (&play).into(),
+                }),
+                value,
+                spread: lead + value,
+                depth: Some(peg.depth),
+                line: None,
+                win: Some(peg.win_pct as f64),
+                tiles: Some(
+                    (peg.hypotheses.iter())
+                        .map(|&(tile, count, margin)| EndgameBagTile {
+                            tile,
+                            count,
+                            value: points(margin) - lead,
+                        })
+                        .collect(),
+                ),
+            }
+        } else {
+            let mut racks = [Vec::new(), Vec::new()];
+            racks[self.turn as usize].extend_from_slice(&self.rack);
+            racks[1 - self.turn as usize].extend(
+                (0u8..)
+                    .zip(&self.unseen)
+                    .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
+            );
+            solver.init_after_scoreless_turns(
+                &self.board_tiles,
+                [&racks[0], &racks[1]],
+                self.pass_turns,
+                self.zero_turns,
+            );
+            let solved = match solver.solve_within(self.turn, &limits) {
+                Ok(solved) => solved,
+                Err(e) => {
+                    self.table = Some(solver.take_table());
+                    return Err(err_to_str(e));
+                }
+            };
+            let mut line = Vec::new();
+            solver.collect_pv(self.turn, &mut line);
+            let value = points(solved.value);
+            EndgameAnswer {
+                bag: 0,
+                steps,
+                exact: solved.exact,
+                play: line.first().map(|(_, play)| play.into()),
+                value,
+                spread: lead + value,
+                depth: Some(solved.depth),
+                line: Some(
+                    (line.iter())
+                        .map(|(value, play)| EndgamePly {
+                            play: play.into(),
+                            value: points(*value),
+                        })
+                        .collect(),
+                ),
+                win: None,
+                tiles: None,
+            }
+        };
+        self.table = Some(solver.take_table());
+        self.answer.take(answer, self.in_bag);
+        Ok(())
+    }
+}
+
+// a new endgame's handle
+#[wasm_bindgen]
+pub fn endgame_new(req_str: String) -> Result<u32, JsValue> {
+    Ok(do_endgame_new(&req_str)?)
+}
+
+fn do_endgame_new(req_str: &str) -> Result<u32, String> {
+    let req = serde_json::from_str::<EndgameNewRequest>(req_str).map_err(err_to_str)?;
+    let kwg = (CACHED_KWG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.lexicon)
+        .cloned())
+    .ok_or("missing kwg")?;
+    let game_config = (CACHED_GAME_CONFIG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.rules)
+        .cloned())
+    .ok_or("missing game_config")?;
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return Err(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
+    if game_config.num_players() != 2 {
+        return Err("endgame: the rules are not for two players".into());
+    }
+    let rack_size = game_config.rack_size() as usize;
+    if req.rack.is_empty() {
+        return Err("endgame: the rack is empty".into());
+    }
+    if req.rack.len() > rack_size {
+        return Err(format!(
+            "rack: max {rack_size} tiles, found {} tiles",
+            req.rack.len()
+        ));
+    }
+    let turn = req.turn as usize;
+    if turn >= 2 {
+        return Err(format!("turn: must be >= 0 and < 2, found {turn}"));
+    }
+    if req.scores.len() != 2 {
+        return Err(format!(
+            "scores: length must be 2, found {}",
+            req.scores.len()
+        ));
+    }
+    // a request's scores are points; the game keeps millipoints
+    let scores = (req.scores.iter())
+        .map(|&points| points.checked_mul(equity::SCALE))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|scores| scores[turn].checked_sub(scores[1 - turn]))
+        .ok_or_else(|| {
+            format!(
+                "scores: each must be within {} points, and their difference too, found {:?}",
+                i32::MAX / equity::SCALE,
+                req.scores
+            )
+        })?;
+    if req.max_memory_mb == 0 || req.max_memory_mb > 4096 {
+        return Err(format!(
+            "max_memory_mb: 1 to 4096, found {}",
+            req.max_memory_mb
+        ));
+    }
+
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &req.rack, &req.board_tiles)
+        .map_err(err_to_str)?;
+    // the tiles the side to move cannot see: the other side's rack, and the
+    // bag's, if any
+    let unseen = kibitzer.available_tally.clone();
+    let num_unseen = unseen.iter().map(|&count| count as usize).sum::<usize>();
+    // the other side holding no tiles went out, so the game is over
+    if num_unseen == 0 {
+        return Err("endgame: the other side holds no tiles, so the game is over".into());
+    }
+    let in_bag = num_unseen > rack_size;
+    if num_unseen > rack_size + 1 {
+        return Err(format!(
+            "endgame: the bag holds {} tiles; at most one is solved",
+            num_unseen - rack_size
+        ));
+    }
+    if in_bag && req.rack.len() != rack_size {
+        return Err("endgame: with a tile in the bag the rack must be full".into());
+    }
+    let mut rack = req.rack;
+    rack.sort_unstable();
+    // the lexicon's words the board can still take, whatever the racks, made
+    // into the endgame's own graph, as wolges's endgame command prunes its own:
+    // the same answers, a far smaller graph to generate on
+    let mut words = fash::MyHashSet::<bites::Bites>::default();
+    movegen::KurniaMoveGenerator::new(&game_config).gen_remaining_words(
+        &movegen::BoardSnapshot {
+            board_tiles: &kibitzer.board_tiles,
+            game_config: &game_config,
+            kwg: &kwg.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &Klv::empty().map_err(err_to_str)?,
+        },
+        |word: &[u8]| {
+            words.insert(word.into());
+        },
+    );
+    let mut words = words.into_iter().collect::<Vec<_>>();
+    words.sort_unstable();
+    let bytes = match game_config.game_rules() {
+        game_config::GameRules::Classic => build::build_big(
+            build::BuildContent::Gaddawg,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &words,
+        ),
+        game_config::GameRules::Jumbled => build::build_big(
+            build::BuildContent::DawgOnly,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &build::make_alphagrams(&words),
+        ),
+    }
+    .map_err(err_to_str)?;
+    let peg = in_bag.then(|| {
+        endgame::PegProgress::new(
+            req.turn,
+            &kibitzer.board_tiles,
+            &rack,
+            &unseen,
+            equity::Equity::new(scores),
+        )
+    });
+    let endgame = Endgame {
+        game_config,
+        kwg: Box::new(Kwg::from_bytes_alloc(&bytes).map_err(err_to_str)?),
+        arm_tables: Box::new(anagrams::ArmTables::None),
+        board_tiles: kibitzer.board_tiles.clone(),
+        rack,
+        unseen,
+        in_bag,
+        turn: req.turn,
+        lead: scores,
+        pass_turns: req.pass_turns,
+        zero_turns: req.zero_turns,
+        max_memory: req.max_memory_mb << 20,
+        table: None,
+        peg,
+        answer: EndgameAnswer {
+            bag: in_bag as u8,
+            steps: 0,
+            exact: false,
+            play: None,
+            value: 0.0,
+            spread: points(equity::Equity::new(scores)),
+            depth: Some(0),
+            line: (!in_bag).then(Vec::new),
+            win: in_bag.then_some(0.0),
+            tiles: in_bag.then(Vec::new),
+        },
+    };
+
+    let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+    let handle = endgames
+        .made
+        .checked_add(1)
+        .ok_or("too many endgames made")?;
+    endgames.made = handle;
+    endgames.live.insert(handle, endgame);
+    Ok(handle)
+}
+
+// a step of an endgame, as EndgameAnswer
+#[wasm_bindgen]
+pub fn endgame_step(handle: u32, req_str: String) -> Result<String, JsValue> {
+    Ok(do_endgame_step(handle, &req_str, page_clock)?)
+}
+
+fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<String, String> {
+    let req = serde_json::from_str::<EndgameStepRequest>(req_str).map_err(err_to_str)?;
+    let ms = match req.ms {
+        Some(ms) if ms >= 0.0 && ms.is_finite() => ms,
+        Some(ms) => return Err(format!("ms: {ms} is not a time to run")),
+        None => return Err("endgame_step: give ms".into()),
+    };
+    let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+    let endgame = endgames
+        .live
+        .get_mut(&handle)
+        .ok_or_else(|| no_endgame(handle))?;
+    // an exact answer stays: no solve can better it
+    if ms > 0.0 && !endgame.answer.exact {
+        endgame.solve(ms, clock)?;
+    }
+    serde_json::to_string(&endgame.answer).map_err(err_to_str)
+}
+
+// an endgame let go, with its table and the tables it holds
+#[wasm_bindgen]
+pub fn endgame_free(handle: u32) -> Result<(), JsValue> {
+    Ok(do_endgame_free(handle)?)
+}
+
+fn do_endgame_free(handle: u32) -> Result<(), String> {
+    let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+    endgames
+        .live
+        .remove(&handle)
+        .map(|_| ())
+        .ok_or_else(|| no_endgame(handle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,6 +2266,11 @@ mod tests {
     // a lexicon of a few words cached under this name, beside the rules and the
     // empty leaves startup caches
     fn tiny_lexicon(name: &str) {
+        tiny_lexicon_for(name, false);
+    }
+
+    // the same, for jumbled rules as well: a graph of the words' alphagrams
+    fn tiny_lexicon_for(name: &str, jumbled: bool) {
         do_this_on_startup().unwrap();
         let mut words = [
             &[A, T][..],
@@ -1767,12 +2297,21 @@ mod tests {
         .map(|&word| word.into())
         .collect::<Vec<bites::Bites>>();
         words.sort_unstable();
-        let bytes = build::build(
-            build::BuildContent::Gaddawg,
-            build::BuildLayout::Wolges,
-            build::BuildOrder::Sorted,
-            &words,
-        )
+        let bytes = if jumbled {
+            build::build(
+                build::BuildContent::DawgOnly,
+                build::BuildLayout::Wolges,
+                build::BuildOrder::Sorted,
+                &build::make_alphagrams(&words),
+            )
+        } else {
+            build::build(
+                build::BuildContent::Gaddawg,
+                build::BuildLayout::Wolges,
+                build::BuildOrder::Sorted,
+                &words,
+            )
+        }
         .unwrap();
         let graph = Kwg::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
             piece.copy_from_slice(&bytes[at..at + piece.len()])
@@ -2428,5 +2967,317 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(err, "missing kwg");
+    }
+
+    // a late board, as json: CAT across row 2 from column 6, and, from row 7
+    // on, every other tile but those the racks hold (a blank as an A), which no
+    // play can touch, its runs being no words
+    fn late_board(racks: &[u8]) -> String {
+        late_board_of("CrosswordGame", racks)
+    }
+
+    // the same under these rules: their board and their tiles
+    fn late_board_of(rules: &str, racks: &[u8]) -> String {
+        do_this_on_startup().unwrap();
+        let game_config = CACHED_GAME_CONFIG.read().unwrap()[rules].clone();
+        let alphabet = game_config.alphabet();
+        let mut left = (0..alphabet.len())
+            .map(|tile| alphabet.freq(tile))
+            .collect::<Vec<_>>();
+        for &tile in racks.iter().chain(&[C, A, T]) {
+            left[tile as usize] -= 1;
+        }
+        let dim = game_config.board_layout().dim();
+        let mut board = vec![vec![0i8; dim.cols as usize]; dim.rows as usize];
+        board[2][6] = C as i8;
+        board[2][7] = A as i8;
+        board[2][8] = T as i8;
+        let mut squares = board[7..].iter_mut().flatten();
+        for (tile, &count) in left.iter().enumerate() {
+            for _ in 0..count {
+                *squares.next().unwrap() = if tile == 0 { -(A as i8) } else { tile as i8 };
+            }
+        }
+        serde_json::to_string(&board).unwrap()
+    }
+
+    // an endgame of the late board, seat 0 to move, with what more is given
+    fn endgame_of(lexicon: &str, rack: &[u8], others: &[u8], more: &str) -> Result<u32, String> {
+        tiny_lexicon(lexicon);
+        let racks = rack.iter().chain(others).copied().collect::<Vec<_>>();
+        do_endgame_new(&format!(
+            r#"{{"rack":{rack:?},"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
+            late_board(&racks)
+        ))
+    }
+
+    // a clock that never moves, so no step runs out of time
+    fn frozen() -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    fn endgame_step(handle: u32, req: &str) -> serde_json::Value {
+        report(&do_endgame_step(handle, req, frozen).unwrap())
+    }
+
+    // an empty bag: the other side holds the tiles unseen, and the answer is
+    // wolges's own solve of the position, its line played from its first move
+    #[test]
+    fn an_endgame_answers_as_wolges_solves_it() {
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let handle = endgame_of("tiny-end-solve", &rack, &others, "").unwrap();
+        // read before any step: nothing solved, the shape already whole
+        let before = endgame_step(handle, r#"{"ms":0}"#);
+        assert_eq!(
+            before,
+            serde_json::json!({"bag": 0, "steps": 0, "exact": false, "play": null,
+                "value": 0.0, "spread": 0.0, "depth": 0, "line": []})
+        );
+        let answer = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(answer["bag"], 0);
+        assert_eq!(answer["steps"], 1);
+        assert_eq!(answer["exact"], true);
+        assert_eq!(answer["play"], answer["line"][0]["play"]);
+        assert_eq!(answer["value"], answer["line"][0]["value"]);
+        assert_eq!(answer["spread"], answer["value"]);
+
+        // wolges's solver on the same position
+        let Tables {
+            kwg, game_config, ..
+        } = tables("tiny-end-solve", "noleave", "CrosswordGame").unwrap();
+        let mut kibitzer = kibitzer::Kibitzer::new();
+        let board = serde_json::from_str::<Vec<Vec<i8>>>(&late_board(
+            &rack.iter().chain(&others).copied().collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        kibitzer.prepare(&game_config, &rack, &board).unwrap();
+        let arm_tables = anagrams::ArmTables::None;
+        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+            &game_config,
+            &kwg.kwg,
+            &arm_tables,
+        )
+        .unwrap();
+        let mut sorted = rack.to_vec();
+        sorted.sort_unstable();
+        solver.init(&kibitzer.board_tiles, [&sorted, &others]);
+        let value = solver.solve(0).unwrap();
+        assert_eq!(answer["value"].as_f64().unwrap(), points(value));
+
+        // an exact answer stays: a later step solves nothing, and ms 0 reads it
+        assert_eq!(endgame_step(handle, r#"{"ms":1000}"#), answer);
+        assert_eq!(endgame_step(handle, r#"{"ms":0}"#), answer);
+        // an endgame keeps its own graph: one made before its lexicon is
+        // evicted solves after it as the first did
+        let again = endgame_of("tiny-end-solve", &rack, &others, "").unwrap();
+        assert!(evict_kwg("tiny-end-solve".into()).unwrap());
+        assert_eq!(endgame_step(again, r#"{"ms":60000}"#), answer);
+        do_endgame_free(again).unwrap();
+        do_endgame_free(handle).unwrap();
+        for err in [
+            do_endgame_step(handle, r#"{"ms":1}"#, frozen).unwrap_err(),
+            do_endgame_free(handle).unwrap_err(),
+        ] {
+            assert!(err.contains("freed"), "{err}");
+        }
+    }
+
+    // the same on the super board and under jumbled rules, on a graph of the
+    // words' alphagrams: the answer is wolges's own solve of each
+    #[test]
+    fn an_endgame_answers_as_wolges_solves_it_on_super_and_jumbled_rules() {
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let racks = rack.iter().chain(&others).copied().collect::<Vec<_>>();
+        for (rules, jumbled) in [("CrosswordGameSuper", false), ("WordSmog", true)] {
+            let lexicon = format!("tiny-end-{rules}");
+            tiny_lexicon_for(&lexicon, jumbled);
+            let board = late_board_of(rules, &racks);
+            let handle = do_endgame_new(&format!(
+                r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"{rules}","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
+            ))
+            .unwrap();
+            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            assert_eq!(answer["exact"], true, "{rules}");
+            assert_eq!(answer["play"], answer["line"][0]["play"], "{rules}");
+
+            let Tables {
+                kwg, game_config, ..
+            } = tables(&lexicon, "noleave", rules).unwrap();
+            let mut kibitzer = kibitzer::Kibitzer::new();
+            let board = serde_json::from_str::<Vec<Vec<i8>>>(&board).unwrap();
+            kibitzer.prepare(&game_config, &rack, &board).unwrap();
+            let arm_tables = anagrams::ArmTables::None;
+            let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+                &game_config,
+                &kwg.kwg,
+                &arm_tables,
+            )
+            .unwrap();
+            let mut sorted = rack.to_vec();
+            sorted.sort_unstable();
+            solver.init(&kibitzer.board_tiles, [&sorted, &others]);
+            let value = solver.solve(0).unwrap();
+            assert_eq!(answer["value"].as_f64().unwrap(), points(value), "{rules}");
+            do_endgame_free(handle).unwrap();
+        }
+    }
+
+    // one tile in the bag: each tile it may be, weighed by how many of it are
+    // unseen; the value is their weighted mean, the win their weighted share
+    #[test]
+    fn an_endgame_with_a_tile_in_the_bag_weighs_each_tile() {
+        let rack = [S, E, A, T, C, A, T];
+        let others = [A, T, E, S, E, A, T, E];
+        let handle = endgame_of("tiny-end-bag", &rack, &others, "").unwrap();
+        // read before any step: no depth searched, nothing to play
+        let before = endgame_step(handle, r#"{"ms":0}"#);
+        assert_eq!(
+            (&before["depth"], &before["play"]),
+            (&0.into(), &serde_json::Value::Null)
+        );
+        let answer = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(answer["bag"], 1);
+        assert_eq!(answer["exact"], true);
+        assert!(answer["depth"].as_i64().unwrap() >= 1, "{answer}");
+        assert!(answer["play"].is_object(), "{answer}");
+        let tiles = answer["tiles"].as_array().unwrap();
+        let count = |t: &serde_json::Value| t["count"].as_f64().unwrap();
+        let value = |t: &serde_json::Value| t["value"].as_f64().unwrap();
+        let total = tiles.iter().map(count).sum::<f64>();
+        assert_eq!(total, others.len() as f64);
+        let mean = tiles.iter().map(|t| count(t) * value(t)).sum::<f64>() / total;
+        assert!(
+            (answer["value"].as_f64().unwrap() - mean).abs() < 0.001,
+            "{answer}"
+        );
+        let won = (tiles.iter())
+            .map(|t| {
+                count(t)
+                    * match value(t).total_cmp(&0.0) {
+                        std::cmp::Ordering::Greater => 1.0,
+                        std::cmp::Ordering::Equal => 0.5,
+                        std::cmp::Ordering::Less => 0.0,
+                    }
+            })
+            .sum::<f64>()
+            / total;
+        assert!(
+            (answer["win"].as_f64().unwrap() - won).abs() < 1e-6,
+            "{answer}"
+        );
+        do_endgame_free(handle).unwrap();
+    }
+
+    // an empty bag's answer gives way to a step's only when that is exact,
+    // deeper, or at its depth worth more, so a step that stopped sooner than
+    // one before it leaves the deeper answer
+    #[test]
+    fn an_empty_bags_answer_gives_way_only_to_a_better_one() {
+        let answer = |exact: bool, depth: i8, value: f64| EndgameAnswer {
+            bag: 0,
+            steps: 1,
+            exact,
+            play: Some(kibitzer::JsonPlay::Exchange {
+                tiles: Vec::new().into(),
+            }),
+            value,
+            spread: value,
+            depth: Some(depth),
+            line: Some(Vec::new()),
+            win: None,
+            tiles: None,
+        };
+        let held = answer(false, 3, 5.0);
+        assert!(held.gives_way_to(&answer(false, 4, -9.0)), "deeper");
+        assert!(held.gives_way_to(&answer(false, 3, 6.0)), "worth more");
+        assert!(held.gives_way_to(&answer(true, 2, 1.0)), "exact");
+        assert!(!held.gives_way_to(&answer(false, 3, 5.0)), "the same");
+        assert!(!held.gives_way_to(&answer(false, 3, 4.0)), "worth less");
+        assert!(!held.gives_way_to(&answer(false, 2, 9.0)), "shallower");
+        let mut none = answer(false, 0, 0.0);
+        none.play = None;
+        assert!(none.gives_way_to(&answer(false, 1, -3.0)), "no answer yet");
+        // an exact answer from a shallower search than the one held keeps the
+        // deeper depth; a step that does not give way counts its step
+        let mut held = answer(false, 5, 19.0);
+        held.take(answer(true, 3, 19.0), false);
+        assert!(held.exact, "the exact answer taken");
+        assert_eq!(held.depth, Some(5), "the depth fell");
+        let mut steps = answer(false, 5, 19.0);
+        steps.take(
+            EndgameAnswer {
+                steps: 7,
+                ..answer(false, 4, 30.0)
+            },
+            false,
+        );
+        assert_eq!((steps.depth, steps.value, steps.steps), (Some(5), 19.0, 7));
+        // with a tile in the bag every step's answer is taken, its depth never
+        // below the one before
+        let mut in_bag = answer(false, 2, 1.0);
+        in_bag.take(answer(false, 1, 2.0), true);
+        assert_eq!((in_bag.depth, in_bag.value), (Some(2), 2.0));
+    }
+
+    // what endgame_new and endgame_step refuse, each before it solves
+    #[test]
+    fn an_endgame_refuses_what_it_cannot_solve() {
+        let full = [S, E, A, T, C, A, T];
+        for (rack, others, more, wanted) in [
+            (
+                &full[..],
+                &[A, T, E, S, E, A, T, E, E][..],
+                "",
+                "endgame: the bag holds 2 tiles; at most one is solved",
+            ),
+            (
+                &[S, E, A, T][..],
+                &[A, T, E, S, E, A, T, E][..],
+                "",
+                "endgame: with a tile in the bag the rack must be full",
+            ),
+            (
+                &[S, E][..],
+                &[][..],
+                "",
+                "endgame: the other side holds no tiles, so the game is over",
+            ),
+            (
+                &[S][..],
+                &[A, T][..],
+                r#","max_memory_mb":0"#,
+                "max_memory_mb: 1 to 4096, found 0",
+            ),
+        ] {
+            let err = endgame_of("tiny-end-refuse", rack, others, more).unwrap_err();
+            assert_eq!(err, wanted);
+        }
+        tiny_lexicon("tiny-end-refuse");
+        let board = late_board(&[A, T, E]);
+        let err = do_endgame_new(&format!(
+            r#"{{"rack":[],"board":{board},"lexicon":"tiny-end-refuse","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
+        ))
+        .unwrap_err();
+        assert_eq!(err, "endgame: the rack is empty");
+        // the seat to move, the scoreless turns, and the passes so far are the
+        // position's: left out, refused
+        for field in ["turn", "zero_turns", "pass_turns"] {
+            let req = format!(
+                r#"{{"rack":[{S}],"board":{board},"lexicon":"tiny-end-refuse","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
+            )
+            .replace(&format!(r#","{field}":0"#), "");
+            let err = do_endgame_new(&req).unwrap_err();
+            assert!(err.contains(&format!("missing field `{field}`")), "{err}");
+        }
+        let handle = endgame_of("tiny-end-refuse", &[S], &[A, T], "").unwrap();
+        assert_eq!(
+            do_endgame_step(handle, "{}", frozen).unwrap_err(),
+            "endgame_step: give ms"
+        );
+        assert_eq!(
+            do_endgame_step(handle, r#"{"ms":-1}"#, frozen).unwrap_err(),
+            "ms: -1 is not a time to run"
+        );
+        do_endgame_free(handle).unwrap();
     }
 }
