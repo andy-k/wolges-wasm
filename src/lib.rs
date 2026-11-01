@@ -646,6 +646,152 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
     Ok(serde_json::to_string(&result).map_err(err_to_str)?)
 }
 
+// an analyzer's call: the letters that fit every empty square beside a tile.
+// Its request and answer are JSON strings, as analyze's are, and its failure is
+// an error the call throws, none a trap; the call is a thin export over a part
+// that returns its own errors.
+
+// the letters that, put between the tiles before a square (nearest last) and
+// the tiles after it, make a word of the lexicon; under jumbled rules, whose
+// graph holds each word's tiles in order, any order of them
+fn letters_that_fit(
+    kwg: &Kwg,
+    jumbled: bool,
+    alphabet_len: u8,
+    before: &[u8],
+    after: &[u8],
+    word: &mut Vec<u8>,
+) -> Vec<u8> {
+    (1..alphabet_len)
+        .filter(|&letter| {
+            word.clear();
+            word.extend_from_slice(before);
+            word.push(letter);
+            word.extend_from_slice(after);
+            if jumbled {
+                word.sort_unstable();
+            }
+            let mut p = 0;
+            for &tile in word.iter() {
+                p = kwg.seek(p, tile);
+                if p < 0 {
+                    return false;
+                }
+            }
+            kwg::Node::accepts(&kwg[p])
+        })
+        .collect()
+}
+
+// hooks: a board, as analyze's, with its lexicon and rules
+#[derive(serde::Deserialize)]
+struct HooksRequest {
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    lexicon: String,
+    rules: String,
+}
+
+// an empty square: the letters that make the across run of tiles through it a
+// word, and those that make the down run one; null where no tile is beside it
+// that way, so no word is made that way
+#[derive(serde::Serialize)]
+struct HookSquare {
+    row: i8,
+    col: i8,
+    across: Option<Vec<u8>>,
+    down: Option<Vec<u8>>,
+}
+
+// every empty square with a tile beside it, row by row
+#[derive(serde::Serialize)]
+struct HooksAnswer {
+    squares: Vec<HookSquare>,
+}
+
+#[wasm_bindgen]
+pub fn hooks(req_str: String) -> Result<String, JsValue> {
+    Ok(do_hooks(&req_str)?)
+}
+
+fn do_hooks(req_str: &str) -> Result<String, String> {
+    let req = serde_json::from_str::<HooksRequest>(req_str).map_err(err_to_str)?;
+    let kwg = (CACHED_KWG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.lexicon)
+        .cloned())
+    .ok_or("missing kwg")?;
+    let game_config = (CACHED_GAME_CONFIG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.rules)
+        .cloned())
+    .ok_or("missing game_config")?;
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return Err(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &[], &req.board_tiles)
+        .map_err(err_to_str)?;
+    let dim = game_config.board_layout().dim();
+    let tile_at = |r: i8, c: i8| {
+        if (0..dim.rows).contains(&r) && (0..dim.cols).contains(&c) {
+            kibitzer.board_tiles[r as usize * dim.cols as usize + c as usize]
+        } else {
+            0
+        }
+    };
+    let jumbled = matches!(game_config.game_rules(), game_config::GameRules::Jumbled);
+    let alphabet_len = game_config.alphabet().len();
+    // the letters of the tiles from (r, c) on, a step of (dr, dc) at a time, as
+    // long as there are tiles; a blank's is the letter it stands for
+    let run = |mut r: i8, mut c: i8, dr: i8, dc: i8| {
+        let mut letters = Vec::new();
+        loop {
+            r += dr;
+            c += dc;
+            match tile_at(r, c) {
+                0 => return letters,
+                tile => letters.push(tile & 0x7f),
+            }
+        }
+    };
+    let mut word = Vec::new();
+    let mut squares = Vec::new();
+    for r in 0..dim.rows {
+        for c in 0..dim.cols {
+            let beside_a_tile = [(r - 1, c), (r, c - 1), (r, c + 1), (r + 1, c)]
+                .iter()
+                .any(|&(r, c)| tile_at(r, c) != 0);
+            if tile_at(r, c) != 0 || !beside_a_tile {
+                continue;
+            }
+            let mut fit = |dr: i8, dc: i8| {
+                let mut before = run(r, c, -dr, -dc);
+                before.reverse();
+                let after = run(r, c, dr, dc);
+                (!before.is_empty() || !after.is_empty()).then(|| {
+                    letters_that_fit(&kwg.kwg, jumbled, alphabet_len, &before, &after, &mut word)
+                })
+            };
+            let across = fit(0, 1);
+            let down = fit(1, 0);
+            squares.push(HookSquare {
+                row: r,
+                col: c,
+                across,
+                down,
+            });
+        }
+    }
+    serde_json::to_string(&HooksAnswer { squares }).map_err(err_to_str)
+}
+
 //#[wasm_bindgen]
 pub fn sim_prepare(req_str: &str) -> Result<JsValue, JsValue> {
     let req = serde_json::from_str::<SimPrepareRequest>(req_str).map_err(err_to_str)?;
@@ -925,5 +1071,94 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // english tiles
+    const A: u8 = 1;
+    const C: u8 = 3;
+    const E: u8 = 5;
+    const S: u8 = 19;
+    const T: u8 = 20;
+
+    // a lexicon of a few words cached under this name, beside the rules and the
+    // empty leaves startup caches
+    fn tiny_lexicon(name: &str) {
+        do_this_on_startup().unwrap();
+        let mut words = [
+            &[A, T][..],
+            &[T, A],
+            &[A, S],
+            &[E, S],
+            &[E, T],
+            &[C, A, T],
+            &[A, C, T],
+            &[C, A, T, S],
+            &[S, C, A, T],
+            &[A, C, T, S],
+            &[E, A, T],
+            &[A, T, E],
+            &[T, E, A],
+            &[E, T, A],
+            &[E, A, T, S],
+            &[S, E, A, T],
+            &[T, E, A, S],
+            &[S, A, T],
+            &[S, E, T],
+        ]
+        .iter()
+        .map(|&word| word.into())
+        .collect::<Vec<bites::Bites>>();
+        words.sort_unstable();
+        let bytes = build::build(
+            build::BuildContent::Gaddawg,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &words,
+        )
+        .unwrap();
+        let graph = Kwg::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
+            piece.copy_from_slice(&bytes[at..at + piece.len()])
+        })
+        .unwrap();
+        CACHED_KWG
+            .write()
+            .unwrap()
+            .insert(name.into(), CachedKwg::new(graph).into());
+    }
+
+    // an empty board but for CAT across row 7 from column 6, as json
+    fn cat_board() -> String {
+        let mut board = vec![vec![0i8; 15]; 15];
+        board[7][6] = C as i8;
+        board[7][7] = A as i8;
+        board[7][8] = T as i8;
+        serde_json::to_string(&board).unwrap()
+    }
+
+    #[test]
+    fn hooks_give_the_letters_that_fit_every_empty_square_beside_a_tile() {
+        tiny_lexicon("tiny-hooks");
+        let req = format!(
+            r#"{{"board":{},"lexicon":"tiny-hooks","rules":"CrosswordGame"}}"#,
+            cat_board()
+        );
+        let answer = serde_json::from_str::<serde_json::Value>(&do_hooks(&req).unwrap()).unwrap();
+        // every empty square beside CAT, row by row. Above C nothing makes a
+        // word down; above A, T (ta); above T, A or E (at, et); left of CAT, S
+        // (scat); right of it, S (cats); below C nothing; below A, S or T (as,
+        // at); below T, A (ta)
+        assert_eq!(
+            answer,
+            serde_json::json!({"squares": [
+                {"row": 6, "col": 6, "across": null, "down": []},
+                {"row": 6, "col": 7, "across": null, "down": [T]},
+                {"row": 6, "col": 8, "across": null, "down": [A, E]},
+                {"row": 7, "col": 5, "across": [S], "down": null},
+                {"row": 7, "col": 9, "across": [S], "down": null},
+                {"row": 8, "col": 6, "across": null, "down": []},
+                {"row": 8, "col": 7, "across": null, "down": [S, T]},
+                {"row": 8, "col": 8, "across": null, "down": [A]},
+            ]})
+        );
     }
 }
