@@ -1909,14 +1909,15 @@ struct Endgame {
     max_memory: Option<usize>,
     table: Option<endgame::KeptTable>,
     peg: Option<endgame::PegProgress>,
+    finished: Option<(i8, equity::Equity)>, // an empty bag's deepest pass done, its value
     answer: EndgameAnswer,
 }
 
 impl EndgameAnswer {
     // whether an empty bag's answer gives way to a later step's: the step's is
     // exact, or deeper, or at its depth worth more (a play the step proved
-    // better); a step starts its solve again on the kept table, and may stop
-    // sooner than one before it did
+    // better); a step deepens on from the depth the steps before it finished,
+    // and one stopped in its first pass answers from that depth
     fn gives_way_to(&self, step: &EndgameAnswer) -> bool {
         self.play.is_none()
             || step.exact
@@ -2035,13 +2036,18 @@ impl Endgame {
                 self.pass_turns,
                 self.zero_turns,
             );
-            let solved = match solver.solve_within(self.turn, &limits) {
+            let solved = match self.finished {
+                Some(finished) => solver.solve_within_after(self.turn, &limits, finished),
+                None => solver.solve_within(self.turn, &limits),
+            };
+            let solved = match solved {
                 Ok(solved) => solved,
                 Err(e) => {
                     self.table = Some(solver.take_table());
                     return Err(err_to_str(e));
                 }
             };
+            self.finished = Some((solved.depth, solved.value));
             let mut line = Vec::new();
             solver.collect_pv(self.turn, &mut line);
             let value = points(solved.value);
@@ -2223,6 +2229,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         max_memory,
         table: None,
         peg,
+        finished: None,
         answer: EndgameAnswer {
             bag: in_bag as u8,
             steps: 0,
@@ -3502,6 +3509,45 @@ mod tests {
             "{answer}"
         );
         do_endgame_free(handle).unwrap();
+    }
+
+    // a clock that moves a millisecond each time it is read
+    fn ticking() -> std::time::Duration {
+        static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::time::Duration::from_millis(READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    // an empty bag's steps, each four reads of the clock, deepen on from the
+    // depth the steps before finished: never a shallower one, and the steps end
+    // with the endgame's own value. Steps that each began at depth 1 again
+    // spent their reads walking the depths done and never got past them
+    #[test]
+    fn an_empty_bags_steps_deepen_on_from_the_depth_finished() {
+        let (rack, others) = ([S, E, A, T, C, A, T], [A, T, E, S, E, A, T]);
+        let handle = endgame_of("tiny-end-deepen", &rack, &others, "").unwrap();
+        let whole = endgame_of("tiny-end-deepen", &rack, &others, "").unwrap();
+        let exact = endgame_step(whole, r#"{"ms":60000}"#);
+        assert_eq!(exact["exact"], true);
+        let mut finished = 0;
+        for step in 1.. {
+            assert!(step <= 1000, "the steps did not end in a thousand");
+            let answer = report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking).unwrap());
+            if answer["exact"] == true {
+                assert_eq!(answer["value"], exact["value"]);
+                assert!(step > 2, "{step} steps");
+                break;
+            }
+            let endgames = ENDGAMES.lock().unwrap();
+            let (depth, _) = endgames.live[&handle].finished.unwrap();
+            assert!(
+                depth >= finished,
+                "step {step}: depth {depth} after {finished}"
+            );
+            assert_eq!(answer["depth"], depth, "step {step}");
+            finished = depth;
+        }
+        do_endgame_free(handle).unwrap();
+        do_endgame_free(whole).unwrap();
     }
 
     // an empty bag's answer gives way to a step's only when that is exact,
