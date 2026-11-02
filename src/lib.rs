@@ -322,11 +322,7 @@ pub fn precache_klv(
         Klv::from_reader::<kwg::Node22>(value.length() as usize, js_pieces(&value))
             .map_err(err_to_str)?,
     )?;
-    CACHED_KLV
-        .write()
-        .map_err(err_to_str)?
-        .insert(key, table.into());
-    Ok(())
+    Ok(cache_klv(key, table)?)
 }
 
 // a leave table whose graph is already in kbwg's layout (a kblv2), taken as it
@@ -341,6 +337,13 @@ pub fn precache_kblv2(
         Klv::from_reader::<kwg::Node24>(value.length() as usize, js_pieces(&value))
             .map_err(err_to_str)?,
     )?;
+    Ok(cache_klv(key, table)?)
+}
+
+// a leave table cached under its name, in place of any before it, and the
+// inference tables made from that one forgotten
+fn cache_klv(key: String, table: CachedKlv) -> Result<(), String> {
+    forget_infer_tables(&key)?;
     CACHED_KLV
         .write()
         .map_err(err_to_str)?
@@ -369,6 +372,7 @@ pub fn evict_kwg(key: String) -> Result<bool, JsValue> {
 // Same, for a leave-value table. See evict_kwg.
 #[wasm_bindgen]
 pub fn evict_klv(key: String) -> Result<bool, JsValue> {
+    forget_infer_tables(&key)?;
     Ok(CACHED_KLV
         .write()
         .map_err(err_to_str)?
@@ -732,6 +736,199 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
     serde_json::to_string(&HooksAnswer { squares }).map_err(err_to_str)
 }
 
+// infer: the leaves the player who just moved may have kept, from that move, as
+// wolges's sims infer them: the board before it, the rack of the one who
+// watches (empty for one who sees none), the move as a sim takes one (an
+// exchange's tiles read only for how many), how far it may fall short of a
+// rack's best (fuzz, in points), and how many of the likeliest leaves to list
+// (none unless asked). The leaves, weighted to sum to 1 and millions of them at
+// times, stay here under a handle sim_new and sim_set take; none when nothing
+// is inferred, as when the bag is empty or the move's draw empties it
+#[derive(serde::Deserialize)]
+struct InferRequest {
+    rack: Vec<u8>,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    lexicon: String,
+    leave: String,
+    rules: String,
+    play: SimPlay,
+    fuzz: f64,
+    #[serde(default)]
+    list: usize,
+}
+
+// a leave a player may have kept, and its weight
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct WeightedLeave {
+    tiles: Vec<u8>,
+    weight: f64,
+}
+
+// an inference: its handle, how many leaves it holds, and as many of the
+// likeliest as were asked, the likeliest first, those alike in their tiles'
+// order
+#[derive(serde::Serialize)]
+struct InferAnswer {
+    handle: u32,
+    count: usize,
+    leaves: Vec<WeightedLeave>,
+}
+
+// the inferences made, by handle, each its leaves (shared with the sims given
+// them); a handle is never used twice
+#[derive(Default)]
+struct Inferences {
+    made: u32,
+    live: fash::MyHashMap<u32, std::sync::Arc<infer::PackedLeaves>>,
+}
+
+static INFERENCES: std::sync::LazyLock<std::sync::Mutex<Inferences>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn no_inference(handle: u32) -> String {
+    format!("inference {handle}: none such, or freed")
+}
+
+// the n likeliest of these leaves (every one, if no more), as InferAnswer lists
+// them: found by a selection, so that a few of millions are not a whole sort
+fn likeliest(leaves: &infer::PackedLeaves, n: usize) -> Vec<WeightedLeave> {
+    let n = n.min(leaves.len());
+    if n == 0 {
+        return Vec::new();
+    }
+    let order = |a: &u32, b: &u32| {
+        let (a, b) = (*a as usize, *b as usize);
+        (leaves.weight(b).total_cmp(&leaves.weight(a)))
+            .then_with(|| leaves.leave(a).cmp(leaves.leave(b)))
+    };
+    let mut at = (0..leaves.len() as u32).collect::<Vec<_>>();
+    if n < at.len() {
+        at.select_nth_unstable_by(n - 1, order);
+        at.truncate(n);
+    }
+    at.sort_unstable_by(order);
+    (at.into_iter())
+        .map(|i| WeightedLeave {
+            tiles: leaves.leave(i as usize).to_vec(),
+            weight: leaves.weight(i as usize),
+        })
+        .collect()
+}
+
+// the inference tables made for a rules and a leave table (the multiset lattice
+// with the table's values on it, and an inference's scratch)
+struct HeldInfer {
+    rules: String,
+    leave: String,
+    tables: infer::InferTables,
+}
+
+// the inference tables of the rules and the leave table infer was last asked
+// about, made by the first infer to need them. One set at a time, as a set
+// holds two numbers for each multiset of up to a rack's tiles: infer asked
+// about other rules or another table makes its own in their place, and the
+// table loaded again or evicted takes them along
+static CACHED_INFER: std::sync::Mutex<Option<HeldInfer>> = std::sync::Mutex::new(None);
+
+fn forget_infer_tables(leave: &str) -> Result<(), String> {
+    let mut cached = CACHED_INFER.lock().map_err(err_to_str)?;
+    if cached.as_ref().is_some_and(|held| held.leave == leave) {
+        *cached = None;
+    }
+    Ok(())
+}
+
+// the leaves inferred, as InferAnswer
+#[wasm_bindgen]
+pub fn infer(req_str: String) -> Result<String, JsValue> {
+    Ok(do_infer(&req_str)?)
+}
+
+fn do_infer(req_str: &str) -> Result<String, String> {
+    let req = serde_json::from_str::<InferRequest>(req_str).map_err(err_to_str)?;
+    if let SimPlay::Play {
+        bonus,
+        challenged_off,
+        ..
+    } = &req.play
+        && (*bonus != 0 || *challenged_off)
+    {
+        return Err("play: a bonus or a play challenged off says nothing of a leave".into());
+    }
+    let Tables {
+        kwg,
+        klv,
+        game_config,
+    } = tables(&req.lexicon, &req.leave, &req.rules)?;
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &req.rack, &req.board_tiles)
+        .map_err(err_to_str)?;
+    let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
+    let mut cached = CACHED_INFER.lock().map_err(err_to_str)?;
+    let tables = match &mut *cached {
+        Some(held) if held.rules == req.rules && held.leave == req.leave => &mut held.tables,
+        slot => {
+            // the set held goes before the next is made, never two at once
+            *slot = None;
+            let tables = infer::InferTables::new(&game_config, &klv.klv).map_err(err_to_str)?;
+            &mut slot
+                .insert(HeldInfer {
+                    rules: req.rules.clone(),
+                    leave: req.leave.clone(),
+                    tables,
+                })
+                .tables
+        }
+    };
+    let mut leaves = infer::kept_leaves_packed(
+        tables,
+        &mut move_generator,
+        &movegen::BoardSnapshot {
+            board_tiles: &kibitzer.board_tiles,
+            game_config: &game_config,
+            kwg: &kwg.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &klv.klv,
+        },
+        &req.rack,
+        &req.play.to_play(),
+        req.fuzz,
+        1,
+    )
+    .map_err(err_to_str)?;
+    drop(cached);
+    leaves.normalize();
+    let listed = likeliest(&leaves, req.list);
+    let count = leaves.len();
+    let mut inferences = INFERENCES.lock().map_err(err_to_str)?;
+    let handle = (inferences.made.checked_add(1)).ok_or("too many inferences made")?;
+    inferences.made = handle;
+    inferences.live.insert(handle, std::sync::Arc::new(leaves));
+    drop(inferences);
+    serde_json::to_string(&InferAnswer {
+        handle,
+        count,
+        leaves: listed,
+    })
+    .map_err(err_to_str)
+}
+
+// an inference let go; a sim given it keeps its leaves
+#[wasm_bindgen]
+pub fn infer_free(handle: u32) -> Result<(), JsValue> {
+    Ok(do_infer_free(handle)?)
+}
+
+fn do_infer_free(handle: u32) -> Result<(), String> {
+    let mut inferences = INFERENCES.lock().map_err(err_to_str)?;
+    (inferences.live.remove(&handle))
+        .map(|_| ())
+        .ok_or_else(|| no_inference(handle))
+}
+
 // sim_new: a position (rack, board, lexicon, leave, rules, each seat's score in
 // points, the seat to move, and the scoreless turns and the passes in a row so
 // far; each seat's rack size, by default the mover's rack with full racks for
@@ -758,6 +955,9 @@ struct SimNewRequest {
     known: Vec<u8>,
     #[serde(default = "default_plies")]
     plies: Option<usize>, // null: every ply to the game's end
+    #[serde(default)]
+    kept: Vec<WeightedLeave>, // the leaves the opponent may hold, as the caller weighs them
+    inferred: Option<u32>, // an inference's leaves the opponent may hold, by infer's handle
     #[serde(default)]
     opponents_pass: bool, // every seat but the mover's passes in a rollout
     seed: Option<u64>,
@@ -1435,16 +1635,19 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
             req.rack.len()
         ));
     }
-    // the tiles known to be on the opponent's rack: each iteration puts them
-    // there first and deals the rest of it from the tiles unseen
-    if !req.known.is_empty() {
-        check_known(
-            &req.known,
-            num_players,
-            rack_sizes[(turn + 1) % num_players] as usize,
-            &kibitzer.available_tally,
-        )?;
-    }
+    // the tiles known to be on the opponent's rack, or the leaves it may hold:
+    // each iteration puts them there first (a leave chosen by its weight) and
+    // deals the rest of it from the tiles unseen
+    let opponent = (turn + 1) % num_players;
+    let (known, inferred) = match opponent_leaves(
+        (req.known, req.kept, req.inferred),
+        num_players,
+        rack_sizes[opponent] as usize,
+        &kibitzer.available_tally,
+    )? {
+        OpponentLeaves::Listed(known) => (known, None),
+        OpponentLeaves::Inferred(leaves) => (Vec::new(), Some(leaves)),
+    };
 
     // the bag in tile order and the other seats dealt from it as it lies, so
     // that a seed is all that makes a sim's draws
@@ -1481,11 +1684,6 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
     let mut simmer = simmer::Simmer::new(&game_config).map_err(err_to_str)?;
     simmer.set_opponents_pass(req.opponents_pass);
-    let known = if req.known.is_empty() {
-        Vec::new()
-    } else {
-        vec![(req.known, 1.0)]
-    };
     simmer.prepare(
         &game_config,
         &game_state,
@@ -1493,6 +1691,9 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         true,
         &known,
     );
+    if let Some(leaves) = inferred {
+        simmer.set_packed_kept_leaves(opponent as u8, leaves);
+    }
     let pristine = simmer.prepared_state().clone();
     let sim = Sim {
         game_config,
@@ -1516,20 +1717,21 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     Ok(handle)
 }
 
-// tiles known to be on the opponent's rack: a game of two seats, no more than
-// that rack holds, all among the tiles unseen (a tally)
+// tiles known to be on the opponent's rack (a request's field what): a game of
+// two seats, no more than that rack holds, all among the tiles unseen (a tally)
 fn check_known(
+    what: &str,
     known: &[u8],
     num_players: usize,
     opponent_rack: usize,
     unseen: &[u8],
 ) -> Result<(), String> {
     if num_players != 2 {
-        return Err(format!("known: only with two seats, found {num_players}"));
+        return Err(format!("{what}: only with two seats, found {num_players}"));
     }
     if known.len() > opponent_rack {
         return Err(format!(
-            "known: {} tiles, but the opponent's rack holds {opponent_rack}",
+            "{what}: {} tiles, but the opponent's rack holds {opponent_rack}",
             known.len(),
         ));
     }
@@ -1539,12 +1741,109 @@ fn check_known(
             Some(count) if *count > 0 => *count -= 1,
             _ => {
                 return Err(format!(
-                    "known: {known:?} are not all among the tiles unseen"
+                    "{what}: {known:?} are not all among the tiles unseen"
                 ));
             }
         }
     }
     Ok(())
+}
+
+// the leaves the opponent may hold, weighted, from a request's known tiles (one
+// leave, certain) or its kept leaves (as infer answers them), never both; each
+// leave checked as known tiles are, each weight 0 or more, and the weights
+// summing to a number above 0 (a sim draws a leave from 0 up to their sum)
+fn kept_leaves_of(
+    known: Vec<u8>,
+    kept: Vec<WeightedLeave>,
+    num_players: usize,
+    opponent_rack: usize,
+    unseen: &[u8],
+) -> Result<Vec<(Vec<u8>, f64)>, String> {
+    if !known.is_empty() {
+        if !kept.is_empty() {
+            return Err("known, kept: give one or the other".into());
+        }
+        check_known("known", &known, num_players, opponent_rack, unseen)?;
+        return Ok(vec![(known, 1.0)]);
+    }
+    let mut leaves = Vec::with_capacity(kept.len());
+    for (i, leave) in kept.into_iter().enumerate() {
+        let what = format!("kept[{i}]");
+        if leave.weight < 0.0 {
+            return Err(format!("{what}: weight must be 0 or more"));
+        }
+        check_known(&what, &leave.tiles, num_players, opponent_rack, unseen)?;
+        leaves.push((leave.tiles, leave.weight));
+    }
+    let total = leaves.iter().map(|(_, weight)| weight).sum::<f64>();
+    if !leaves.is_empty() && !(total > 0.0 && total.is_finite()) {
+        return Err("kept: weights must sum to a finite number above 0".into());
+    }
+    Ok(leaves)
+}
+
+// what the opponent may hold: a list (kept_leaves_of's), or an inference's
+// leaves, shared with it
+enum OpponentLeaves {
+    Listed(Vec<(Vec<u8>, f64)>),
+    Inferred(std::sync::Arc<infer::PackedLeaves>),
+}
+
+// what the opponent may hold from a request's known tiles, its kept leaves, or
+// an inference (by infer's handle), never two of them; an inference's leaves
+// checked as known tiles are, none of them copied
+fn opponent_leaves(
+    (known, kept, inferred): (Vec<u8>, Vec<WeightedLeave>, Option<u32>),
+    num_players: usize,
+    opponent_rack: usize,
+    unseen: &[u8],
+) -> Result<OpponentLeaves, String> {
+    let Some(handle) = inferred else {
+        return Ok(OpponentLeaves::Listed(kept_leaves_of(
+            known,
+            kept,
+            num_players,
+            opponent_rack,
+            unseen,
+        )?));
+    };
+    if !known.is_empty() {
+        return Err("known, inferred: give one or the other".into());
+    }
+    if !kept.is_empty() {
+        return Err("kept, inferred: give one or the other".into());
+    }
+    let leaves = (INFERENCES.lock().map_err(err_to_str)?.live.get(&handle))
+        .cloned()
+        .ok_or_else(|| format!("inferred: {}", no_inference(handle)))?;
+    if num_players != 2 && !leaves.is_empty() {
+        return Err(format!(
+            "inferred: only with two seats, found {num_players}"
+        ));
+    }
+    let mut left = vec![0u8; unseen.len()];
+    for i in 0..leaves.len() {
+        let leave = leaves.leave(i);
+        if leave.len() > opponent_rack {
+            return Err(format!(
+                "inferred: leave {i} has {} tiles, but the opponent's rack holds {opponent_rack}",
+                leave.len()
+            ));
+        }
+        left.copy_from_slice(unseen);
+        for &tile in leave {
+            match left.get_mut(tile as usize) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => {
+                    return Err(format!(
+                        "inferred: leave {i}, {leave:?}, is not all among the tiles unseen"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(OpponentLeaves::Inferred(leaves))
 }
 
 #[wasm_bindgen]
@@ -1695,14 +1994,16 @@ pub fn sim_free(sim: u32) -> Result<(), JsValue> {
     Ok(do_sim_free(sim)?)
 }
 
-// sim_set: a change to a live sim's plies or to the tiles known to be on the
-// opponent's rack, each as sim_new takes it (one left out stays as it was); the
-// results so far stay, and the change counts from the next iteration on
+// sim_set: a change to a live sim's plies or to what the opponent holds, each
+// as sim_new takes it (one left out stays as it was); the results so far stay,
+// and the change counts from the next iteration on
 #[derive(serde::Deserialize)]
 struct SimSetRequest {
     #[serde(default, deserialize_with = "given")]
     plies: Option<Option<usize>>, // null: every ply to the game's end
     known: Option<Vec<u8>>,
+    kept: Option<Vec<WeightedLeave>>,
+    inferred: Option<u32>,
 }
 
 // a field given, null among the values it may take; one left out takes its
@@ -1730,7 +2031,7 @@ fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
     let opponent = (turn + 1) % num_players;
     // checked before anything changes: the tiles unseen are the bag's and every
     // rack's but the mover's
-    if let Some(known) = &req.known {
+    let held = if req.known.is_some() || req.kept.is_some() || req.inferred.is_some() {
         let mut unseen = vec![0u8; sim.game_config.alphabet().len() as usize];
         let others = (sim.game_state.players.iter().enumerate())
             .filter(|&(i, _)| i != turn)
@@ -1738,25 +2039,30 @@ fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
         for &tile in sim.game_state.bag.as_slice().iter().chain(others) {
             unseen[tile as usize] += 1;
         }
-        check_known(
-            known,
+        Some(opponent_leaves(
+            (
+                req.known.unwrap_or_default(),
+                req.kept.unwrap_or_default(),
+                req.inferred,
+            ),
             num_players,
             sim.game_state.players[opponent].rack.len(),
             &unseen,
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
     if let Some(plies) = req.plies {
         sim.simmer
             .set_num_sim_plies(&sim.game_config, plies.unwrap_or(usize::MAX));
         sim.plies = plies;
     }
-    if let Some(known) = req.known {
-        let known = if known.is_empty() {
-            Vec::new()
-        } else {
-            vec![(known, 1.0)]
-        };
-        sim.simmer.set_kept_leaves(opponent as u8, &known);
+    match held {
+        Some(OpponentLeaves::Listed(known)) => sim.simmer.set_kept_leaves(opponent as u8, &known),
+        Some(OpponentLeaves::Inferred(leaves)) => {
+            sim.simmer.set_packed_kept_leaves(opponent as u8, leaves)
+        }
+        None => {}
     }
     serde_json::to_string(&sim.report(0, None)).map_err(err_to_str)
 }
@@ -2817,6 +3123,377 @@ mod tests {
     // a sim as a step of no iterations reads it
     fn read_sim(sim: u32) -> serde_json::Value {
         step(sim, r#"{"iterations":0}"#)
+    }
+
+    // the tests that infer, one at a time, since infer holds one set of tables
+    // and a test reads which
+    static INFER_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn one_infer_test() -> std::sync::MutexGuard<'static, ()> {
+        INFER_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // infer answers as wolges's own inference does, weights made to sum to 1: a
+    // new handle each time, the count, and as many of the likeliest as asked
+    // (the likeliest first; none unless asked); fuzz the caller's, never left
+    // out; freed once
+    #[test]
+    fn infer_answers_as_wolges_infers() {
+        let _one = one_infer_test();
+        tiny_lexicon("tiny-infer");
+        let rack = [S, E, A, T];
+        let ask = |more: &str| {
+            do_infer(&format!(
+                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{CATS}{more}}}"#,
+                cat_board()
+            ))
+        };
+        let fuzz = infer::FUZZ;
+        let answer = ask(&format!(r#","fuzz":{fuzz},"list":{}"#, u32::MAX)).unwrap();
+
+        let Tables {
+            kwg,
+            klv,
+            game_config,
+        } = tables("tiny-infer", "noleave", "CrosswordGame").unwrap();
+        let mut kibitzer = kibitzer::Kibitzer::new();
+        let board = serde_json::from_str::<Vec<Vec<i8>>>(&cat_board()).unwrap();
+        kibitzer.prepare(&game_config, &rack, &board).unwrap();
+        let play = serde_json::from_str::<SimPlay>(CATS).unwrap().to_play();
+        let mut wolges = infer::kept_leaves(
+            &mut infer::InferTables::new(&game_config, &klv.klv).unwrap(),
+            &mut movegen::KurniaMoveGenerator::new(&game_config),
+            &movegen::BoardSnapshot {
+                board_tiles: &kibitzer.board_tiles,
+                game_config: &game_config,
+                kwg: &kwg.kwg,
+                anagrams: None,
+                rack_lengths: None,
+                klv: &klv.klv,
+            },
+            &rack,
+            &play,
+            infer::FUZZ,
+            1,
+        )
+        .unwrap();
+        assert!(!wolges.is_empty());
+        let total = wolges.iter().map(|(_, weight)| weight).sum::<f64>();
+        for (_, weight) in &mut wolges {
+            *weight /= total;
+        }
+        wolges.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let listed = (wolges.into_iter())
+            .map(|(tiles, weight)| WeightedLeave { tiles, weight })
+            .collect::<Vec<_>>();
+        // compared as text, as a weight read back from JSON can be off in its
+        // last place
+        let handle_of = |answer: &str| report(answer)["handle"].as_u64().unwrap() as u32;
+        let want = |handle: u32, n: usize| {
+            serde_json::to_string(&InferAnswer {
+                handle,
+                count: listed.len(),
+                leaves: listed[..n].to_vec(),
+            })
+            .unwrap()
+        };
+        let first = handle_of(&answer);
+        assert_eq!(answer, want(first, listed.len()));
+        let three = ask(&format!(r#","fuzz":{fuzz},"list":3"#)).unwrap();
+        assert_eq!(three, want(first + 1, 3));
+        let none = ask(&format!(r#","fuzz":{fuzz}"#)).unwrap();
+        assert_eq!(none, want(first + 2, 0));
+        for handle in first..first + 3 {
+            do_infer_free(handle).unwrap();
+        }
+        let err = do_infer_free(first).unwrap_err();
+        assert!(err.starts_with(&format!("inference {first}: ")), "{err}");
+
+        // fuzz is the caller's to give: never left out, none below 0
+        for more in ["", r#","fuzz":-1"#] {
+            let err = ask(more).unwrap_err();
+            assert!(err.contains("fuzz"), "{err}");
+        }
+
+        // a play with a bonus or challenged off is refused: neither says what
+        // was kept
+        for more in [r#""bonus":5"#, r#""challenged_off":true"#] {
+            let err = do_infer(&format!(
+                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{},{more}}},"fuzz":{fuzz}}}"#,
+                cat_board(),
+                CATS.strip_suffix('}').unwrap()
+            ))
+            .unwrap_err();
+            assert!(err.starts_with("play: "), "{err}");
+        }
+    }
+
+    // a leave table of these leaves (in order) and values, laid out as a klv2
+    fn leave_table(leaves: &[(&[u8], f32)]) -> CachedKlv {
+        let words = (leaves.iter())
+            .map(|&(tiles, _)| tiles.into())
+            .collect::<Vec<bites::Bites>>();
+        let graph = build::build(
+            build::BuildContent::DawgOnly,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &words,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((graph.len() / 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(&graph);
+        bytes.extend_from_slice(&(leaves.len() as u32).to_le_bytes());
+        for &(_, value) in leaves {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        CachedKlv::new(
+            Klv::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
+                piece.copy_from_slice(&bytes[at..at + piece.len()])
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    // a leave table cached again under its name answers infer as it is now, not
+    // as the inference tables made from the one before it would; another
+    // table's tables, or other rules', take the place of those held; evicted, a
+    // table takes its tables along
+    #[test]
+    fn infer_answers_from_a_leave_table_as_it_is_cached_now() {
+        let _one = one_infer_test();
+        tiny_lexicon("tiny-infer-again");
+        tiny_lexicon_for("tiny-infer-again-jumbled", true);
+        // a lexicon and its rules
+        const ENGLISH: (&str, &str) = ("tiny-infer-again", "CrosswordGame");
+        const JUMBLED: (&str, &str) = ("tiny-infer-again-jumbled", "WordSmog");
+        // every leave inferred, the handle freed
+        let ask = |leave: &str, (lexicon, rules): (&str, &str)| {
+            let answer = report(
+                &do_infer(&format!(
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"{lexicon}","leave":"{leave}","rules":"{rules}","play":{CATS},"fuzz":{},"list":{}}}"#,
+                    cat_board(),
+                    infer::FUZZ,
+                    u32::MAX
+                ))
+                .unwrap(),
+            );
+            do_infer_free(answer["handle"].as_u64().unwrap() as u32).unwrap();
+            answer["leaves"].clone()
+        };
+        let made = |leave: &str, (_, rules): (&str, &str)| {
+            (CACHED_INFER.lock().unwrap().as_ref())
+                .is_some_and(|held| held.leave == leave && held.rules == rules)
+        };
+        let table = || CachedKlv::new(Klv::empty().unwrap()).unwrap();
+        cache_klv("tiny-infer-again".into(), table()).unwrap();
+        let before = ask("tiny-infer-again", ENGLISH);
+        assert!(made("tiny-infer-again", ENGLISH));
+        // the same table under other rules
+        ask("tiny-infer-again", JUMBLED);
+        assert!(made("tiny-infer-again", JUMBLED));
+        // an E alone worth 100 points as a leave: a rack holding one would
+        // sooner exchange the rest and keep it than play CATS
+        let table = || leave_table(&[(&[E], 100.0)]);
+        cache_klv("tiny-infer-again".into(), table()).unwrap();
+        assert!(!made("tiny-infer-again", JUMBLED));
+        let after = ask("tiny-infer-again", ENGLISH);
+        assert_ne!(after, before);
+        cache_klv("tiny-infer-fresh".into(), table()).unwrap();
+        assert_eq!(after, ask("tiny-infer-fresh", ENGLISH));
+        assert!(made("tiny-infer-fresh", ENGLISH) && !made("tiny-infer-again", ENGLISH));
+        assert!(evict_klv("tiny-infer-fresh".into()).unwrap());
+        assert!(!made("tiny-infer-fresh", ENGLISH));
+    }
+
+    // with the bag empty there is nothing to infer: the mover holds every tile
+    // the watcher cannot see
+    #[test]
+    fn infer_with_an_empty_bag_answers_no_leaves() {
+        let _one = one_infer_test();
+        tiny_lexicon("tiny-infer-late");
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let racks = rack.iter().chain(&others).copied().collect::<Vec<_>>();
+        let answer = report(
+            &do_infer(&format!(
+                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer-late","leave":"noleave","rules":"CrosswordGame","play":{PASS},"fuzz":{},"list":{}}}"#,
+                late_board(&racks),
+                infer::FUZZ,
+                u32::MAX
+            ))
+            .unwrap(),
+        );
+        let handle = answer["handle"].clone();
+        assert_eq!(
+            answer,
+            serde_json::json!({"handle": handle, "count": 0, "leaves": []})
+        );
+        do_infer_free(handle.as_u64().unwrap() as u32).unwrap();
+    }
+
+    // a sim given an inference's handle deals its opponent one of its leaves
+    // each iteration, as one given the same leaves as a list does, and keeps
+    // them once the handle is freed; sim_set takes a handle too. The handle
+    // goes with neither known tiles nor kept leaves, and its leaves must fit
+    // what the sim's opponent may hold
+    #[test]
+    fn a_sim_deals_its_opponent_one_of_an_inferences_leaves() {
+        let _one = one_infer_test();
+        tiny_lexicon("tiny-infer-sim");
+        let inferred = || {
+            let answer = report(
+                &do_infer(&format!(
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","play":{CATS},"fuzz":{}}}"#,
+                    cat_board(),
+                    infer::FUZZ
+                ))
+                .unwrap(),
+            );
+            assert!(answer["count"].as_u64().unwrap() > 0);
+            answer["handle"].as_u64().unwrap() as u32
+        };
+        // the opponent's rack on each of these iterations
+        let dealt = |sim: u32, iterations: std::ops::RangeInclusive<u64>| {
+            let mut sims = SIMS.lock().unwrap();
+            let sim = sims.live.get_mut(&sim).unwrap();
+            (iterations.map(|iteration| {
+                sim.simmer.restore_prepared(&sim.pristine);
+                sim.simmer.reseed(iteration_seed(sim.seed, iteration));
+                sim.simmer.prepare_iteration();
+                sim.simmer.prepared_state().players[1].rack.clone()
+            }))
+            .collect::<Vec<_>>()
+        };
+        let handle = inferred();
+        let leaves = INFERENCES.lock().unwrap().live[&handle].clone();
+        let from_handle = sim_of(
+            "tiny-infer-sim",
+            &cat_board(),
+            &format!(r#","inferred":{handle}"#),
+        );
+        do_infer_free(handle).unwrap();
+        // the sim and this test share the leaves; none were copied
+        assert_eq!(std::sync::Arc::strong_count(&leaves), 2);
+        let listed = (0..leaves.len())
+            .map(|i| (leaves.leave(i).to_vec(), leaves.weight(i)))
+            .collect::<Vec<_>>();
+        let from_list = sim_of("tiny-infer-sim", &cat_board(), "");
+        let plain = dealt(from_list, 1..=20);
+        (SIMS.lock().unwrap().live.get_mut(&from_list).unwrap())
+            .simmer
+            .set_kept_leaves(1, &listed);
+        let racks = dealt(from_handle, 1..=20);
+        assert_eq!(dealt(from_list, 1..=20), racks);
+        assert_ne!(plain, racks);
+        // sim_set takes a handle: a sim with none then deals as one made with it
+        let again = inferred();
+        let set = sim_of("tiny-infer-sim", &cat_board(), "");
+        do_sim_set(set, &format!(r#"{{"inferred":{again}}}"#)).unwrap();
+        assert_eq!(dealt(set, 1..=20), racks);
+        for sim in [from_handle, from_list, set] {
+            do_sim_free(sim).unwrap();
+        }
+
+        let err = do_sim_set(from_handle, &format!(r#"{{"inferred":{again}}}"#)).unwrap_err();
+        assert!(err.starts_with("sim "), "{err}");
+        for (more, said) in [
+            (format!(r#","inferred":{handle}"#), "inferred: inference "),
+            (
+                format!(r#","known":[{E}],"inferred":{again}"#),
+                "known, inferred",
+            ),
+            (
+                format!(r#","kept":[{{"tiles":[0],"weight":1}}],"inferred":{again}"#),
+                "kept, inferred",
+            ),
+            // an opponent of five tiles cannot hold a leave of six
+            (
+                format!(r#","rack_sizes":[4,5],"inferred":{again}"#),
+                "inferred: leave 0 has 6 tiles",
+            ),
+        ] {
+            let err = do_sim_new(&format!(
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
+                cat_board()
+            ))
+            .unwrap_err();
+            assert!(err.starts_with(said), "{err}");
+        }
+        // a mover holding both blanks leaves the opponent none to keep
+        let err = do_sim_new(&format!(
+            r#"{{"rack":[0,0,{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"inferred":{again}}}"#,
+            cat_board()
+        ))
+        .unwrap_err();
+        assert!(err.contains("is not all among the tiles unseen"), "{err}");
+        do_infer_free(again).unwrap();
+    }
+
+    // a sim given kept leaves deals its opponent one of them each iteration,
+    // chosen by weight, as sim_set does too; known and kept do not go together
+    #[test]
+    fn a_sim_deals_its_opponent_one_of_its_kept_leaves() {
+        let kept =
+            format!(r#""kept":[{{"tiles":[{E},{E}],"weight":3}},{{"tiles":[0],"weight":1}}]"#);
+        let handle = sim_of("tiny-sim-kept", &cat_board(), &format!(",{kept}"));
+        let dealt = |handle: u32, iterations: std::ops::RangeInclusive<u64>| {
+            let mut sims = SIMS.lock().unwrap();
+            let sim = sims.live.get_mut(&handle).unwrap();
+            let mut counts = [0, 0];
+            for iteration in iterations {
+                sim.simmer.restore_prepared(&sim.pristine);
+                sim.simmer.reseed(iteration_seed(sim.seed, iteration));
+                sim.simmer.prepare_iteration();
+                let rack = &sim.simmer.prepared_state().players[1].rack;
+                let es = rack.iter().filter(|&&t| t == E).count() >= 2;
+                let blank = rack.contains(&0);
+                assert!(es || blank, "{rack:?}");
+                counts[0] += es as u32;
+                counts[1] += blank as u32;
+            }
+            counts
+        };
+        let counts = dealt(handle, 1..=40);
+        assert!(counts[0] > 0 && counts[1] > 0, "{counts:?}");
+        // sim_set to the blank alone, the E's weighing nothing
+        do_sim_set(
+            handle,
+            &format!(r#"{{"kept":[{{"tiles":[{E},{E}],"weight":0}},{{"tiles":[0],"weight":1}}]}}"#),
+        )
+        .unwrap();
+        assert_eq!(dealt(handle, 41..=60)[1], 20);
+        do_sim_free(handle).unwrap();
+
+        tiny_lexicon("tiny-sim-kept-bad");
+        for (more, said) in [
+            (format!(r#","known":[{E}],{kept}"#), "known, kept"),
+            (
+                r#","kept":[{"tiles":[0],"weight":-1}]"#.into(),
+                "kept[0]: weight",
+            ),
+            (
+                r#","kept":[{"tiles":[0,0,0],"weight":1}]"#.into(),
+                "kept[0]: ",
+            ),
+            (
+                r#","kept":[{"tiles":[0],"weight":0}]"#.into(),
+                "kept: weights",
+            ),
+            (
+                r#","kept":[{"tiles":[0],"weight":1e308},{"tiles":[0],"weight":1e308}]"#.into(),
+                "kept: weights",
+            ),
+        ] {
+            let err = do_sim_new(&format!(
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-kept-bad","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
+                cat_board()
+            ))
+            .unwrap_err();
+            assert!(err.starts_with(said), "{err}");
+        }
     }
 
     #[test]
