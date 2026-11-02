@@ -785,7 +785,10 @@ fn one_part() -> u64 {
 
 // a play as a caller names one to a sim: as play_score takes one, but its score
 // may be left out, since the sim counts it again. Other fields are not read, so
-// a play as an answer gives it back may be passed as it is.
+// a play as an answer gives it back may be passed as it is. A placement may add
+// "bonus" points to its score (a challenge's, as "[and +5]"), or be
+// "challenged_off" the board: it scores nothing, the tiles go back on the rack,
+// and its turn counts as a scoreless one.
 #[derive(serde::Deserialize)]
 #[serde(tag = "action")]
 enum SimPlay {
@@ -797,6 +800,10 @@ enum SimPlay {
         lane: i8,
         idx: i8,
         word: Box<[i8]>,
+        #[serde(default)]
+        bonus: i32,
+        #[serde(default)]
+        challenged_off: bool,
     },
 }
 
@@ -811,6 +818,7 @@ impl SimPlay {
                 lane,
                 idx,
                 word,
+                ..
             } => kibitzer::JsonPlay::Play {
                 down: *down,
                 lane: *lane,
@@ -870,6 +878,7 @@ struct SimPly {
 // to win, and each ply's
 struct SimCandidate {
     play: movegen::Play,
+    challenged_off: bool,
     static_equity: f32,
     state: SimState,
     first_iter: u64,
@@ -940,10 +949,15 @@ fn rollout(
     kwg: &Kwg,
     klv: &Klv,
     play: &movegen::Play,
+    challenged_off: bool,
 ) -> Result<(f64, i32, f64), String> {
-    let game_ended = simmer
-        .simulate_lean(game_config, kwg, &anagrams::ArmTables::None, klv, play)
-        .map_err(err_to_str)?;
+    let no_tables = &anagrams::ArmTables::None;
+    let game_ended = if challenged_off {
+        simmer.simulate_lean_challenged_off(game_config, kwg, no_tables, klv)
+    } else {
+        simmer.simulate_lean(game_config, kwg, no_tables, klv, play)
+    }
+    .map_err(err_to_str)?;
     let final_spread = simmer.final_equity_spread().map_err(err_to_str)?;
     let win = simmer.compute_win_prob(game_ended, final_spread, None);
     let spread = final_spread
@@ -956,11 +970,38 @@ fn rollout(
     ))
 }
 
+// a play as a sim holds it: checked and scored, its static equity, and whether
+// it was challenged off the board, which makes it a candidate of its own
+struct HeldPlay {
+    play: movegen::Play,
+    static_equity: f32,
+    challenged_off: bool,
+}
+
+impl HeldPlay {
+    fn is(&self, candidate: &SimCandidate) -> bool {
+        candidate.play == self.play && candidate.challenged_off == self.challenged_off
+    }
+}
+
 impl Sim {
     // a play as the sim holds it, checked and scored as play_score checks and
-    // scores it, with its static equity: refused if it is no play on this
-    // position, or makes a word the lexicon lacks
-    fn held(&self, sim_play: &SimPlay) -> Result<(movegen::Play, f32), String> {
+    // scores it, with its static equity: refused only if it is no play on this
+    // position. A word the lexicon lacks stands, as a phony no one challenged
+    // would. Its bonus adds to its score. Challenged off, it scores nothing. The
+    // rack then stays whole, so its static equity is a pass's.
+    fn held(&self, sim_play: &SimPlay) -> Result<HeldPlay, String> {
+        let (bonus, challenged_off) = match sim_play {
+            SimPlay::Play {
+                bonus,
+                challenged_off,
+                ..
+            } => (*bonus, *challenged_off),
+            SimPlay::Exchange { .. } => (0, false),
+        };
+        if challenged_off && bonus != 0 {
+            return Err("a play challenged off scores nothing, so takes no bonus".into());
+        }
         let board_snapshot = &movegen::BoardSnapshot {
             board_tiles: &self.game_state.board_tiles,
             game_config: &self.game_config,
@@ -975,25 +1016,32 @@ impl Sim {
             .validate_play(board_snapshot, &self.game_state, &play)
             .map_err(|e| e.to_string())?
             .unwrap_or(play);
-        let score = ps.compute_score(board_snapshot, &play);
+        let score = if challenged_off {
+            0
+        } else {
+            bonus
+                .checked_mul(equity::SCALE)
+                .and_then(|bonus| ps.compute_score(board_snapshot, &play).checked_add(bonus))
+                .ok_or_else(|| format!("bonus: {bonus} points overflow the score"))?
+        };
         if let movegen::Play::Place { score: s, .. } = &mut play {
             *s = score;
         }
-        let mut invalid_words = Vec::<Vec<u8>>::new();
-        ps.find_invalid_words(board_snapshot, &play, |word| {
-            invalid_words.push(word.into())
-        });
-        if !invalid_words.is_empty() {
-            return Err(format!("makes words the lexicon lacks: {invalid_words:?}"));
-        }
+        let pass = movegen::Play::Exchange {
+            tiles: [][..].into(),
+        };
         let equity = ps.compute_equity(
             board_snapshot,
             &self.game_state,
-            &play,
+            if challenged_off { &pass } else { &play },
             move_filter::LEAVE_SCALE_DENOM,
             score,
         );
-        Ok((play, equity as f32 / equity::SCALE as f32))
+        Ok(HeldPlay {
+            play,
+            static_equity: equity as f32 / equity::SCALE as f32,
+            challenged_off,
+        })
     }
 
     // up to max iterations, until out_of_time says so before one, while a
@@ -1034,6 +1082,7 @@ impl Sim {
                     &self.kwg.kwg,
                     &self.klv.klv,
                     &candidate.play,
+                    candidate.challenged_off,
                 )?;
                 let played = self.simmer.plies_played();
                 let num_plies = played.len().min(self.plies);
@@ -1074,9 +1123,9 @@ impl Sim {
         Ok(stepped)
     }
 
-    fn report(&self, stepped: u64, against: Option<&movegen::Play>) -> SimReport {
+    fn report(&self, stepped: u64, against: Option<&HeldPlay>) -> SimReport {
         let weight = self.simmer.win_prob_weightage();
-        let other = against.and_then(|play| self.candidates.iter().find(|c| c.play == *play));
+        let other = against.and_then(|held| self.candidates.iter().find(|c| held.is(c)));
         let other_objectives = other.map(|other| objectives(other, weight));
         SimReport {
             iterations: self.iterations,
@@ -1087,6 +1136,7 @@ impl Sim {
                         equity: c.static_equity,
                         play: (&c.play).into(),
                     },
+                    challenged_off: c.challenged_off,
                     state: c.state.name(),
                     n: c.objective.count() as u64,
                     win: (&c.win).into(),
@@ -1259,13 +1309,15 @@ struct SimAgainst {
 }
 
 // a candidate: its play as analyze lists one (its score recounted, its equity
-// the static one), where it stands, and its rollouts: their number, chance to
-// win, equity (the change in spread in points, the leaves left counted),
-// objective, and plies (the first the opponent's reply); with a play to compare
-// against, itself less that play
+// the static one), whether it was challenged off (said only when it was), where
+// it stands, and its rollouts: their number, chance to win, equity (the change
+// in spread in points, the leaves left counted), objective, and plies (the first
+// the opponent's reply); with a play to compare against, itself less that play
 #[derive(serde::Serialize)]
 struct SimCandidateReport {
     play: kibitzer::JsonPlayWithEquity,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    challenged_off: bool,
     state: &'static str,
     n: u64,
     win: SimStat,
@@ -1509,11 +1561,11 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
     // the play to compare against, checked before any step
     let against = match &req.against {
         Some(sim_play) => {
-            let (play, _) = sim.held(sim_play).map_err(|e| format!("against: {e}"))?;
-            if !sim.candidates.iter().any(|c| c.play == play) {
+            let held = sim.held(sim_play).map_err(|e| format!("against: {e}"))?;
+            if !sim.candidates.iter().any(|c| held.is(c)) {
                 return Err("against: not in the sim".into());
             }
-            Some(play)
+            Some(held)
         }
         None => None,
     };
@@ -1533,11 +1585,14 @@ enum SimChange {
     Resume,
 }
 
-// a play a change was given: as the sim holds it, as analyze lists a play, and
-// where it stood before the change ("absent" if not in the sim)
+// a play a change was given: as the sim holds it, as analyze lists a play,
+// whether it was challenged off (said only when it was), and where it stood
+// before the change ("absent" if not in the sim)
 #[derive(serde::Serialize)]
 struct SimChanged {
     play: kibitzer::JsonPlayWithEquity,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    challenged_off: bool,
     was: &'static str,
 }
 
@@ -1552,13 +1607,14 @@ fn do_sim_change(handle: u32, plays_str: &str, change: SimChange) -> Result<Stri
         .map(|(i, sim_play)| sim.held(sim_play).map_err(|e| format!("plays[{i}]: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
     let mut answer = Vec::with_capacity(held.len());
-    for (play, static_equity) in held {
-        let at = sim.candidates.iter().position(|c| c.play == play);
+    for held in held {
+        let at = sim.candidates.iter().position(|c| held.is(c));
         let was = at.map_or("absent", |at| sim.candidates[at].state.name());
         match (change, at) {
             (SimChange::Add, None) => sim.candidates.push(SimCandidate {
-                play: play.clone(),
-                static_equity,
+                play: held.play.clone(),
+                challenged_off: held.challenged_off,
+                static_equity: held.static_equity,
                 state: SimState::Running,
                 first_iter: sim.iterations + 1,
                 wins: Vec::new(),
@@ -1577,9 +1633,10 @@ fn do_sim_change(handle: u32, plays_str: &str, change: SimChange) -> Result<Stri
         }
         answer.push(SimChanged {
             play: kibitzer::JsonPlayWithEquity {
-                equity: static_equity,
-                play: (&play).into(),
+                equity: held.static_equity,
+                play: (&held.play).into(),
             },
+            challenged_off: held.challenged_off,
             was,
         });
     }
@@ -2673,17 +2730,11 @@ mod tests {
             [5, 5, 1]
         );
 
-        // a play the lexicon lacks, or one the rack cannot make, refuses the
-        // whole change, naming it, and nothing joins
-        let te = r#"{"action":"play","down":true,"lane":8,"idx":7,"word":[0,5]}"#;
-        let err = do_sim_add(sim, &format!("[{SCAT},{te}]")).unwrap_err();
-        assert!(
-            err.starts_with("plays[1]: ") && err.contains("lacks"),
-            "{err}"
-        );
+        // a play the rack cannot make refuses the whole change, naming it, and
+        // nothing joins
         let off = r#"{"action":"play","down":true,"lane":8,"idx":6,"word":[26,0]}"#;
-        let err = do_sim_add(sim, &format!("[{off}]")).unwrap_err();
-        assert!(err.starts_with("plays[0]: "), "{err}");
+        let err = do_sim_add(sim, &format!("[{SCAT},{off}]")).unwrap_err();
+        assert!(err.starts_with("plays[1]: "), "{err}");
         assert_eq!(ns(&step(sim, r#"{"iterations":0}"#)), [5, 5, 1]);
 
         // paused, a candidate keeps its rollouts and runs no more; resumed, it
@@ -2711,6 +2762,63 @@ mod tests {
         assert_eq!(
             ns(&step(sim, r#"{"iterations":1,"prune":false}"#)),
             [10, 6, 1]
+        );
+        do_sim_free(sim).unwrap();
+    }
+
+    // a sim takes what quackle's does: a phony, which stands as one no one
+    // challenged would; a play with a challenge's bonus; a play challenged off
+    // the board. That last scores nothing. It rolls out as a pass does but for
+    // its turn. Each is a candidate of its own.
+    #[test]
+    fn a_sim_takes_a_phony_a_bonus_and_a_play_challenged_off() {
+        let sim = cat_sim("tiny-sim-phony");
+        // E below the T of CAT: TE down, a word the tiny lexicon lacks
+        let te = r#"{"action":"play","down":true,"lane":8,"idx":7,"word":[0,5]"#;
+        let (phony, plus5, off) = (
+            format!("{te}}}"),
+            format!(r#"{te},"bonus":5}}"#),
+            format!(r#"{te},"challenged_off":true}}"#),
+        );
+        let answer = report(&do_sim_add(sim, &format!("[{phony},{plus5},{off}]")).unwrap());
+        for held in answer.as_array().unwrap() {
+            assert_eq!(held["was"], "absent");
+        }
+        let score = answer[0]["play"]["score"].as_i64().unwrap();
+        assert!(score > 0);
+        assert_eq!(answer[1]["play"]["score"].as_i64().unwrap(), score + 5);
+        assert_eq!(answer[2]["play"]["score"], 0);
+        assert_eq!(answer[2]["challenged_off"], true);
+        assert!(answer[0].get("challenged_off").is_none());
+        // challenged off, it keeps the rack whole: a pass's static equity
+        let pass = report(&do_sim_add(sim, &format!("[{PASS}]")).unwrap());
+        assert_eq!(pass[0]["was"], "running");
+        assert_eq!(answer[2]["play"]["equity"], pass[0]["play"]["equity"]);
+        // a play challenged off scores nothing, so takes no bonus
+        let both = format!(r#"{te},"bonus":5,"challenged_off":true}}"#);
+        let err = do_sim_add(sim, &format!("[{both}]")).unwrap_err();
+        assert!(err.starts_with("plays[0]: "), "{err}");
+
+        // CATS, the pass, the phony, it with its bonus, it challenged off
+        let stepped = step(sim, r#"{"iterations":6,"prune":false}"#);
+        assert_eq!(ns(&stepped), [6, 6, 6, 6, 6]);
+        let c = stepped["candidates"].as_array().unwrap();
+        assert_eq!(c[4]["challenged_off"], true);
+        // on the same draws, challenged off rolls out as the pass does
+        assert_eq!(c[4]["plies"], c[1]["plies"]);
+        assert_eq!(c[4]["equity"], c[1]["equity"]);
+        // and the bonus is five more points of spread on every rollout
+        let mean = |i: usize| c[i]["equity"]["mean"].as_f64().unwrap();
+        assert!((mean(3) - mean(2) - 5.0).abs() < 1e-9, "{c:?}");
+
+        // the flag is part of which candidate a play names
+        let removed = report(&do_sim_change(sim, &format!("[{off}]"), SimChange::Remove).unwrap());
+        assert_eq!(removed[0]["was"], "running");
+        let left = step(sim, r#"{"iterations":0}"#);
+        assert_eq!(ns(&left), [6, 6, 6, 6]);
+        assert!(
+            (left["candidates"].as_array().unwrap().iter())
+                .all(|c| c.get("challenged_off").is_none())
         );
         do_sim_free(sim).unwrap();
     }
@@ -2784,6 +2892,7 @@ mod tests {
                 tiles: Box::new([]),
             }
             .to_play(),
+            challenged_off: false,
             static_equity: 0.0,
             state: SimState::Running,
             first_iter: 1,
