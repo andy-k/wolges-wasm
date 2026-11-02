@@ -42,110 +42,81 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
         "noleave".into(),
         CachedKlv::new(Klv::empty().map_err(err_to_str)?)?.into(),
     );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame".into(),
-        game_config::make_english_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog".into(),
-        game_config::make_jumbled_english_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGameSuper".into(),
-        game_config::make_super_english_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmogSuper".into(),
-        game_config::make_jumbled_super_english_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/catalan".into(),
-        game_config::make_catalan_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/catalan".into(),
-        game_config::make_jumbled_catalan_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGameSuper/catalan".into(),
-        game_config::make_super_catalan_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmogSuper/catalan".into(),
-        game_config::make_jumbled_super_catalan_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/dutch".into(),
-        game_config::make_dutch_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/dutch".into(),
-        game_config::make_jumbled_dutch_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/french".into(),
-        game_config::make_french_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/french".into(),
-        game_config::make_jumbled_french_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/german".into(),
-        game_config::make_german_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/german".into(),
-        game_config::make_jumbled_german_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGameSuper/german".into(),
-        game_config::make_super_german_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmogSuper/german".into(),
-        game_config::make_jumbled_super_german_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/norwegian".into(),
-        game_config::make_norwegian_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/norwegian".into(),
-        game_config::make_jumbled_norwegian_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/polish".into(),
-        game_config::make_polish_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/polish".into(),
-        game_config::make_jumbled_polish_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/slovene".into(),
-        game_config::make_slovene_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/slovene".into(),
-        game_config::make_jumbled_slovene_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/spanish".into(),
-        game_config::make_spanish_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/spanish".into(),
-        game_config::make_jumbled_spanish_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "CrosswordGame/swedish".into(),
-        game_config::make_swedish_game_config().into(),
-    );
-    CACHED_GAME_CONFIG.write().unwrap().insert(
-        "WordSmog/swedish".into(),
-        game_config::make_jumbled_swedish_game_config().into(),
-    );
+    // each game is made once: its WordSmog form is its CrosswordGame one made
+    // jumbled (GameConfig::jumbled). So each alphabet and board is built once.
+    for (classic, jumbled, make) in [
+        (
+            "CrosswordGame",
+            "WordSmog",
+            game_config::make_english_game_config as fn() -> game_config::GameConfig,
+        ),
+        (
+            "CrosswordGameSuper",
+            "WordSmogSuper",
+            game_config::make_super_english_game_config,
+        ),
+        (
+            "CrosswordGame/catalan",
+            "WordSmog/catalan",
+            game_config::make_catalan_game_config,
+        ),
+        (
+            "CrosswordGameSuper/catalan",
+            "WordSmogSuper/catalan",
+            game_config::make_super_catalan_game_config,
+        ),
+        (
+            "CrosswordGame/dutch",
+            "WordSmog/dutch",
+            game_config::make_dutch_game_config,
+        ),
+        (
+            "CrosswordGame/french",
+            "WordSmog/french",
+            game_config::make_french_game_config,
+        ),
+        (
+            "CrosswordGame/german",
+            "WordSmog/german",
+            game_config::make_german_game_config,
+        ),
+        (
+            "CrosswordGameSuper/german",
+            "WordSmogSuper/german",
+            game_config::make_super_german_game_config,
+        ),
+        (
+            "CrosswordGame/norwegian",
+            "WordSmog/norwegian",
+            game_config::make_norwegian_game_config,
+        ),
+        (
+            "CrosswordGame/polish",
+            "WordSmog/polish",
+            game_config::make_polish_game_config,
+        ),
+        (
+            "CrosswordGame/slovene",
+            "WordSmog/slovene",
+            game_config::make_slovene_game_config,
+        ),
+        (
+            "CrosswordGame/spanish",
+            "WordSmog/spanish",
+            game_config::make_spanish_game_config,
+        ),
+        (
+            "CrosswordGame/swedish",
+            "WordSmog/swedish",
+            game_config::make_swedish_game_config,
+        ),
+    ] {
+        let gc = make();
+        let jumbled_gc = gc.jumbled();
+        let mut cached = CACHED_GAME_CONFIG.write().unwrap();
+        cached.insert(classic.into(), gc.into());
+        cached.insert(jumbled.into(), jumbled_gc.into());
+    }
     Ok(())
 }
 
@@ -2211,6 +2182,38 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // every rules name is cached at startup in pairs: each WordSmog one is the
+    // CrosswordGame one of its name under the jumbled rules
+    #[test]
+    fn every_rules_name_is_cached_classic_and_jumbled_in_pairs() {
+        do_this_on_startup().unwrap();
+        let rules = CACHED_GAME_CONFIG.read().unwrap();
+        let mut classic = 0;
+        for (name, game_config) in rules.iter() {
+            let Some(rest) = name.strip_prefix("CrosswordGame") else {
+                assert!(name.starts_with("WordSmog"), "{name}");
+                continue;
+            };
+            classic += 1;
+            let jumbled = &rules[&format!("WordSmog{rest}")];
+            assert!(
+                matches!(game_config.game_rules(), game_config::GameRules::Classic),
+                "{name}"
+            );
+            assert!(
+                matches!(jumbled.game_rules(), game_config::GameRules::Jumbled),
+                "{name}"
+            );
+            assert_eq!(jumbled.alphabet().len(), game_config.alphabet().len());
+            assert_eq!(
+                jumbled.board_layout().dim().rows,
+                game_config.board_layout().dim().rows
+            );
+            assert_eq!(jumbled.rack_size(), game_config.rack_size());
+        }
+        assert_eq!((classic, rules.len()), (13, 26));
     }
 
     // english tiles
