@@ -1433,29 +1433,12 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     // the tiles known to be on the opponent's rack: each iteration puts them
     // there first and deals the rest of it from the tiles unseen
     if !req.known.is_empty() {
-        if num_players != 2 {
-            return Err(format!("known: only with two seats, found {num_players}"));
-        }
-        let opponent = 1 - turn;
-        if req.known.len() > rack_sizes[opponent] as usize {
-            return Err(format!(
-                "known: {} tiles, but the opponent's rack holds {}",
-                req.known.len(),
-                rack_sizes[opponent]
-            ));
-        }
-        let mut unseen = kibitzer.available_tally.clone();
-        for &tile in &req.known {
-            match unseen.get_mut(tile as usize) {
-                Some(count) if *count > 0 => *count -= 1,
-                _ => {
-                    return Err(format!(
-                        "known: {:?} are not all among the tiles unseen",
-                        req.known
-                    ));
-                }
-            }
-        }
+        check_known(
+            &req.known,
+            num_players,
+            rack_sizes[(turn + 1) % num_players] as usize,
+            &kibitzer.available_tally,
+        )?;
     }
 
     // the bag in tile order and the other seats dealt from it as it lies, so
@@ -1526,6 +1509,37 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     sims.made = handle;
     sims.live.insert(handle, sim);
     Ok(handle)
+}
+
+// tiles known to be on the opponent's rack: a game of two seats, no more than
+// that rack holds, all among the tiles unseen (a tally)
+fn check_known(
+    known: &[u8],
+    num_players: usize,
+    opponent_rack: usize,
+    unseen: &[u8],
+) -> Result<(), String> {
+    if num_players != 2 {
+        return Err(format!("known: only with two seats, found {num_players}"));
+    }
+    if known.len() > opponent_rack {
+        return Err(format!(
+            "known: {} tiles, but the opponent's rack holds {opponent_rack}",
+            known.len(),
+        ));
+    }
+    let mut unseen = unseen.to_vec();
+    for &tile in known {
+        match unseen.get_mut(tile as usize) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                return Err(format!(
+                    "known: {known:?} are not all among the tiles unseen"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[wasm_bindgen]
@@ -1674,6 +1688,72 @@ pub fn sim_resume(sim: u32, plays_str: String) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn sim_free(sim: u32) -> Result<(), JsValue> {
     Ok(do_sim_free(sim)?)
+}
+
+// sim_set: a change to a live sim's plies or to the tiles known to be on the
+// opponent's rack, each as sim_new takes it (one left out stays as it was); the
+// results so far stay, and the change counts from the next iteration on
+#[derive(serde::Deserialize)]
+struct SimSetRequest {
+    #[serde(default, deserialize_with = "given")]
+    plies: Option<Option<usize>>, // null: every ply to the game's end
+    known: Option<Vec<u8>>,
+}
+
+// a field given, null among the values it may take; one left out takes its
+// default
+fn given<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+// the sim after its change, as SimReport
+#[wasm_bindgen]
+pub fn sim_set(sim: u32, req_str: String) -> Result<String, JsValue> {
+    Ok(do_sim_set(sim, &req_str)?)
+}
+
+fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
+    let req = serde_json::from_str::<SimSetRequest>(req_str).map_err(err_to_str)?;
+    let mut sims = SIMS.lock().map_err(err_to_str)?;
+    let sim = sims.live.get_mut(&handle).ok_or_else(|| no_sim(handle))?;
+    let num_players = sim.game_config.num_players() as usize;
+    let turn = sim.game_state.turn as usize;
+    let opponent = (turn + 1) % num_players;
+    // checked before anything changes: the tiles unseen are the bag's and every
+    // rack's but the mover's
+    if let Some(known) = &req.known {
+        let mut unseen = vec![0u8; sim.game_config.alphabet().len() as usize];
+        let others = (sim.game_state.players.iter().enumerate())
+            .filter(|&(i, _)| i != turn)
+            .flat_map(|(_, player)| player.rack.iter());
+        for &tile in sim.game_state.bag.as_slice().iter().chain(others) {
+            unseen[tile as usize] += 1;
+        }
+        check_known(
+            known,
+            num_players,
+            sim.game_state.players[opponent].rack.len(),
+            &unseen,
+        )?;
+    }
+    if let Some(plies) = req.plies {
+        sim.simmer
+            .set_num_sim_plies(&sim.game_config, plies.unwrap_or(usize::MAX));
+        sim.plies = plies;
+    }
+    if let Some(known) = req.known {
+        let known = if known.is_empty() {
+            Vec::new()
+        } else {
+            vec![(known, 1.0)]
+        };
+        sim.simmer.set_kept_leaves(opponent as u8, &known);
+    }
+    serde_json::to_string(&sim.report(0, None)).map_err(err_to_str)
 }
 
 fn do_sim_free(handle: u32) -> Result<(), String> {
@@ -2651,6 +2731,80 @@ mod tests {
                 .all(|&(n, score)| n > 0 && score == 0.0)
         );
         assert!(theirs(&playing).iter().any(|&(_, score)| score > 0.0));
+    }
+
+    // sim_set changes a live sim's plies and known tiles from the next
+    // iteration on, its results kept, and leaves what it is not given
+    #[test]
+    fn a_live_sims_plies_and_known_tiles_change_its_results_kept() {
+        let sim = cat_sim("tiny-sim-set");
+        let before = step(sim, r#"{"iterations":4,"prune":false}"#);
+        assert_eq!(report(&do_sim_set(sim, "{}").unwrap()), read_sim(sim));
+        let set = report(&do_sim_set(sim, r#"{"plies":2}"#).unwrap());
+        for (now, was) in (set["candidates"].as_array().unwrap().iter())
+            .zip(before["candidates"].as_array().unwrap())
+        {
+            for stat in ["n", "win", "equity", "objective"] {
+                assert_eq!(now[stat], was[stat], "{stat}");
+            }
+            assert_eq!(
+                now["plies"].as_array().unwrap()[..],
+                was["plies"].as_array().unwrap()[..2]
+            );
+        }
+        let after = step(sim, r#"{"iterations":4,"prune":false}"#);
+        assert_eq!(ns(&after), vec![8, 8]);
+        for candidate in after["candidates"].as_array().unwrap() {
+            let plies = candidate["plies"].as_array().unwrap();
+            assert_eq!(plies.len(), 2);
+            assert!(plies.iter().all(|ply| ply["n"] == 8));
+        }
+        // and those four iterations rolled out as a sim of two plies does
+        let two = sim_of("tiny-sim-set", &cat_board(), r#","plies":2"#);
+        do_sim_add(two, &format!("[{CATS},{PASS}]")).unwrap();
+        step(two, r#"{"iterations":8,"prune":false}"#);
+        {
+            let sims = SIMS.lock().unwrap();
+            for (now, fresh) in sims.live[&sim]
+                .candidates
+                .iter()
+                .zip(&sims.live[&two].candidates)
+            {
+                assert_eq!(now.equities[4..], fresh.equities[4..]);
+                assert_ne!(now.equities[..4], fresh.equities[..4]);
+            }
+        }
+        do_sim_free(two).unwrap();
+
+        // the opponent holds the known tiles each iteration from now on
+        do_sim_set(sim, &format!(r#"{{"known":[{E},{E},0]}}"#)).unwrap();
+        {
+            let mut sims = SIMS.lock().unwrap();
+            let sim = sims.live.get_mut(&sim).unwrap();
+            for iteration in 9..=28 {
+                sim.simmer.restore_prepared(&sim.pristine);
+                sim.simmer.reseed(iteration_seed(sim.seed, iteration));
+                sim.simmer.prepare_iteration();
+                let rack = &sim.simmer.prepared_state().players[1].rack;
+                for (tile, count) in [(E, 2), (0, 1)] {
+                    assert!(
+                        rack.iter().filter(|&&t| t == tile).count() >= count,
+                        "{rack:?}"
+                    );
+                }
+            }
+        }
+        // more than are unseen: refused, and nothing changes
+        let read = read_sim(sim);
+        let err = do_sim_set(sim, r#"{"plies":3,"known":[0,0,0]}"#).unwrap_err();
+        assert!(err.starts_with("known: "), "{err}");
+        assert_eq!(read_sim(sim), read);
+        do_sim_free(sim).unwrap();
+    }
+
+    // a sim as a step of no iterations reads it
+    fn read_sim(sim: u32) -> serde_json::Value {
+        step(sim, r#"{"iterations":0}"#)
     }
 
     #[test]
