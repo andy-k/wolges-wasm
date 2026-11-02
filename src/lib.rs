@@ -752,7 +752,7 @@ struct SimNewRequest {
     #[serde(default)]
     known: Vec<u8>,
     #[serde(default = "default_plies")]
-    plies: usize,
+    plies: Option<usize>, // null: every ply to the game's end
     seed: Option<u64>,
     #[serde(default)]
     part: u64,
@@ -760,8 +760,8 @@ struct SimNewRequest {
     parts: u64,
 }
 
-fn default_plies() -> usize {
-    move_picker::DEFAULT_NUM_SIM_PLIES
+fn default_plies() -> Option<usize> {
+    Some(move_picker::DEFAULT_NUM_SIM_PLIES)
 }
 
 fn one_part() -> u64 {
@@ -877,8 +877,9 @@ struct SimCandidate {
 
 // a sim a caller steps, stops, resumes, and changes: the position, the tables
 // it was made with (held here, so that evicting their names cannot pull them
-// away), the simmer prepared on it, the plies a rollout plays, its seed, which
-// part of how many it is, its iterations so far, and its candidates
+// away), the simmer prepared on it, the plies a rollout plays (none: every ply
+// to the game's end), its seed, which part of how many it is, its iterations so
+// far, and its candidates
 struct Sim {
     game_config: std::sync::Arc<game_config::GameConfig>,
     kwg: std::sync::Arc<CachedKwg>,
@@ -886,7 +887,7 @@ struct Sim {
     game_state: game_state::GameState,
     simmer: simmer::Simmer,
     pristine: game_state::GameState,
-    plies: usize,
+    plies: Option<usize>,
     seed: u64,
     part: u64,
     parts: u64,
@@ -1068,7 +1069,7 @@ impl Sim {
                     candidate.challenged_off,
                 )?;
                 let played = self.simmer.plies_played();
-                let num_plies = played.len().min(self.plies);
+                let num_plies = self.plies.map_or(played.len(), |p| played.len().min(p));
                 plies.extend_from_slice(&played[..num_plies]);
                 rows.push((objective, spread, win, num_plies));
             }
@@ -1115,8 +1116,14 @@ impl Sim {
         let other = against.and_then(|held| self.candidates.iter().find(|c| held.is(c)));
         let other_objectives = other.map(|other| objectives(other, weight));
         // every ply of the sim's is reported, one no rollout has reached yet as
-        // an empty one
+        // an empty one; a sim to the game's end, every ply a rollout reached
         let unreached = SimPly::default();
+        let listed = self.plies.unwrap_or_else(|| {
+            (self.candidates.iter())
+                .map(|c| c.plies.len())
+                .max()
+                .unwrap_or(0)
+        });
         SimReport {
             iterations: self.iterations,
             stepped,
@@ -1132,7 +1139,7 @@ impl Sim {
                     win: (&c.win).into(),
                     equity: (&c.equity).into(),
                     objective: (&c.objective).into(),
-                    plies: (0..self.plies)
+                    plies: (0..listed)
                         .map(|i| c.plies.get(i).unwrap_or(&unreached))
                         .map(|ply| SimPlyReport {
                             n: ply.score.count() as u64,
@@ -1488,7 +1495,13 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     } else {
         vec![(req.known, 1.0)]
     };
-    simmer.prepare(&game_config, &game_state, req.plies, true, &known);
+    simmer.prepare(
+        &game_config,
+        &game_state,
+        req.plies.unwrap_or(usize::MAX),
+        true,
+        &known,
+    );
     let pristine = simmer.prepared_state().clone();
     let sim = Sim {
         game_config,
@@ -2563,6 +2576,45 @@ mod tests {
             }
             do_sim_free(sim).unwrap();
         }
+    }
+
+    // "plies": null is every ply to the game's end: each rollout as a sim of
+    // more plies than any game here lasts plays it, the answer listing the
+    // plies as far as the longest rollout reached
+    #[test]
+    fn a_sim_of_null_plies_rolls_out_to_the_games_end() {
+        let sims = [r#","plies":null"#, r#","plies":1000"#]
+            .map(|plies| sim_of("tiny-sim-many", &cat_board(), plies));
+        for sim in sims {
+            do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
+        }
+        let [many, long] = sims.map(|sim| step(sim, r#"{"iterations":6}"#));
+        for sim in sims {
+            do_sim_free(sim).unwrap();
+        }
+        for (m, l) in (many["candidates"].as_array().unwrap().iter())
+            .zip(long["candidates"].as_array().unwrap())
+        {
+            let (m_plies, l_plies) = (
+                m["plies"].as_array().unwrap(),
+                l["plies"].as_array().unwrap(),
+            );
+            assert!(m_plies.len() > move_picker::DEFAULT_NUM_SIM_PLIES);
+            assert_eq!(m_plies[..], l_plies[..m_plies.len()]);
+            assert!(l_plies[m_plies.len()..].iter().all(|ply| ply["n"] == 0));
+            for stat in ["n", "win", "equity", "objective"] {
+                assert_eq!(m[stat], l[stat], "{stat}");
+            }
+        }
+        // the plies listed end at the longest rollout's last
+        assert!(
+            (many["candidates"].as_array().unwrap().iter()).any(|c| c["plies"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["n"]
+                != 0)
+        );
     }
 
     #[test]
