@@ -753,6 +753,8 @@ struct SimNewRequest {
     known: Vec<u8>,
     #[serde(default = "default_plies")]
     plies: Option<usize>, // null: every ply to the game's end
+    #[serde(default)]
+    opponents_pass: bool, // every seat but the mover's passes in a rollout
     seed: Option<u64>,
     #[serde(default)]
     part: u64,
@@ -1490,6 +1492,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
     let mut simmer = simmer::Simmer::new(&game_config).map_err(err_to_str)?;
+    simmer.set_opponents_pass(req.opponents_pass);
     let known = if req.known.is_empty() {
         Vec::new()
     } else {
@@ -2615,6 +2618,39 @@ mod tests {
                 .unwrap()["n"]
                 != 0)
         );
+    }
+
+    // "opponents_pass": every ply of the opponent's in a rollout is a pass
+    #[test]
+    fn a_sims_opponents_may_pass_every_turn() {
+        let sims = [r#","opponents_pass":true"#, ""]
+            .map(|more| sim_of("tiny-sim-opponents-pass", &cat_board(), more));
+        for sim in sims {
+            do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
+        }
+        let [passing, playing] = sims.map(|sim| step(sim, r#"{"iterations":8}"#));
+        for sim in sims {
+            do_sim_free(sim).unwrap();
+        }
+        // the opponent's plies (the first after a candidate, then every other
+        // one) with what each scored
+        let theirs = |answer: &serde_json::Value| {
+            (answer["candidates"].as_array().unwrap().iter())
+                .flat_map(|c| c["plies"].as_array().unwrap().iter().step_by(2))
+                .map(|ply| {
+                    (
+                        ply["n"].as_u64().unwrap(),
+                        ply["score"]["mean"].as_f64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            theirs(&passing)
+                .iter()
+                .all(|&(n, score)| n > 0 && score == 0.0)
+        );
+        assert!(theirs(&playing).iter().any(|&(_, score)| score > 0.0));
     }
 
     #[test]
