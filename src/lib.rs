@@ -727,17 +727,15 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
     serde_json::to_string(&HooksAnswer { squares }).map_err(err_to_str)
 }
 
-// the most plies a sim's rollouts may play
-const MAX_SIM_PLIES: usize = 16;
-
 // sim_new: a position (rack, board, lexicon, leave, rules, each seat's score in
 // points, the seat to move, and the scoreless turns and the passes in a row so
 // far; each seat's rack size, by default the mover's rack with full racks for
 // the others dealt in turn from the tiles unseen while enough are left), the
 // tiles known to be on the opponent's rack (none by default), the plies each
-// rollout plays (by default as many as wolges's own sims play), the seed its
-// draws come from (a random one if none), and, for a sim run in parts, which
-// part of how many this is. A new sim holds no candidates.
+// rollout plays (by default as many as wolges's own sims play; past them, while
+// the bag is empty, it plays on to the game's end), the seed its draws come
+// from (a random one if none), and, for a sim run in parts, which part of how
+// many this is. A new sim holds no candidates.
 #[derive(serde::Deserialize)]
 struct SimNewRequest {
     rack: Vec<u8>,
@@ -1092,6 +1090,10 @@ impl Sim {
                 candidate.objective.update(objective);
                 candidate.equity.update(equity);
                 candidate.win.update(win);
+                // a ply's stats from the first rollout to reach it on
+                if candidate.plies.len() < num_plies {
+                    candidate.plies.resize_with(num_plies, SimPly::default);
+                }
                 for (ply, played) in candidate.plies.iter_mut().zip(&plies[at..at + num_plies]) {
                     ply.score.update(simmer::spread_points(played.score));
                     ply.bingo
@@ -1112,6 +1114,9 @@ impl Sim {
         let weight = self.simmer.win_prob_weightage();
         let other = against.and_then(|held| self.candidates.iter().find(|c| held.is(c)));
         let other_objectives = other.map(|other| objectives(other, weight));
+        // every ply of the sim's is reported, one no rollout has reached yet as
+        // an empty one
+        let unreached = SimPly::default();
         SimReport {
             iterations: self.iterations,
             stepped,
@@ -1127,7 +1132,8 @@ impl Sim {
                     win: (&c.win).into(),
                     equity: (&c.equity).into(),
                     objective: (&c.objective).into(),
-                    plies: (c.plies.iter())
+                    plies: (0..self.plies)
+                        .map(|i| c.plies.get(i).unwrap_or(&unreached))
                         .map(|ply| SimPlyReport {
                             n: ply.score.count() as u64,
                             score: (&ply.score).into(),
@@ -1337,9 +1343,6 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     } = tables(&req.lexicon, &req.leave, &req.rules)?;
     let num_players = game_config.num_players() as usize;
     let rack_size = game_config.rack_size() as usize;
-    if !(1..=MAX_SIM_PLIES).contains(&req.plies) {
-        return Err(format!("plies: 1 to {MAX_SIM_PLIES}, found {}", req.plies));
-    }
     if req.part >= req.parts {
         return Err(format!(
             "part: must be >= 0 and < parts={}, found {}",
@@ -1605,7 +1608,7 @@ fn do_sim_change(handle: u32, plays_str: &str, change: SimChange) -> Result<Stri
                 objective: stats::Stats::new(),
                 equity: stats::Stats::new(),
                 win: stats::Stats::new(),
-                plies: (0..sim.plies).map(|_| SimPly::default()).collect(),
+                plies: Vec::new(),
             }),
             (SimChange::Remove, Some(at)) => {
                 sim.candidates.remove(at);
@@ -2530,6 +2533,33 @@ mod tests {
         }
         // each part numbers its iterations apart from the others
         assert_ne!(parts[0]["candidates"], parts[1]["candidates"]);
+    }
+
+    // a sim's plies are the caller's: sixteen is no cap, nor is any game's
+    // length; each rollout plays on to the game's end once the bag is empty.
+    // Every ply is reported, those no rollout reached as empty ones; no later
+    // ply counts more rollouts than the one before
+    #[test]
+    fn a_sim_takes_any_plies_and_reports_each() {
+        for plies in [2usize, 20, 1000] {
+            let sim = sim_of(
+                "tiny-sim-plies",
+                &cat_board(),
+                &format!(r#","plies":{plies}"#),
+            );
+            do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
+            let answer = step(sim, r#"{"iterations":6}"#);
+            assert_eq!(answer["iterations"], 6);
+            for candidate in answer["candidates"].as_array().unwrap() {
+                let counts = (candidate["plies"].as_array().unwrap().iter())
+                    .map(|ply| ply["n"].as_u64().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(counts.len(), plies);
+                assert!(counts.windows(2).all(|w| w[0] >= w[1]), "{plies}");
+                assert_eq!(Some(counts[0]), candidate["n"].as_u64(), "{plies}");
+            }
+            do_sim_free(sim).unwrap();
+        }
     }
 
     #[test]
