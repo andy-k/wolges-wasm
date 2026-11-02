@@ -1746,16 +1746,12 @@ fn page_clock() -> std::time::Duration {
     std::time::Duration::from_secs_f64(step_clock().max(0.0) / 1000.0)
 }
 
-// the memory the wasm may hold while an endgame solves, in MiB, unless its
-// request says: a phone's browser may refuse a page much more
-fn default_max_memory_mb() -> usize {
-    256
-}
-
 // endgame_new: a position whose bag holds at most one tile (rack, board,
 // lexicon, rules, each seat's score in points, the seat to move, and the
 // scoreless turns and the passes in a row so far), and the most memory the wasm
-// may hold while it solves
+// may hold while it solves, in MiB. With none given, the solver's table grows
+// until the page refuses it more; a caller whose page may be refused sooner
+// than it can cope with (a phone's browser) gives one
 #[derive(serde::Deserialize)]
 struct EndgameNewRequest {
     rack: Vec<u8>,
@@ -1767,8 +1763,8 @@ struct EndgameNewRequest {
     turn: u8,
     zero_turns: u16,
     pass_turns: u16,
-    #[serde(default = "default_max_memory_mb")]
-    max_memory_mb: usize,
+    #[serde(default)]
+    max_memory_mb: Option<usize>,
 }
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer
@@ -1839,7 +1835,7 @@ struct Endgame {
     lead: i32,
     pass_turns: u16,
     zero_turns: u16,
-    max_memory: usize,
+    max_memory: Option<usize>,
     table: Option<endgame::KeptTable>,
     peg: Option<endgame::PegProgress>,
     answer: EndgameAnswer,
@@ -1907,8 +1903,8 @@ impl Endgame {
         let limits = endgame::Limits {
             time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
             states: None,
-            memory: Some(endgame::MemoryLimit {
-                bytes: self.max_memory,
+            memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
+                bytes,
                 held: held_bytes,
             }),
         };
@@ -2065,11 +2061,10 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
                 req.scores
             )
         })?;
-    if req.max_memory_mb == 0 || req.max_memory_mb > 4096 {
-        return Err(format!(
-            "max_memory_mb: 1 to 4096, found {}",
-            req.max_memory_mb
-        ));
+    if let Some(mb) = req.max_memory_mb
+        && (mb == 0 || mb > 4096)
+    {
+        return Err(format!("max_memory_mb: 1 to 4096, found {mb}"));
     }
 
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -2151,7 +2146,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         lead: scores,
         pass_turns: req.pass_turns,
         zero_turns: req.zero_turns,
-        max_memory: req.max_memory_mb << 20,
+        max_memory: req.max_memory_mb.map(|mb| mb << 20),
         table: None,
         peg,
         answer: EndgameAnswer {
@@ -3312,6 +3307,18 @@ mod tests {
         let mut in_bag = answer(false, 2, 1.0);
         in_bag.take(answer(false, 1, 2.0), true);
         assert_eq!((in_bag.depth, in_bag.value), (Some(2), 2.0));
+    }
+
+    // a request that gives no memory caps none, the table growing until the
+    // page refuses it more; one that gives MiB caps that many
+    #[test]
+    fn an_endgame_caps_its_memory_only_when_asked() {
+        for (more, cap) in [("", None), (r#","max_memory_mb":300"#, Some(300 << 20))] {
+            let handle = endgame_of("tiny-end-cap", &[S], &[A, T], more).unwrap();
+            let max_memory = ENDGAMES.lock().unwrap().live[&handle].max_memory;
+            assert_eq!(max_memory, cap, "{more}");
+            do_endgame_free(handle).unwrap();
+        }
     }
 
     // what endgame_new and endgame_step refuse, each before it solves
