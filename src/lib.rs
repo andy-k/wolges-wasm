@@ -348,19 +348,12 @@ pub fn precache_kblv2(
 // lexicon it has ever been asked for. Returns whether the key was there.
 //
 // A call already in flight is unaffected: get_wasm_cache! clones the Arc before
-// doing any work, so this drops the name and the memory goes back to the
-// allocator when the last user is done with it. A later call naming an evicted
-// key gets the usual "missing kwg", which is the point -- the failure is loud.
+// doing any work, so this drops the name; the memory goes back to the allocator
+// when the last user (a live sim among them) is done with it. A later call
+// naming an evicted key gets the usual "missing kwg", which is the point -- the
+// failure is loud.
 #[wasm_bindgen]
 pub fn evict_kwg(key: String) -> Result<bool, JsValue> {
-    // a live sim made with the name holds its graph till it is freed, so while
-    // one is, the eviction is refused
-    let holding = sims_holding(|sim| sim.lexicon == key)?;
-    if !holding.is_empty() {
-        return_js_error!(format!(
-            "lexicon {key:?}: sims {holding:?} hold it; free them first"
-        ));
-    }
     Ok(CACHED_KWG
         .write()
         .map_err(err_to_str)?
@@ -371,12 +364,6 @@ pub fn evict_kwg(key: String) -> Result<bool, JsValue> {
 // Same, for a leave-value table. See evict_kwg.
 #[wasm_bindgen]
 pub fn evict_klv(key: String) -> Result<bool, JsValue> {
-    let holding = sims_holding(|sim| sim.leave == key)?;
-    if !holding.is_empty() {
-        return_js_error!(format!(
-            "leave {key:?}: sims {holding:?} hold it; free them first"
-        ));
-    }
     Ok(CACHED_KLV
         .write()
         .map_err(err_to_str)?
@@ -895,8 +882,6 @@ struct SimCandidate {
 // away), the simmer prepared on it, the plies a rollout plays, its seed, which
 // part of how many it is, its iterations so far, and its candidates
 struct Sim {
-    lexicon: String,
-    leave: String,
     game_config: std::sync::Arc<game_config::GameConfig>,
     kwg: std::sync::Arc<CachedKwg>,
     klv: std::sync::Arc<CachedKlv>,
@@ -1503,8 +1488,6 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     simmer.prepare(&game_config, &game_state, req.plies, true, &known);
     let pristine = simmer.prepared_state().clone();
     let sim = Sim {
-        lexicon: req.lexicon,
-        leave: req.leave,
         game_config,
         kwg,
         klv,
@@ -1680,17 +1663,6 @@ fn do_sim_free(handle: u32) -> Result<(), String> {
         .remove(&handle)
         .map(|_| ())
         .ok_or_else(|| no_sim(handle))
-}
-
-// the live sims made with the table a name named, by handle
-fn sims_holding(holds: impl Fn(&Sim) -> bool) -> Result<Vec<u32>, String> {
-    let sims = SIMS.lock().map_err(err_to_str)?;
-    let mut handles = (sims.live.iter())
-        .filter(|(_, sim)| holds(sim))
-        .map(|(&handle, _)| handle)
-        .collect::<Vec<_>>();
-    handles.sort_unstable();
-    Ok(handles)
 }
 
 // the bytes allocated and not yet freed, which an endgame's memory cap reads: a
@@ -3029,27 +3001,18 @@ mod tests {
     }
 
     #[test]
-    fn a_freed_sim_is_gone_and_its_tables_can_go() {
+    fn a_sim_keeps_its_graph_evicted_and_a_freed_sim_is_gone() {
         let sim = cat_sim("tiny-sim-free");
-        // while the sim lives, evict_kwg refuses the lexicon's name
-        assert_eq!(
-            sims_holding(|s| s.lexicon == "tiny-sim-free").unwrap(),
-            [sim]
-        );
-        do_sim_free(sim).unwrap();
-        assert!(
-            sims_holding(|s| s.lexicon == "tiny-sim-free")
-                .unwrap()
-                .is_empty()
-        );
-        for err in [
-            do_sim_step(sim, r#"{"iterations":1}"#, || 0.0).unwrap_err(),
-            do_sim_add(sim, &format!("[{PASS}]")).unwrap_err(),
-            do_sim_free(sim).unwrap_err(),
-        ] {
-            assert!(err.contains("freed"), "{err}");
-        }
+        let before = step(sim, r#"{"iterations":4}"#);
+        // the name can go while the sim lives: the sim keeps the graph it was
+        // made with and steps on it as before
         assert!(evict_kwg("tiny-sim-free".into()).unwrap());
+        let after = step(sim, r#"{"iterations":4}"#);
+        assert_eq!(after["iterations"], 8);
+        assert_eq!(
+            before["candidates"].as_array().unwrap().len(),
+            after["candidates"].as_array().unwrap().len()
+        );
         // a sim of a lexicon no longer cached
         let err = do_sim_new(&format!(
             r#"{{"rack":[{S}],"board":{},"lexicon":"tiny-sim-free","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#,
@@ -3057,6 +3020,14 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(err, "missing kwg");
+        do_sim_free(sim).unwrap();
+        for err in [
+            do_sim_step(sim, r#"{"iterations":1}"#, || 0.0).unwrap_err(),
+            do_sim_add(sim, &format!("[{PASS}]")).unwrap_err(),
+            do_sim_free(sim).unwrap_err(),
+        ] {
+            assert!(err.contains("freed"), "{err}");
+        }
     }
 
     // a late board, as json: CAT across row 2 from column 6, and, from row 7
