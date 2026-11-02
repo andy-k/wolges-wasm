@@ -2036,10 +2036,10 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
                 req.scores
             )
         })?;
-    if let Some(mb) = req.max_memory_mb
-        && (mb == 0 || mb > 4096)
-    {
-        return Err(format!("max_memory_mb: 1 to 4096, found {mb}"));
+    // a cap past what the page can have is never reached; none at all leaves no
+    // room for the table
+    if req.max_memory_mb == Some(0) {
+        return Err("max_memory_mb: at least 1, found 0".into());
     }
 
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -2109,6 +2109,9 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             equity::Equity::new(scores),
         )
     });
+    // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
+    // shifted would wrap to none)
+    let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
     let endgame = Endgame {
         game_config,
         kwg: Box::new(Kwg::from_bytes_alloc(&bytes).map_err(err_to_str)?),
@@ -2121,7 +2124,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         lead: scores,
         pass_turns: req.pass_turns,
         zero_turns: req.zero_turns,
-        max_memory: req.max_memory_mb.map(|mb| mb << 20),
+        max_memory,
         table: None,
         peg,
         answer: EndgameAnswer {
@@ -3314,7 +3317,18 @@ mod tests {
     // page refuses it more; one that gives MiB caps that many
     #[test]
     fn an_endgame_caps_its_memory_only_when_asked() {
-        for (more, cap) in [("", None), (r#","max_memory_mb":300"#, Some(300 << 20))] {
+        for (more, cap) in [
+            ("", None),
+            (r#","max_memory_mb":300"#, Some(300 << 20)),
+            (
+                r#","max_memory_mb":4096"#,
+                Some(4096usize.saturating_mul(1 << 20)),
+            ),
+            (
+                &format!(r#","max_memory_mb":{}"#, usize::MAX)[..],
+                Some(usize::MAX),
+            ),
+        ] {
             let handle = endgame_of("tiny-end-cap", &[S], &[A, T], more).unwrap();
             let max_memory = ENDGAMES.lock().unwrap().live[&handle].max_memory;
             assert_eq!(max_memory, cap, "{more}");
@@ -3349,7 +3363,7 @@ mod tests {
                 &[S][..],
                 &[A, T][..],
                 r#","max_memory_mb":0"#,
-                "max_memory_mb: 1 to 4096, found 0",
+                "max_memory_mb: at least 1, found 0",
             ),
         ] {
             let err = endgame_of("tiny-end-refuse", rack, others, more).unwrap_err();
