@@ -86,6 +86,11 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
             game_config::make_super_german_game_config,
         ),
         (
+            "CrosswordGame/italian",
+            "WordSmog/italian",
+            game_config::make_italian_game_config,
+        ),
+        (
             "CrosswordGame/norwegian",
             "WordSmog/norwegian",
             game_config::make_norwegian_game_config,
@@ -2346,7 +2351,7 @@ mod tests {
             );
             assert_eq!(jumbled.rack_size(), game_config.rack_size());
         }
-        assert_eq!((classic, rules.len()), (13, 26));
+        assert_eq!((classic, rules.len()), (14, 28));
     }
 
     // english tiles
