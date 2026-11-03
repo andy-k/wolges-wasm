@@ -1025,14 +1025,52 @@ impl SimPlay {
 
 // sim_step: at most this many iterations, at most for this many milliseconds,
 // or both, whichever ends first; iterations 0 reads the sim without stepping
-// it. Pruning (by default only for a sim not run in parts) and a play each
+// it. Whether to prune, said on every step; to prune, every prune_every
+// iterations each running candidate behind the leader by prune_z standard
+// errors, on the iterations both ran, is pruned, a chance to win within
+// prune_decided (0 to 0.5) of 0 or 1 having its game decided. And a play each
 // candidate is compared with, on the iterations both ran.
 #[derive(serde::Deserialize)]
 struct SimStepRequest {
     iterations: Option<u64>,
     ms: Option<f64>,
-    prune: Option<bool>,
+    prune: bool,
+    prune_every: Option<u64>,
+    prune_z: Option<f64>,
+    prune_decided: Option<f64>,
     against: Option<SimPlay>,
+}
+
+// how a step prunes: every so many of the sim's iterations, behind by so many
+// standard errors, decided within so much of 0 or 1
+#[derive(Clone, Copy, Debug)]
+struct Pruning {
+    every: u64,
+    z: f64,
+    decided: f64,
+}
+
+// the pruning a step asks for, each of its settings given and checked; none
+// when it asks for none
+fn pruning_of(req: &SimStepRequest) -> Result<Option<Pruning>, String> {
+    if !req.prune {
+        return Ok(None);
+    }
+    let every = req.prune_every.ok_or("prune_every: required to prune")?;
+    if every == 0 {
+        return Err("prune_every: must be 1 or more".into());
+    }
+    let z = req.prune_z.ok_or("prune_z: required to prune")?;
+    if z < 0.0 {
+        return Err("prune_z: must be 0 or more".into());
+    }
+    let decided = req
+        .prune_decided
+        .ok_or("prune_decided: required to prune")?;
+    if !(0.0..=0.5).contains(&decided) {
+        return Err("prune_decided: must be from 0 to 0.5".into());
+    }
+    Ok(Some(Pruning { every, z, decided }))
 }
 
 // where a sim's candidate stands: rolled out every iteration, held out by the
@@ -1237,15 +1275,13 @@ impl Sim {
 
     // up to max iterations, until out_of_time says so before one, while a
     // candidate runs; each rolls out every running candidate on the same draws,
-    // and with prune, every PRUNE_CADENCE iterations, those behind the leader
-    // are pruned
+    // and with pruning, those behind the leader are pruned as it says
     fn step(
         &mut self,
         max: u64,
-        prune: bool,
+        pruning: Option<Pruning>,
         mut out_of_time: impl FnMut() -> bool,
     ) -> Result<u64, String> {
-        let z = move_picker::paired_z(move_picker::DEFAULT_NUM_SIM_ITERS);
         let rack_size = self.game_config.rack_size();
         let mut rows = Vec::new();
         let mut plies = Vec::new();
@@ -1311,8 +1347,10 @@ impl Sim {
             }
             self.iterations = iteration;
             stepped += 1;
-            if prune && iteration.is_multiple_of(move_picker::PRUNE_CADENCE) {
-                prune_behind(&mut self.candidates, z);
+            if let Some(pruning) = pruning
+                && iteration.is_multiple_of(pruning.every)
+            {
+                prune_behind(&mut self.candidates, pruning.z, pruning.decided);
             }
         }
         Ok(stepped)
@@ -1378,10 +1416,6 @@ impl Sim {
     }
 }
 
-// a chance to win this near 0 or 1 has its game decided: within one game, in a
-// whole default sim's iterations, of certain
-const DECIDED: f64 = 1.0 / move_picker::DEFAULT_NUM_SIM_ITERS as f64;
-
 // how a chance to win has its game: won, lost, or still open
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Outcome {
@@ -1390,10 +1424,11 @@ enum Outcome {
     Open,
 }
 
-fn outcome(win: f64) -> Outcome {
-    if win >= 1.0 - DECIDED {
+// a chance to win within decided of 1 has its game won, within it of 0 lost
+fn outcome(win: f64, decided: f64) -> Outcome {
+    if win >= 1.0 - decided {
         Outcome::Won
-    } else if win <= DECIDED {
+    } else if win <= decided {
         Outcome::Lost
     } else {
         Outcome::Open
@@ -1403,14 +1438,14 @@ fn outcome(win: f64) -> Outcome {
 // the running candidate a page sorting by the chance to win lists first: if any
 // game is won, the won one of the highest equity; if every game is lost, the
 // one of the highest equity; else the one of the highest chance to win
-fn leader(candidates: &[SimCandidate]) -> Option<&SimCandidate> {
+fn leader(candidates: &[SimCandidate], decided: f64) -> Option<&SimCandidate> {
     let running = || (candidates.iter()).filter(|c| c.state == SimState::Running);
     let by_equity =
         |a: &&SimCandidate, b: &&SimCandidate| a.equity.mean().total_cmp(&b.equity.mean());
-    let won = |c: &&SimCandidate| outcome(c.win.mean()) == Outcome::Won;
+    let won = |c: &&SimCandidate| outcome(c.win.mean(), decided) == Outcome::Won;
     if running().any(|c| won(&c)) {
         running().filter(won).max_by(by_equity)
-    } else if running().all(|c| outcome(c.win.mean()) == Outcome::Lost) {
+    } else if running().all(|c| outcome(c.win.mean(), decided) == Outcome::Lost) {
         running().max_by(by_equity)
     } else {
         running().max_by(|a, b| a.win.mean().total_cmp(&b.win.mean()))
@@ -1419,21 +1454,21 @@ fn leader(candidates: &[SimCandidate]) -> Option<&SimCandidate> {
 
 // whether a candidate is compared with the leader by equity: when both games
 // are won, or both lost, the chance to win cannot tell them apart
-fn by_equity(win: f64, lead_win: f64) -> bool {
-    let mine = outcome(win);
-    mine != Outcome::Open && mine == outcome(lead_win)
+fn by_equity(win: f64, lead_win: f64, decided: f64) -> bool {
+    let mine = outcome(win, decided);
+    mine != Outcome::Open && mine == outcome(lead_win, decided)
 }
 
 // the running candidates behind the leader on the iterations both ran, pruned:
 // behind by the chance to win, or, where the chance to win cannot tell them
 // apart, by equity, each as wolges's move picker tells a candidate behind
-fn prune_behind(candidates: &mut [SimCandidate], z: f64) {
-    let Some(lead) = leader(candidates) else {
+fn prune_behind(candidates: &mut [SimCandidate], z: f64, decided: f64) {
+    let Some(lead) = leader(candidates, decided) else {
         return;
     };
     let behind = (candidates.iter())
         .map(|c| {
-            let (mine, leads) = if by_equity(c.win.mean(), lead.win.mean()) {
+            let (mine, leads) = if by_equity(c.win.mean(), lead.win.mean(), decided) {
                 (&c.equities, &lead.equities)
             } else {
                 (&c.wins, &lead.wins)
@@ -1876,6 +1911,7 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
         }
         None => None,
     };
+    let pruning = pruning_of(&req)?;
     let mut sims = SIMS.lock().map_err(err_to_str)?;
     let sim = sims.live.get_mut(&handle).ok_or_else(|| no_sim(handle))?;
     // the play to compare against, checked before any step
@@ -1889,8 +1925,7 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
         }
         None => None,
     };
-    let prune = req.prune.unwrap_or(sim.parts == 1);
-    let stepped = sim.step(req.iterations.unwrap_or(u64::MAX), prune, || {
+    let stepped = sim.step(req.iterations.unwrap_or(u64::MAX), pruning, || {
         deadline.is_some_and(|deadline| now() >= deadline)
     })?;
     serde_json::to_string(&sim.report(stepped, against.as_ref())).map_err(err_to_str)
@@ -2822,6 +2857,16 @@ mod tests {
         report(&do_sim_step(sim, req, || 0.0).unwrap())
     }
 
+    // a step's fields to prune as wolges's own sims prune (every PRUNE_CADENCE
+    // iterations, the z of a whole default sim), decided within this margin
+    fn pruning(decided: f64) -> String {
+        format!(
+            r#""prune":true,"prune_every":{},"prune_z":{:?},"prune_decided":{decided:?}"#,
+            move_picker::PRUNE_CADENCE,
+            move_picker::paired_z(move_picker::DEFAULT_NUM_SIM_ITERS)
+        )
+    }
+
     fn do_sim_add(handle: u32, plays: &str) -> Result<String, String> {
         do_sim_change(handle, plays, SimChange::Add)
     }
@@ -2866,7 +2911,7 @@ mod tests {
         }
 
         // iterations 0 reads it as it is
-        let read = step(b, r#"{"iterations":0}"#);
+        let read = step(b, r#"{"iterations":0,"prune":false}"#);
         assert_eq!(
             (read["iterations"].clone(), read["stepped"].clone()),
             (5.into(), 0.into())
@@ -2910,7 +2955,7 @@ mod tests {
         let whole = step(whole, r#"{"iterations":12,"prune":false}"#);
         // a part prunes only when asked, so these steps run every candidate
         let parts = (parts.iter())
-            .map(|&sim| step(sim, r#"{"iterations":4}"#))
+            .map(|&sim| step(sim, r#"{"iterations":4,"prune":false}"#))
             .collect::<Vec<_>>();
         // the parts' statistics pooled: n summed, the mean n-weighted, and the
         // sum of squares each part's own plus its mean's distance from the whole
@@ -2965,7 +3010,7 @@ mod tests {
                 &format!(r#","plies":{plies}"#),
             );
             do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
-            let answer = step(sim, r#"{"iterations":6}"#);
+            let answer = step(sim, r#"{"iterations":6,"prune":false}"#);
             assert_eq!(answer["iterations"], 6);
             for candidate in answer["candidates"].as_array().unwrap() {
                 let counts = (candidate["plies"].as_array().unwrap().iter())
@@ -2989,7 +3034,7 @@ mod tests {
         for sim in sims {
             do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
         }
-        let [many, long] = sims.map(|sim| step(sim, r#"{"iterations":6}"#));
+        let [many, long] = sims.map(|sim| step(sim, r#"{"iterations":6,"prune":false}"#));
         for sim in sims {
             do_sim_free(sim).unwrap();
         }
@@ -3026,7 +3071,7 @@ mod tests {
         for sim in sims {
             do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
         }
-        let [passing, playing] = sims.map(|sim| step(sim, r#"{"iterations":8}"#));
+        let [passing, playing] = sims.map(|sim| step(sim, r#"{"iterations":8,"prune":false}"#));
         for sim in sims {
             do_sim_free(sim).unwrap();
         }
@@ -3122,7 +3167,7 @@ mod tests {
 
     // a sim as a step of no iterations reads it
     fn read_sim(sim: u32) -> serde_json::Value {
-        step(sim, r#"{"iterations":0}"#)
+        step(sim, r#"{"iterations":0,"prune":false}"#)
     }
 
     // the tests that infer, one at a time, since infer holds one set of tables
@@ -3507,13 +3552,14 @@ mod tests {
             clock.set(t + 1.0);
             t
         };
-        let answer = report(&do_sim_step(sim, r#"{"ms":3.5}"#, now).unwrap());
+        let answer = report(&do_sim_step(sim, r#"{"ms":3.5,"prune":false}"#, now).unwrap());
         assert_eq!(answer["stepped"], 3);
         // iterations bound it too, whichever ends first
-        let answer = report(&do_sim_step(sim, r#"{"ms":1000,"iterations":2}"#, now).unwrap());
+        let answer =
+            report(&do_sim_step(sim, r#"{"ms":1000,"iterations":2,"prune":false}"#, now).unwrap());
         assert_eq!(answer["stepped"], 2);
         assert!(do_sim_step(sim, r#"{}"#, now).is_err());
-        assert!(do_sim_step(sim, r#"{"ms":-1}"#, now).is_err());
+        assert!(do_sim_step(sim, r#"{"ms":-1,"prune":false}"#, now).is_err());
         do_sim_free(sim).unwrap();
     }
 
@@ -3534,7 +3580,7 @@ mod tests {
         ] {
             let sim = sim_new(scores).unwrap();
             do_sim_add(sim, &format!("[{PASS}]")).unwrap();
-            let answer = step(sim, r#"{"iterations":4}"#);
+            let answer = step(sim, r#"{"iterations":4,"prune":false}"#);
             let win = answer["candidates"][0]["win"]["mean"].as_f64().unwrap();
             assert!(
                 if ahead { win > 0.999 } else { win < 0.001 },
@@ -3602,7 +3648,7 @@ mod tests {
         }
         let sim = sim_of("tiny-sim-late", &serde_json::to_string(&board).unwrap(), "");
         do_sim_add(sim, &format!("[{PASS}]")).unwrap();
-        let answer = step(sim, r#"{"iterations":2}"#);
+        let answer = step(sim, r#"{"iterations":2,"prune":false}"#);
         assert_eq!(answer["stepped"], 2);
         do_sim_free(sim).unwrap();
     }
@@ -3666,7 +3712,10 @@ mod tests {
         let off = r#"{"action":"play","down":true,"lane":8,"idx":6,"word":[26,0]}"#;
         let err = do_sim_add(sim, &format!("[{SCAT},{off}]")).unwrap_err();
         assert!(err.starts_with("plays[1]: "), "{err}");
-        assert_eq!(ns(&step(sim, r#"{"iterations":0}"#)), [5, 5, 1]);
+        assert_eq!(
+            ns(&step(sim, r#"{"iterations":0,"prune":false}"#)),
+            [5, 5, 1]
+        );
 
         // paused, a candidate keeps its rollouts and runs no more; resumed, it
         // runs again from the next iteration
@@ -3745,7 +3794,7 @@ mod tests {
         // the flag is part of which candidate a play names
         let removed = report(&do_sim_change(sim, &format!("[{off}]"), SimChange::Remove).unwrap());
         assert_eq!(removed[0]["was"], "running");
-        let left = step(sim, r#"{"iterations":0}"#);
+        let left = step(sim, r#"{"iterations":0,"prune":false}"#);
         assert_eq!(ns(&left), [6, 6, 6, 6]);
         assert!(
             (left["candidates"].as_array().unwrap().iter())
@@ -3790,7 +3839,7 @@ mod tests {
         // two points a draw, so by little in the chance to win, and it takes a
         // while to tell
         let sim = cat_sim("tiny-sim-prune");
-        let answer = step(sim, r#"{"iterations":256}"#);
+        let answer = step(sim, &format!(r#"{{"iterations":256,{}}}"#, pruning(0.0)));
         assert_eq!(states(&answer), ["running", "pruned"]);
         let n = ns(&answer);
         assert_eq!(n[0], 256);
@@ -3798,6 +3847,28 @@ mod tests {
             n[1] < 256 && n[1].is_multiple_of(move_picker::PRUNE_CADENCE),
             "{n:?}"
         );
+        // the caller's settings, not wolges's: looks every 3 iterations prune
+        // the pass at a multiple of 3 that no look every 16 would have had, and
+        // a z no difference reaches prunes nothing
+        let settings = |every: u64, z: f64| {
+            let sim = cat_sim("tiny-sim-prune");
+            let answer = step(
+                sim,
+                &format!(
+                    r#"{{"iterations":256,"prune":true,"prune_every":{every},"prune_z":{z:?},"prune_decided":0}}"#
+                ),
+            );
+            do_sim_free(sim).unwrap();
+            (states(&answer), ns(&answer))
+        };
+        let z = move_picker::paired_z(move_picker::DEFAULT_NUM_SIM_ITERS);
+        let (states3, n3) = settings(3, z);
+        assert_eq!(states3, ["running", "pruned"]);
+        assert!(
+            n3[1].is_multiple_of(3) && !n3[1].is_multiple_of(16),
+            "{n3:?}"
+        );
+        assert_eq!(settings(16, 1000.0).0, ["running", "running"]);
         // a pruned candidate is resumed as a paused one is
         do_sim_change(sim, &format!("[{PASS}]"), SimChange::Resume).unwrap();
         assert_eq!(
@@ -3811,7 +3882,7 @@ mod tests {
         assert_eq!(ns(&answer), [64, 64]);
         // with nothing running, a step steps nothing
         do_sim_change(sim, &format!("[{CATS},{PASS}]"), SimChange::Pause).unwrap();
-        assert_eq!(step(sim, r#"{"iterations":5}"#)["stepped"], 0);
+        assert_eq!(step(sim, r#"{"iterations":5,"prune":false}"#)["stepped"], 0);
         do_sim_free(sim).unwrap();
     }
 
@@ -3844,13 +3915,51 @@ mod tests {
     // both won or both lost, by equity
     #[test]
     fn a_sim_prunes_by_the_chance_to_win_and_decided_games_by_equity() {
-        // decided: within one game, in a whole default sim's, of certain
-        assert_eq!(outcome(1.0 - DECIDED), Outcome::Won);
-        assert_eq!(outcome(DECIDED), Outcome::Lost);
-        assert_eq!(outcome(1.0 - 2.0 * DECIDED), Outcome::Open);
-        assert_eq!(outcome(2.0 * DECIDED), Outcome::Open);
-        assert!(by_equity(1.0 - DECIDED, 1.0) && by_equity(0.0, DECIDED));
-        assert!(!by_equity(0.6, 1.0) && !by_equity(0.0, 1.0) && !by_equity(0.5, 0.5));
+        // decided: within the margin a step gives of certain
+        let d = 0.001;
+        assert_eq!(outcome(1.0 - d, d), Outcome::Won);
+        assert_eq!(outcome(d, d), Outcome::Lost);
+        assert_eq!(outcome(1.0 - 2.0 * d, d), Outcome::Open);
+        assert_eq!(outcome(2.0 * d, d), Outcome::Open);
+        assert_eq!(outcome(1.0 - d, 0.0), Outcome::Open);
+        assert_eq!(outcome(1.0, 0.0), Outcome::Won);
+        assert_eq!(outcome(0.0, 0.0), Outcome::Lost);
+        assert!(by_equity(1.0 - d, 1.0, d) && by_equity(0.0, d, d));
+        assert!(!by_equity(1.0 - d, 1.0, 0.0));
+        assert!(!by_equity(0.6, 1.0, d) && !by_equity(0.0, 1.0, d) && !by_equity(0.5, 0.5, d));
+        // a step says whether it prunes, and to prune gives every setting, each
+        // in range
+        let asked = |json: &str| pruning_of(&serde_json::from_str(json).unwrap());
+        assert!(asked(r#"{"prune":false}"#).unwrap().is_none());
+        let given = asked(r#"{"prune":true,"prune_every":16,"prune_z":3.5,"prune_decided":0.5}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!((given.every, given.z, given.decided), (16, 3.5, 0.5));
+        for (json, said) in [
+            (r#""prune_z":3.5,"prune_decided":0.001"#, "prune_every: "),
+            (r#""prune_every":16,"prune_decided":0.001"#, "prune_z: "),
+            (r#""prune_every":16,"prune_z":3.5"#, "prune_decided: "),
+            (
+                r#""prune_every":0,"prune_z":3.5,"prune_decided":0.001"#,
+                "prune_every: ",
+            ),
+            (
+                r#""prune_every":16,"prune_z":-1,"prune_decided":0.001"#,
+                "prune_z: ",
+            ),
+            (
+                r#""prune_every":16,"prune_z":3.5,"prune_decided":0.6"#,
+                "prune_decided: ",
+            ),
+            (
+                r#""prune_every":16,"prune_z":3.5,"prune_decided":-0.1"#,
+                "prune_decided: ",
+            ),
+        ] {
+            let err = asked(&format!(r#"{{"prune":true,{json}}}"#)).unwrap_err();
+            assert!(err.starts_with(said), "{json}: {err}");
+        }
+        assert!(serde_json::from_str::<SimStepRequest>(r#"{"iterations":1}"#).is_err());
 
         let z = move_picker::paired_z(move_picker::DEFAULT_NUM_SIM_ITERS);
         // 32 iterations alternating between two values
@@ -3860,6 +3969,21 @@ mod tests {
                 .map(|c| c.state.name())
                 .collect::<Vec<_>>()
         };
+        // two games won within the margin: the leader is the one of the higher
+        // equity, though the other's chance to win is higher; with no margin
+        // neither is won, and the leader is the higher chance to win
+        let candidates = [
+            rolled(&two(0.9995, 0.9995), &two(30.0, 30.0)),
+            rolled(&two(0.9999, 0.9999), &two(20.0, 20.0)),
+        ];
+        assert!(std::ptr::eq(
+            leader(&candidates, d).unwrap(),
+            &candidates[0]
+        ));
+        assert!(std::ptr::eq(
+            leader(&candidates, 0.0).unwrap(),
+            &candidates[1]
+        ));
         // two won games and an open one: the leader is the won one of the
         // higher equity, the other won one is behind it in equity, and the open
         // one, though its equity is the highest, is behind it in the chance to
@@ -3869,8 +3993,11 @@ mod tests {
             rolled(&two(1.0, 1.0), &two(30.0, 33.0)),
             rolled(&two(0.5, 0.7), &two(90.0, 95.0)),
         ];
-        assert!(std::ptr::eq(leader(&candidates).unwrap(), &candidates[1]));
-        prune_behind(&mut candidates, z);
+        assert!(std::ptr::eq(
+            leader(&candidates, 0.0).unwrap(),
+            &candidates[1]
+        ));
+        prune_behind(&mut candidates, z, 0.0);
         assert_eq!(standing(&candidates), ["pruned", "running", "pruned"]);
         // every game lost: the leader is the one of the highest equity, and the
         // others are behind it in equity
@@ -3878,7 +4005,7 @@ mod tests {
             rolled(&two(0.0, 0.0), &two(-90.0, -95.0)),
             rolled(&two(0.0, 0.0), &two(-20.0, -22.0)),
         ];
-        prune_behind(&mut candidates, z);
+        prune_behind(&mut candidates, z, 0.0);
         assert_eq!(standing(&candidates), ["pruned", "running"]);
         // open games: the leader is the one of the highest chance to win, and a
         // play of more equity but less chance to win is behind it; a play never
@@ -3888,7 +4015,7 @@ mod tests {
             rolled(&two(0.6, 0.8), &two(10.0, 12.0)),
             rolled(&two(0.6, 0.8), &two(0.0, 1.0)),
         ];
-        prune_behind(&mut candidates, z);
+        prune_behind(&mut candidates, z, 0.0);
         assert_eq!(standing(&candidates), ["pruned", "running", "running"]);
         // a paused candidate is not the leader, and is not pruned
         let mut candidates = [
@@ -3896,24 +4023,44 @@ mod tests {
             rolled(&two(0.9, 0.9), &two(10.0, 12.0)),
         ];
         candidates[1].state = SimState::Paused;
-        prune_behind(&mut candidates, z);
+        prune_behind(&mut candidates, z, 0.0);
         assert_eq!(standing(&candidates), ["running", "paused"]);
 
-        // a sim far ahead: every rollout's game is won, so CATS and the pass are
-        // compared by equity, and the pass, which scores nothing now, is pruned
+        // a sim far ahead: every rollout's chance to win is within 0.001 of 1,
+        // though not 1 itself. Given that margin, CATS and the pass are compared
+        // by equity, and the pass, which scores nothing now, is pruned; by
+        // default neither game is decided, and chances to win this near each
+        // other prune neither
         tiny_lexicon("tiny-sim-decided");
-        let sim = do_sim_new(&format!(
-            r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-decided","leave":"noleave","rules":"CrosswordGame","scores":[1000,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7}}"#,
-            cat_board()
-        ))
-        .unwrap();
-        do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
-        let answer = step(sim, r#"{"iterations":256}"#);
+        let far_ahead = || {
+            let sim = do_sim_new(&format!(
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-decided","leave":"noleave","rules":"CrosswordGame","scores":[1000,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7}}"#,
+                cat_board()
+            ))
+            .unwrap();
+            do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
+            sim
+        };
+        let sim = far_ahead();
+        let err = do_sim_step(
+            sim,
+            &format!(r#"{{"iterations":1,{}}}"#, pruning(0.6)),
+            || 0.0,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("prune_decided: "), "{err}");
+        let answer = step(sim, &format!(r#"{{"iterations":256,{}}}"#, pruning(0.001)));
         assert_eq!(states(&answer), ["running", "pruned"]);
         for c in 0..2 {
             let win = answer["candidates"][c]["win"]["mean"].as_f64().unwrap();
-            assert_eq!(outcome(win), Outcome::Won, "{win}");
+            assert_eq!(outcome(win, 0.001), Outcome::Won, "{win}");
+            assert_eq!(outcome(win, 0.0), Outcome::Open, "{win}");
         }
+        do_sim_free(sim).unwrap();
+        let sim = far_ahead();
+        let answer = step(sim, &format!(r#"{{"iterations":256,{}}}"#, pruning(0.0)));
+        assert_eq!(states(&answer), ["running", "running"]);
+        assert_eq!(ns(&answer), [256, 256]);
         do_sim_free(sim).unwrap();
     }
 
@@ -3948,30 +4095,33 @@ mod tests {
         }
         // without one, none
         assert!(
-            step(sim, r#"{"iterations":0}"#)["candidates"][0]
+            step(sim, r#"{"iterations":0,"prune":false}"#)["candidates"][0]
                 .get("against")
                 .is_none()
         );
         // a play not in the sim: refused before any step
         let err = do_sim_step(
             sim,
-            &format!(r#"{{"iterations":3,"against":{SCAT}}}"#),
+            &format!(r#"{{"iterations":3,"prune":false,"against":{SCAT}}}"#),
             || 0.0,
         )
         .unwrap_err();
         assert_eq!(err, "against: not in the sim");
-        assert_eq!(step(sim, r#"{"iterations":0}"#)["iterations"], 10);
+        assert_eq!(
+            step(sim, r#"{"iterations":0,"prune":false}"#)["iterations"],
+            10
+        );
         do_sim_free(sim).unwrap();
     }
 
     #[test]
     fn a_sim_keeps_its_graph_evicted_and_a_freed_sim_is_gone() {
         let sim = cat_sim("tiny-sim-free");
-        let before = step(sim, r#"{"iterations":4}"#);
+        let before = step(sim, r#"{"iterations":4,"prune":false}"#);
         // the name can go while the sim lives: the sim keeps the graph it was
         // made with and steps on it as before
         assert!(evict_kwg("tiny-sim-free".into()).unwrap());
-        let after = step(sim, r#"{"iterations":4}"#);
+        let after = step(sim, r#"{"iterations":4,"prune":false}"#);
         assert_eq!(after["iterations"], 8);
         assert_eq!(
             before["candidates"].as_array().unwrap().len(),
@@ -3986,7 +4136,7 @@ mod tests {
         assert_eq!(err, "missing kwg");
         do_sim_free(sim).unwrap();
         for err in [
-            do_sim_step(sim, r#"{"iterations":1}"#, || 0.0).unwrap_err(),
+            do_sim_step(sim, r#"{"iterations":1,"prune":false}"#, || 0.0).unwrap_err(),
             do_sim_add(sim, &format!("[{PASS}]")).unwrap_err(),
             do_sim_free(sim).unwrap_err(),
         ] {
