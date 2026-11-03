@@ -934,10 +934,10 @@ fn do_infer_free(handle: u32) -> Result<(), String> {
 // far; each seat's rack size, by default the mover's rack with full racks for
 // the others dealt in turn from the tiles unseen while enough are left), the
 // tiles known to be on the opponent's rack (none by default), the plies each
-// rollout plays (by default as many as wolges's own sims play; past them, while
-// the bag is empty, it plays on to the game's end), the seed its draws come
-// from (a random one if none), and, for a sim run in parts, which part of how
-// many this is. A new sim holds no candidates.
+// rollout plays (always given, null for every ply to the game's end; past them,
+// while the bag is empty, it plays on to the game's end), the seed its draws
+// come from (a random one if none), and, for a sim run in parts, which part of
+// how many this is. A new sim holds no candidates.
 #[derive(serde::Deserialize)]
 struct SimNewRequest {
     rack: Vec<u8>,
@@ -953,7 +953,7 @@ struct SimNewRequest {
     rack_sizes: Option<Vec<u8>>,
     #[serde(default)]
     known: Vec<u8>,
-    #[serde(default = "default_plies")]
+    #[serde(deserialize_with = "nullable")]
     plies: Option<usize>, // null: every ply to the game's end
     #[serde(default)]
     kept: Vec<WeightedLeave>, // the leaves the opponent may hold, as the caller weighs them
@@ -967,8 +967,13 @@ struct SimNewRequest {
     parts: u64,
 }
 
-fn default_plies() -> Option<usize> {
-    Some(move_picker::DEFAULT_NUM_SIM_PLIES)
+// a field the request must give, null among the values it may take
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
 }
 
 fn one_part() -> u64 {
@@ -2824,11 +2829,17 @@ mod tests {
         );
     }
 
-    // a sim of this board, seed 7, scores level, with what more is given
+    // a sim of this board, seed 7, scores level, with what more is given; its
+    // plies wolges's own sims' unless that gives them
     fn sim_of(lexicon: &str, board: &str, more: &str) -> u32 {
         tiny_lexicon(lexicon);
+        let plies = if more.contains(r#""plies""#) {
+            String::new()
+        } else {
+            format!(r#","plies":{}"#, move_picker::DEFAULT_NUM_SIM_PLIES)
+        };
         do_sim_new(&format!(
-            r#"{{"rack":[{S},{E},{A},{T}],"board":{board},"lexicon":"{lexicon}","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7{more}}}"#
+            r#"{{"rack":[{S},{E},{A},{T}],"board":{board},"lexicon":"{lexicon}","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7{plies}{more}}}"#
         ))
         .unwrap()
     }
@@ -3461,7 +3472,7 @@ mod tests {
             ),
         ] {
             let err = do_sim_new(&format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4{more}}}"#,
                 cat_board()
             ))
             .unwrap_err();
@@ -3469,7 +3480,7 @@ mod tests {
         }
         // a mover holding both blanks leaves the opponent none to keep
         let err = do_sim_new(&format!(
-            r#"{{"rack":[0,0,{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"inferred":{again}}}"#,
+            r#"{{"rack":[0,0,{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4,"inferred":{again}}}"#,
             cat_board()
         ))
         .unwrap_err();
@@ -3533,7 +3544,7 @@ mod tests {
             ),
         ] {
             let err = do_sim_new(&format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-kept-bad","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-kept-bad","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4{more}}}"#,
                 cat_board()
             ))
             .unwrap_err();
@@ -3570,7 +3581,7 @@ mod tests {
         tiny_lexicon("tiny-sim-scores");
         let sim_new = |scores: &str| {
             do_sim_new(&format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-scores","leave":"noleave","rules":"CrosswordGame","turn":0,"zero_turns":0,"pass_turns":0,"seed":7{scores}}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-scores","leave":"noleave","rules":"CrosswordGame","turn":0,"zero_turns":0,"pass_turns":0,"plies":4,"seed":7{scores}}}"#,
                 cat_board()
             ))
         };
@@ -3595,13 +3606,23 @@ mod tests {
         // position's too: left out, refused
         for field in ["turn", "zero_turns", "pass_turns"] {
             let req = format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-scores","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-scores","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4}}"#,
                 cat_board()
             )
             .replace(&format!(r#","{field}":0"#), "");
             let err = do_sim_new(&req).unwrap_err();
             assert!(err.contains(&format!("missing field `{field}`")), "{err}");
         }
+        // so are the plies, which may be null but not left out
+        let req = |plies: &str| {
+            format!(
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-scores","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{plies}}}"#,
+                cat_board()
+            )
+        };
+        let err = do_sim_new(&req("")).unwrap_err();
+        assert!(err.contains("missing field `plies`"), "{err}");
+        do_sim_free(do_sim_new(&req(r#","plies":null"#)).unwrap()).unwrap();
     }
 
     // a sim knows the passes in a row so far: under German rules, where four
@@ -3612,7 +3633,7 @@ mod tests {
         tiny_lexicon("tiny-sim-passes");
         let plies_reached = |pass_turns: u16| {
             let sim = do_sim_new(&format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-passes","leave":"noleave","rules":"CrosswordGame/german","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":{pass_turns},"seed":7}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-passes","leave":"noleave","rules":"CrosswordGame/german","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":{pass_turns},"plies":4,"seed":7}}"#,
                 cat_board()
             ))
             .unwrap();
@@ -3683,7 +3704,7 @@ mod tests {
         tiny_lexicon("tiny-sim-known-bad");
         for known in ["[5,5,5,5,5,5,5,5]", "[0,0,0]"] {
             let err = do_sim_new(&format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-known-bad","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"known":{known}}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-known-bad","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4,"known":{known}}}"#,
                 cat_board()
             ))
             .unwrap_err();
@@ -4034,7 +4055,7 @@ mod tests {
         tiny_lexicon("tiny-sim-decided");
         let far_ahead = || {
             let sim = do_sim_new(&format!(
-                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-decided","leave":"noleave","rules":"CrosswordGame","scores":[1000,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7}}"#,
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-decided","leave":"noleave","rules":"CrosswordGame","scores":[1000,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4,"seed":7}}"#,
                 cat_board()
             ))
             .unwrap();
@@ -4129,7 +4150,7 @@ mod tests {
         );
         // a sim of a lexicon no longer cached
         let err = do_sim_new(&format!(
-            r#"{{"rack":[{S}],"board":{},"lexicon":"tiny-sim-free","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#,
+            r#"{{"rack":[{S}],"board":{},"lexicon":"tiny-sim-free","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4}}"#,
             cat_board()
         ))
         .unwrap_err();
