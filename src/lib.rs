@@ -2214,17 +2214,19 @@ struct EndgameBagTile {
 
 // endgame_step's answer: the bag's tiles (0 or 1), the steps that solved,
 // whether the answer is the endgame's own (the solve finished), the play to
-// make (none before a step solved), its gain for the side to move from now to
-// the game's end, and the lead it then ends with, in points; with an empty bag
-// the depth searched and the line, with a tile in it the share of the tiles it
-// may be that the play wins and the gain for each
+// make and its gain for the side to move from now to the game's end (none
+// before a step solved), and the lead it then ends with, in points; with an
+// empty bag the depth searched and the line, with a tile in it the share of the
+// tiles it may be that the play wins (none before a step solved) and the gain
+// for each
 #[derive(serde::Serialize)]
 struct EndgameAnswer {
     bag: u8,
     steps: u64,
     exact: bool,
     play: Option<kibitzer::JsonPlay>,
-    value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
     spread: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     depth: Option<i8>,
@@ -2358,7 +2360,7 @@ impl Endgame {
                     },
                     endgame::PegMove::Place(play) => (&play).into(),
                 }),
-                value,
+                value: Some(value),
                 spread: lead + value,
                 depth: Some(peg.depth),
                 line: None,
@@ -2407,7 +2409,7 @@ impl Endgame {
                 steps,
                 exact: solved.exact,
                 play: line.first().map(|(_, play)| play.into()),
-                value,
+                value: Some(value),
                 spread: lead + value,
                 depth: Some(solved.depth),
                 line: Some(
@@ -2586,11 +2588,11 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             steps: 0,
             exact: false,
             play: None,
-            value: 0.0,
+            value: None,
             spread: points(equity::Equity::new(scores)),
             depth: Some(0),
             line: (!in_bag).then(Vec::new),
-            win: in_bag.then_some(0.0),
+            win: None,
             tiles: in_bag.then(Vec::new),
         },
     };
@@ -4227,7 +4229,7 @@ mod tests {
         assert_eq!(
             before,
             serde_json::json!({"bag": 0, "steps": 0, "exact": false, "play": null,
-                "value": 0.0, "spread": 0.0, "depth": 0, "line": []})
+                "spread": 0.0, "depth": 0, "line": []})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 0);
@@ -4325,11 +4327,13 @@ mod tests {
         let rack = [S, E, A, T, C, A, T];
         let others = [A, T, E, S, E, A, T, E];
         let handle = endgame_of("tiny-end-bag", &rack, &others, "").unwrap();
-        // read before any step: no depth searched, nothing to play
+        // read before any step: no depth searched, nothing to play, no gain,
+        // and no win
         let before = endgame_step(handle, r#"{"ms":0}"#);
         assert_eq!(
-            (&before["depth"], &before["play"]),
-            (&0.into(), &serde_json::Value::Null)
+            before,
+            serde_json::json!({"bag": 1, "steps": 0, "exact": false, "play": null,
+                "spread": 0.0, "depth": 0, "tiles": []})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 1);
@@ -4415,7 +4419,7 @@ mod tests {
             play: Some(kibitzer::JsonPlay::Exchange {
                 tiles: Vec::new().into(),
             }),
-            value,
+            value: Some(value),
             spread: value,
             depth: Some(depth),
             line: Some(Vec::new()),
@@ -4431,6 +4435,7 @@ mod tests {
         assert!(!held.gives_way_to(&answer(false, 2, 9.0)), "shallower");
         let mut none = answer(false, 0, 0.0);
         none.play = None;
+        none.value = None;
         assert!(none.gives_way_to(&answer(false, 1, -3.0)), "no answer yet");
         // an exact answer from a shallower search than the one held keeps the
         // deeper depth; a step that does not give way counts its step
@@ -4446,12 +4451,15 @@ mod tests {
             },
             false,
         );
-        assert_eq!((steps.depth, steps.value, steps.steps), (Some(5), 19.0, 7));
+        assert_eq!(
+            (steps.depth, steps.value, steps.steps),
+            (Some(5), Some(19.0), 7)
+        );
         // with a tile in the bag every step's answer is taken, its depth never
         // below the one before
         let mut in_bag = answer(false, 2, 1.0);
         in_bag.take(answer(false, 1, 2.0), true);
-        assert_eq!((in_bag.depth, in_bag.value), (Some(2), 2.0));
+        assert_eq!((in_bag.depth, in_bag.value), (Some(2), Some(2.0)));
     }
 
     // a request that gives no memory caps none, the table growing until the
