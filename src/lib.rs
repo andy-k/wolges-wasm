@@ -35,6 +35,28 @@ pub fn version() -> String {
     )
 }
 
+// a step's prune_z for a sim with no iteration budget, after its iterations so
+// far: wolges's move_picker::stitched_z, whose paper is cited there, keeping
+// the chance the sim ever retires its best candidate behind a given other one
+// to at most alpha however long it runs. Iterations a whole number of at least
+// 1 and below 2^64, alpha above 0 and below 1
+#[wasm_bindgen]
+pub fn stitched_z(iterations: f64, alpha: f64) -> Result<f64, JsValue> {
+    Ok(do_stitched_z(iterations, alpha)?)
+}
+
+fn do_stitched_z(iterations: f64, alpha: f64) -> Result<f64, String> {
+    if !(iterations >= 1.0 && iterations < u64::MAX as f64 && iterations.fract() == 0.0) {
+        return Err(format!(
+            "iterations: a whole number of at least 1 and below 2^64, found {iterations}"
+        ));
+    }
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err(format!("alpha: above 0 and below 1, found {alpha}"));
+    }
+    Ok(move_picker::stitched_z(iterations as u64, alpha))
+}
+
 #[wasm_bindgen(start)]
 pub fn do_this_on_startup() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
@@ -3666,6 +3688,34 @@ mod tests {
         let err = do_sim_new(&req("")).unwrap_err();
         assert!(err.contains("missing field `plies`"), "{err}");
         do_sim_free(do_sim_new(&req(r#","plies":null"#)).unwrap()).unwrap();
+    }
+
+    // stitched_z is wolges's at whole iterations from 1 and an alpha between 0
+    // and 1, and refuses anything else
+    #[test]
+    fn stitched_z_is_wolges_own_within_its_bounds() {
+        for (iterations, alpha) in [(1.0, 0.05), (1000.0, 0.05), (87057.0, 0.01), (1e15, 0.5)] {
+            assert_eq!(
+                do_stitched_z(iterations, alpha).unwrap(),
+                move_picker::stitched_z(iterations as u64, alpha)
+            );
+        }
+        for (iterations, alpha) in [
+            (0.0, 0.05),
+            (1.5, 0.05),
+            (f64::NAN, 0.05),
+            (f64::INFINITY, 0.05),
+            (u64::MAX as f64, 0.05),
+            (16.0, 0.0),
+            (16.0, 1.0),
+            (16.0, -0.5),
+            (16.0, f64::NAN),
+        ] {
+            assert!(
+                do_stitched_z(iterations, alpha).is_err(),
+                "{iterations} {alpha}"
+            );
+        }
     }
 
     // a sim's spread and leaves are its equity's two parts: on every rollout
