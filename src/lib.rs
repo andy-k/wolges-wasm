@@ -1109,8 +1109,9 @@ struct SimPly {
 // its static equity, where it stands, its rollout's chance to win and equity on
 // each of the sim's iterations from the one it joined at (NaN where it sat one
 // out), and the statistics of its rollouts: their objective, their change in
-// spread with the leaves left counted (the sim's equity, in points), the chance
-// to win, and each ply's
+// spread with the leaves left counted (the sim's equity, in points) and its two
+// parts (the change in spread in points alone, and the leaves left: the mover's
+// less the opponent's), the chance to win, and each ply's
 struct SimCandidate {
     play: movegen::Play,
     challenged_off: bool,
@@ -1121,6 +1122,8 @@ struct SimCandidate {
     equities: Vec<f64>,
     objective: stats::Stats,
     equity: stats::Stats,
+    spread: stats::Stats,
+    leaves: stats::Stats,
     win: stats::Stats,
     plies: Vec<SimPly>,
 }
@@ -1175,8 +1178,9 @@ fn iteration_seed(seed: u64, iteration: u64) -> u64 {
 // one rollout of a play, as wolges's move_picker rolls one out, by the move
 // generator's lean arm, the one arm the wasm carries: its objective (the change
 // in spread in points, plus the chance to win weighted as the simmer weighs
-// it), the change in spread, and the chance to win; its plies are the simmer's
-// to read until the next
+// it), the change in spread, and the chance to win, then that change in spread
+// in its two parts (in points alone, and the leaves left); its plies are the
+// simmer's to read until the next
 fn rollout(
     simmer: &mut simmer::Simmer,
     game_config: &game_config::GameConfig,
@@ -1184,7 +1188,7 @@ fn rollout(
     klv: &Klv,
     play: &movegen::Play,
     challenged_off: bool,
-) -> Result<(f64, i32, f64), String> {
+) -> Result<(f64, i32, f64, i32, i32), String> {
     let no_tables = &anagrams::ArmTables::None;
     let game_ended = if challenged_off {
         simmer.simulate_lean_challenged_off(game_config, kwg, no_tables, klv)
@@ -1197,10 +1201,16 @@ fn rollout(
     let spread = final_spread
         .checked_sub(simmer.initial_score_spread)
         .ok_or("score overflow")?;
+    let (points, leaves) = simmer.final_spread_and_leaves().map_err(err_to_str)?;
+    let points = points
+        .checked_sub(simmer.initial_score_spread)
+        .ok_or("score overflow")?;
     Ok((
         simmer::sim_objective(spread, win, simmer.win_prob_weightage()),
         spread,
         win,
+        points,
+        leaves,
     ))
 }
 
@@ -1308,7 +1318,7 @@ impl Sim {
                 if candidate.state != SimState::Running {
                     continue;
                 }
-                let (objective, spread, win) = rollout(
+                let (objective, spread, win, points, leaves) = rollout(
                     &mut self.simmer,
                     &self.game_config,
                     &self.kwg.kwg,
@@ -1319,7 +1329,7 @@ impl Sim {
                 let played = self.simmer.plies_played();
                 let num_plies = self.plies.map_or(played.len(), |p| played.len().min(p));
                 plies.extend_from_slice(&played[..num_plies]);
-                rows.push((objective, spread, win, num_plies));
+                rows.push((objective, spread, win, points, leaves, num_plies));
             }
             let mut row = rows.iter();
             let mut at = 0;
@@ -1327,7 +1337,7 @@ impl Sim {
                 if candidate.state != SimState::Running {
                     continue;
                 }
-                let Some(&(objective, spread, win, num_plies)) = row.next() else {
+                let Some(&(objective, spread, win, points, leaves, num_plies)) = row.next() else {
                     break;
                 };
                 let equity = simmer::spread_points(spread);
@@ -1338,6 +1348,8 @@ impl Sim {
                 candidate.equities.push(equity);
                 candidate.objective.update(objective);
                 candidate.equity.update(equity);
+                candidate.spread.update(simmer::spread_points(points));
+                candidate.leaves.update(simmer::spread_points(leaves));
                 candidate.win.update(win);
                 // a ply's stats from the first rollout to reach it on
                 if candidate.plies.len() < num_plies {
@@ -1388,6 +1400,8 @@ impl Sim {
                     n: c.objective.count() as u64,
                     win: (&c.win).into(),
                     equity: (&c.equity).into(),
+                    spread: (&c.spread).into(),
+                    leaves: (&c.leaves).into(),
                     objective: (&c.objective).into(),
                     plies: (0..listed)
                         .map(|i| c.plies.get(i).unwrap_or(&unreached))
@@ -1556,8 +1570,10 @@ struct SimAgainst {
 // a candidate: its play as analyze lists one (its score recounted, its equity
 // the static one), whether it was challenged off (said only when it was), where
 // it stands, and its rollouts: their number, chance to win, equity (the change
-// in spread in points, the leaves left counted), objective, and plies (the first
-// the opponent's reply); with a play to compare against, itself less that play
+// in spread in points, the leaves left counted), that equity's two parts
+// (spread, the change in spread in points alone; leaves, the mover's leave left
+// less the opponent's), objective, and plies (the first the opponent's reply);
+// with a play to compare against, itself less that play
 #[derive(serde::Serialize)]
 struct SimCandidateReport {
     play: kibitzer::JsonPlayWithEquity,
@@ -1567,6 +1583,8 @@ struct SimCandidateReport {
     n: u64,
     win: SimStat,
     equity: SimStat,
+    spread: SimStat,
+    leaves: SimStat,
     objective: SimStat,
     plies: Vec<SimPlyReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1981,6 +1999,8 @@ fn do_sim_change(handle: u32, plays_str: &str, change: SimChange) -> Result<Stri
                 equities: Vec::new(),
                 objective: stats::Stats::new(),
                 equity: stats::Stats::new(),
+                spread: stats::Stats::new(),
+                leaves: stats::Stats::new(),
                 win: stats::Stats::new(),
                 plies: Vec::new(),
             }),
@@ -3648,6 +3668,70 @@ mod tests {
         do_sim_free(do_sim_new(&req(r#","plies":null"#)).unwrap()).unwrap();
     }
 
+    // a sim's spread and leaves are its equity's two parts: on every rollout
+    // they sum to it, so their means do too, a lead at the start counted in
+    // neither; with a table that values leaves, its leaves are not all 0
+    #[test]
+    fn a_sims_spread_and_leaves_sum_to_its_equity() {
+        tiny_lexicon("tiny-sim-parts");
+        // a leave table of one tile each, in the graph's sorted order
+        let leaves: [(&[u8], f32); 5] = [
+            (&[A], 1.5),
+            (&[C], -2.0),
+            (&[E], 3.25),
+            (&[S], 8.0),
+            (&[T], 0.75),
+        ];
+        let words = leaves
+            .iter()
+            .map(|&(tiles, _)| tiles.into())
+            .collect::<Vec<bites::Bites>>();
+        let graph = build::build(
+            build::BuildContent::DawgOnly,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &words,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((graph.len() / 4) as u32).to_le_bytes());
+        bytes.extend_from_slice(&graph);
+        bytes.extend_from_slice(&(leaves.len() as u32).to_le_bytes());
+        for &(_, value) in &leaves {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let table = Klv::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
+            piece.copy_from_slice(&bytes[at..at + piece.len()])
+        })
+        .unwrap();
+        cache_klv(
+            "tiny-sim-parts-leaves".into(),
+            CachedKlv::new(table).unwrap(),
+        )
+        .unwrap();
+        let sim = do_sim_new(&format!(
+            r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-parts","leave":"tiny-sim-parts-leaves","rules":"CrosswordGame","scores":[100,40],"turn":0,"zero_turns":0,"pass_turns":0,"plies":2,"seed":7}}"#,
+            cat_board()
+        ))
+        .unwrap();
+        do_sim_add(sim, &format!("[{CATS},{PASS}]")).unwrap();
+        let answer = step(sim, r#"{"iterations":32,"prune":false}"#);
+        let candidates = answer["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        let mut valued = 0;
+        for candidate in candidates {
+            let mean = |field: &str| candidate[field]["mean"].as_f64().unwrap();
+            let (equity, spread, leaves) = (mean("equity"), mean("spread"), mean("leaves"));
+            assert!(
+                (spread + leaves - equity).abs() < 1e-9,
+                "{spread} + {leaves} against {equity}"
+            );
+            valued += (leaves != 0.0) as usize;
+        }
+        assert!(valued > 0, "every candidate's leaves 0");
+        do_sim_free(sim).unwrap();
+    }
+
     // a sim knows the passes in a row so far: under German rules, where four
     // passes in a row end the game, after three a pass ends it at once, and no
     // ply follows
@@ -3946,6 +4030,8 @@ mod tests {
             equities: equities.into(),
             objective: stats::Stats::new(),
             equity: stats::Stats::new(),
+            spread: stats::Stats::new(),
+            leaves: stats::Stats::new(),
             win: stats::Stats::new(),
             plies: Vec::new(),
         };
