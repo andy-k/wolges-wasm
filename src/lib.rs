@@ -2229,6 +2229,13 @@ struct EndgameNewRequest {
     pass_turns: u16,
     #[serde(default)]
     max_memory_mb: Option<usize>,
+    // with two tiles or more in the bag: what each player knows once the first
+    // move is made ("info_sets" or "random_draws", wolges's PegModel), and the
+    // exchanges each seat has made
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    exchanges: Option<[i16; 2]>,
 }
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer
@@ -2254,17 +2261,35 @@ struct EndgameBagTile {
     value: f64,
 }
 
-// endgame_step's answer: the bag's tiles (0 or 1), the steps that solved and
-// the nodes they searched, whether the answer is the endgame's own (the solve
-// finished), the play to make and its gain for the side to move from now to the
-// game's end (none before a step solved), and the lead it then ends with, in
-// points; with an empty bag the depth searched and the line, with a tile in it
-// the share of the tiles it may be that the play wins (none before a step
-// solved), the gain for each, the endgames searched, and in the committed model
-// the moves its pass under way has valued, of all it values
+// tiles the bag may hold, with two or more in it: the deals that give them, and
+// the play's gain if they are the bag's, in points
+#[derive(serde::Serialize)]
+struct EndgameBagDraw {
+    tiles: Vec<u8>,
+    count: u64,
+    value: f64,
+}
+
+// a play the search with two tiles or more in the bag valued: the share of the
+// deals it wins (a tie counted half) and its mean gain, in points
+#[derive(serde::Serialize)]
+struct EndgameCandidate {
+    play: kibitzer::JsonPlay,
+    win: f64,
+    value: f64,
+}
+
+// endgame_step's answer: the bag's tiles, the steps that solved and the nodes
+// they searched, whether the answer is the endgame's own (the solve finished),
+// the play to make and its gain for the side to move to the game's end (none
+// before a step solved), and the lead it then ends with, in points; with an
+// empty bag the depth searched and the line; with tiles in it the share of the
+// deals the play wins, the endgames searched, the moves its pass has valued of
+// all it values, and the gain for each tile the bag may be (one tile) or for
+// each set it may hold, with every play valued, best first (two or more)
 #[derive(serde::Serialize)]
 struct EndgameAnswer {
-    bag: u8,
+    bag: usize,
     steps: u64,
     nodes: u64,
     exact: bool,
@@ -2281,6 +2306,10 @@ struct EndgameAnswer {
     #[serde(skip_serializing_if = "Option::is_none")]
     tiles: Option<Vec<EndgameBagTile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    draws: Option<Vec<EndgameBagDraw>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidates: Option<Vec<EndgameCandidate>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     endgames: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     moves: Option<[usize; 2]>,
@@ -2291,10 +2320,10 @@ struct EndgameAnswer {
 // its graph (each held here at one address, for the solver's table to be given
 // back to, so the lexicon's name may be evicted while it lives), the position
 // (the board, the side to move's rack, the tiles it cannot see with each one's
-// count, whether one is in the bag, the seat to move, its lead in millipoints,
+// count, how many are in the bag, the seat to move, its lead in millipoints,
 // and the passes and scoreless turns before it), the memory cap, the solver's
-// table between steps, with a tile in the bag the search so far, and the last
-// answer
+// table between steps, with tiles in the bag the search so far (one tile's, or
+// two or more's), and the last answer
 struct Endgame {
     game_config: std::sync::Arc<game_config::GameConfig>,
     kwg: Box<Kwg>,
@@ -2303,6 +2332,8 @@ struct Endgame {
     rack: Vec<u8>,
     unseen: Vec<u8>,
     in_bag: bool,
+    bag: usize,
+    peg_bag: Option<endgame::PegBagProgress>,
     turn: u8,
     lead: i32,
     pass_turns: u16,
@@ -2386,7 +2417,56 @@ impl Endgame {
         };
         let lead = points(equity::Equity::new(self.lead));
         let steps = self.answer.steps + 1;
-        let answer = if let Some(progress) = self.peg.as_mut() {
+        let answer = if let Some(progress) = self.peg_bag.as_mut() {
+            solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
+            let peg = solver.resume_peg(progress, &limits);
+            let peg = peg
+                .map_err(err_to_str)
+                .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
+            let peg = match peg {
+                Ok(peg) => peg,
+                Err(e) => {
+                    self.table = Some(solver.take_table());
+                    return Err(e);
+                }
+            };
+            // the search's margins are the leads the game ends with
+            let value = points(peg.expected_margin) - lead;
+            let (endgames, nodes) = progress.searched();
+            EndgameAnswer {
+                bag: self.bag,
+                steps,
+                nodes,
+                exact: peg.exact,
+                play: Some((&peg.best_move).into()),
+                value: Some(value),
+                spread: lead + value,
+                depth: Some(peg.depth),
+                line: None,
+                win: Some(peg.win_pct),
+                tiles: None,
+                draws: Some(
+                    (peg.hypotheses.iter())
+                        .map(|(tiles, count, margin)| EndgameBagDraw {
+                            tiles: tiles.clone(),
+                            count: *count,
+                            value: points(*margin) - lead,
+                        })
+                        .collect(),
+                ),
+                candidates: Some(
+                    (peg.moves.iter())
+                        .map(|(play, win, margin)| EndgameCandidate {
+                            play: play.into(),
+                            win: *win,
+                            value: points(*margin) - lead,
+                        })
+                        .collect(),
+                ),
+                endgames: Some(endgames),
+                moves: progress.moves().map(|(valued, of)| [valued, of]),
+            }
+        } else if let Some(progress) = self.peg.as_mut() {
             solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
             let peg = solver.resume_peg_one_in_bag(progress, &limits);
             let peg = peg
@@ -2427,6 +2507,8 @@ impl Endgame {
                         })
                         .collect(),
                 ),
+                draws: None,
+                candidates: None,
                 endgames: Some(endgames),
                 moves: progress.moves().map(|(valued, of)| [valued, of]),
             }
@@ -2479,6 +2561,8 @@ impl Endgame {
                 ),
                 win: None,
                 tiles: None,
+                draws: None,
+                candidates: None,
                 endgames: None,
                 moves: None,
             }
@@ -2568,16 +2652,29 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     if num_unseen == 0 {
         return Err("endgame: the other side holds no tiles, so the game is over".into());
     }
-    let in_bag = num_unseen > rack_size;
-    if num_unseen > rack_size + 1 {
-        return Err(format!(
-            "endgame: the bag holds {} tiles; at most one is solved",
-            num_unseen - rack_size
-        ));
-    }
+    let bag = num_unseen.saturating_sub(rack_size);
+    let in_bag = bag != 0;
     if in_bag && req.rack.len() != rack_size {
         return Err("endgame: with a tile in the bag the rack must be full".into());
     }
+    // with two tiles or more in the bag, what each player knows and the
+    // exchanges made are the position's too
+    let bag_search = if bag >= 2 {
+        let model = match req.model.as_deref() {
+            Some("info_sets") => endgame::PegModel::InfoSets,
+            Some("random_draws") => endgame::PegModel::RandomDraws,
+            found => {
+                return Err(format!(
+                    "model: \"info_sets\" or \"random_draws\" with {bag} tiles in the bag, found {found:?}"
+                ));
+            }
+        };
+        let exchanges = (req.exchanges)
+            .ok_or_else(|| format!("exchanges: each seat's, with {bag} tiles in the bag"))?;
+        Some((model, exchanges))
+    } else {
+        None
+    };
     let mut rack = req.rack;
     rack.sort_unstable();
     // the lexicon's words the board can still take, whatever the racks, made
@@ -2614,7 +2711,23 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         ),
     }
     .map_err(err_to_str)?;
-    let peg = in_bag.then(|| {
+    let peg_bag = match bag_search {
+        Some((model, exchanges)) => Some(
+            endgame::PegBagProgress::new(endgame::PegBagPosition {
+                mover: req.turn,
+                board: kibitzer.board_tiles.clone(),
+                mover_rack: rack.clone(),
+                unseen_tally: unseen.clone(),
+                bag_size: bag,
+                score_diff: equity::Equity::new(scores),
+                exchanges,
+                model,
+            })
+            .map_err(err_to_str)?,
+        ),
+        None => None,
+    };
+    let peg = (bag == 1).then(|| {
         endgame::PegProgress::new(
             req.turn,
             &kibitzer.board_tiles,
@@ -2634,6 +2747,8 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         rack,
         unseen,
         in_bag,
+        bag,
+        peg_bag,
         turn: req.turn,
         lead: scores,
         pass_turns: req.pass_turns,
@@ -2644,7 +2759,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         finished: None,
         nodes: 0,
         answer: EndgameAnswer {
-            bag: in_bag as u8,
+            bag,
             steps: 0,
             nodes: 0,
             exact: false,
@@ -2654,7 +2769,9 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             depth: Some(0),
             line: (!in_bag).then(Vec::new),
             win: None,
-            tiles: in_bag.then(Vec::new),
+            tiles: (bag == 1).then(Vec::new),
+            draws: (bag >= 2).then(Vec::new),
+            candidates: (bag >= 2).then(Vec::new),
             endgames: in_bag.then_some(0),
             moves: None,
         },
@@ -4535,6 +4652,99 @@ mod tests {
         do_endgame_free(handle).unwrap();
     }
 
+    // two tiles in the bag: the answer is wolges's own search of the position
+    // (random draws; info sets is taken the same way, but its search of even
+    // this position is too long for a test), each set of tiles the bag may hold
+    // with its deals, and every play valued, the answer's first
+    #[test]
+    fn an_endgame_with_two_tiles_in_the_bag_is_wolges_s_search() {
+        let rack = [S, E, A, T, C, A, T];
+        let others = [A, T, E, S, E, A, T, E, E];
+        let more = r#","model":"info_sets","exchanges":[0,0]"#;
+        let handle = endgame_of("tiny-end-bag2", &rack, &others, more).unwrap();
+        assert_eq!(endgame_step(handle, r#"{"ms":0}"#)["bag"], 2);
+        do_endgame_free(handle).unwrap();
+        let (name, model) = ("random_draws", endgame::PegModel::RandomDraws);
+        let more = format!(r#","model":"{name}","exchanges":[0,0]"#);
+        let handle = endgame_of("tiny-end-bag2", &rack, &others, &more).unwrap();
+        let before = endgame_step(handle, r#"{"ms":0}"#);
+        assert_eq!(
+            before,
+            serde_json::json!({"bag": 2, "steps": 0, "nodes": 0, "exact": false,
+                    "play": null, "spread": 0.0, "depth": 0, "draws": [],
+                    "candidates": [], "endgames": 0}),
+            "{name}"
+        );
+        let answer = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(answer["bag"], 2, "{name}");
+        assert_eq!(answer["exact"], true, "{name}");
+        assert!(answer["endgames"].as_u64().unwrap() > 0, "{name}: {answer}");
+        assert!(answer["nodes"].as_u64().unwrap() > 0, "{name}: {answer}");
+        let candidates = answer["candidates"].as_array().unwrap();
+        assert_eq!(answer["play"], candidates[0]["play"], "{name}");
+        assert_eq!(answer["value"], candidates[0]["value"], "{name}");
+        assert_eq!(answer["win"], candidates[0]["win"], "{name}");
+        let all = candidates.len() as u64;
+        assert_eq!(answer["moves"], serde_json::json!([all, all]), "{name}");
+        let draws = answer["draws"].as_array().unwrap();
+        assert!(
+            draws
+                .iter()
+                .all(|d| d["tiles"].as_array().unwrap().len() == 2),
+            "{name}: {answer}"
+        );
+
+        // wolges's search on the same position
+        let Tables {
+            kwg, game_config, ..
+        } = tables("tiny-end-bag2", "noleave", "CrosswordGame").unwrap();
+        let mut kibitzer = kibitzer::Kibitzer::new();
+        let board = serde_json::from_str::<Vec<Vec<i8>>>(&late_board(
+            &rack.iter().chain(&others).copied().collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        kibitzer.prepare(&game_config, &rack, &board).unwrap();
+        let arm_tables = anagrams::ArmTables::None;
+        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+            &game_config,
+            &kwg.kwg,
+            &arm_tables,
+        )
+        .unwrap();
+        let mut sorted = rack.to_vec();
+        sorted.sort_unstable();
+        let result = solver
+            .solve_peg(
+                endgame::PegBagPosition {
+                    mover: 0,
+                    board: kibitzer.board_tiles.clone(),
+                    mover_rack: sorted,
+                    unseen_tally: kibitzer.available_tally.clone(),
+                    bag_size: 2,
+                    score_diff: equity::Equity::ZERO,
+                    exchanges: [0, 0],
+                    model,
+                },
+                &endgame::Limits::NONE,
+            )
+            .unwrap()
+            .unwrap();
+        let play: kibitzer::JsonPlay = (&result.best_move).into();
+        assert_eq!(
+            answer["play"],
+            serde_json::to_value(&play).unwrap(),
+            "{name}"
+        );
+        assert_eq!(answer["win"].as_f64().unwrap(), result.win_pct, "{name}");
+        assert_eq!(
+            answer["value"].as_f64().unwrap(),
+            points(result.expected_margin),
+            "{name}"
+        );
+        assert_eq!(draws.len(), result.hypotheses.len(), "{name}");
+        do_endgame_free(handle).unwrap();
+    }
+
     // a clock that moves a millisecond each time it is read
     fn ticking() -> std::time::Duration {
         static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4635,6 +4845,8 @@ mod tests {
             line: Some(Vec::new()),
             win: None,
             tiles: None,
+            draws: None,
+            candidates: None,
             endgames: None,
             moves: None,
         };
@@ -4706,8 +4918,20 @@ mod tests {
             (
                 &full[..],
                 &[A, T, E, S, E, A, T, E, E][..],
-                "",
-                "endgame: the bag holds 2 tiles; at most one is solved",
+                r#","exchanges":[0,0]"#,
+                "model: \"info_sets\" or \"random_draws\" with 2 tiles in the bag, found None",
+            ),
+            (
+                &full[..],
+                &[A, T, E, S, E, A, T, E, E][..],
+                r#","model":"blind","exchanges":[0,0]"#,
+                "model: \"info_sets\" or \"random_draws\" with 2 tiles in the bag, found Some(\"blind\")",
+            ),
+            (
+                &full[..],
+                &[A, T, E, S, E, A, T, E, E][..],
+                r#","model":"info_sets""#,
+                "exchanges: each seat's, with 2 tiles in the bag",
             ),
             (
                 &[S, E, A, T][..],
