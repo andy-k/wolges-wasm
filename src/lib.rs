@@ -2212,17 +2212,19 @@ struct EndgameBagTile {
     value: f64,
 }
 
-// endgame_step's answer: the bag's tiles (0 or 1), the steps that solved,
-// whether the answer is the endgame's own (the solve finished), the play to
-// make and its gain for the side to move from now to the game's end (none
-// before a step solved), and the lead it then ends with, in points; with an
-// empty bag the depth searched and the line, with a tile in it the share of the
-// tiles it may be that the play wins (none before a step solved) and the gain
-// for each
+// endgame_step's answer: the bag's tiles (0 or 1), the steps that solved and
+// the nodes they searched, whether the answer is the endgame's own (the solve
+// finished), the play to make and its gain for the side to move from now to the
+// game's end (none before a step solved), and the lead it then ends with, in
+// points; with an empty bag the depth searched and the line, with a tile in it
+// the share of the tiles it may be that the play wins (none before a step
+// solved), the gain for each, the endgames searched, and in the committed model
+// the moves its pass under way has valued, of all it values
 #[derive(serde::Serialize)]
 struct EndgameAnswer {
     bag: u8,
     steps: u64,
+    nodes: u64,
     exact: bool,
     play: Option<kibitzer::JsonPlay>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2236,6 +2238,10 @@ struct EndgameAnswer {
     win: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tiles: Option<Vec<EndgameBagTile>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endgames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moves: Option<[usize; 2]>,
 }
 
 // an endgame a caller steps and frees: its rules and its own word graph, of the
@@ -2263,6 +2269,7 @@ struct Endgame {
     table: Option<endgame::KeptTable>,
     peg: Option<endgame::PegProgress>,
     finished: Option<(i8, equity::Equity)>, // an empty bag's deepest pass done, its value
+    nodes: u64,                             // the nodes an empty bag's steps searched
     answer: EndgameAnswer,
 }
 
@@ -2281,13 +2288,15 @@ impl EndgameAnswer {
     // a later step's answer taken when this one gives way to it, always with a
     // tile in the bag (its search resumes, so its answer only deepens); the
     // depth never falls, as an exact answer may come from a shallower search
-    // than one before it, the table holding what that one finished
+    // than one before it, the table holding what that one finished. Otherwise
+    // only its counts of steps and nodes are taken
     fn take(&mut self, step: EndgameAnswer, in_bag: bool) {
         if in_bag || self.gives_way_to(&step) {
             let depth = step.depth.max(self.depth);
             *self = EndgameAnswer { depth, ..step };
         } else {
             self.steps = step.steps;
+            self.nodes = step.nodes;
         }
     }
 }
@@ -2350,9 +2359,11 @@ impl Endgame {
             };
             // the search's margins are the leads the game ends with
             let value = points(peg.expected_margin) - lead;
+            let (endgames, nodes) = progress.searched();
             EndgameAnswer {
                 bag: 1,
                 steps,
+                nodes,
                 exact: peg.exact,
                 play: peg.best_move.map(|best| match best {
                     endgame::PegMove::Pass => kibitzer::JsonPlay::Exchange {
@@ -2374,6 +2385,8 @@ impl Endgame {
                         })
                         .collect(),
                 ),
+                endgames: Some(endgames),
+                moves: progress.moves().map(|(valued, of)| [valued, of]),
             }
         } else {
             let mut racks = [Vec::new(), Vec::new()];
@@ -2400,6 +2413,7 @@ impl Endgame {
                     return Err(err_to_str(e));
                 }
             };
+            self.nodes += solver.searched();
             self.finished = Some((solved.depth, solved.value));
             let mut line = Vec::new();
             solver.collect_pv(self.turn, &mut line);
@@ -2407,6 +2421,7 @@ impl Endgame {
             EndgameAnswer {
                 bag: 0,
                 steps,
+                nodes: self.nodes,
                 exact: solved.exact,
                 play: line.first().map(|(_, play)| play.into()),
                 value: Some(value),
@@ -2422,6 +2437,8 @@ impl Endgame {
                 ),
                 win: None,
                 tiles: None,
+                endgames: None,
+                moves: None,
             }
         };
         self.table = Some(solver.take_table());
@@ -2583,9 +2600,11 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         table: None,
         peg,
         finished: None,
+        nodes: 0,
         answer: EndgameAnswer {
             bag: in_bag as u8,
             steps: 0,
+            nodes: 0,
             exact: false,
             play: None,
             value: None,
@@ -2594,6 +2613,8 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             line: (!in_bag).then(Vec::new),
             win: None,
             tiles: in_bag.then(Vec::new),
+            endgames: in_bag.then_some(0),
+            moves: None,
         },
     };
 
@@ -4228,12 +4249,13 @@ mod tests {
         let before = endgame_step(handle, r#"{"ms":0}"#);
         assert_eq!(
             before,
-            serde_json::json!({"bag": 0, "steps": 0, "exact": false, "play": null,
-                "spread": 0.0, "depth": 0, "line": []})
+            serde_json::json!({"bag": 0, "steps": 0, "nodes": 0, "exact": false,
+                "play": null, "spread": 0.0, "depth": 0, "line": []})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 0);
         assert_eq!(answer["steps"], 1);
+        assert!(answer["nodes"].as_u64().unwrap() > 0, "{answer}");
         assert_eq!(answer["exact"], true);
         assert_eq!(answer["play"], answer["line"][0]["play"]);
         assert_eq!(answer["value"], answer["line"][0]["value"]);
@@ -4332,12 +4354,21 @@ mod tests {
         let before = endgame_step(handle, r#"{"ms":0}"#);
         assert_eq!(
             before,
-            serde_json::json!({"bag": 1, "steps": 0, "exact": false, "play": null,
-                "spread": 0.0, "depth": 0, "tiles": []})
+            serde_json::json!({"bag": 1, "steps": 0, "nodes": 0, "exact": false,
+                "play": null, "spread": 0.0, "depth": 0, "tiles": [], "endgames": 0})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 1);
         assert_eq!(answer["exact"], true);
+        // the endgames it searched and their nodes, and every move of its last
+        // pass valued
+        assert!(answer["endgames"].as_u64().unwrap() > 0, "{answer}");
+        assert!(answer["nodes"].as_u64().unwrap() > 0, "{answer}");
+        let moves = answer["moves"].as_array().unwrap();
+        assert!(
+            moves[1].as_u64().unwrap() > 0 && moves[0] == moves[1],
+            "{answer}"
+        );
         assert!(answer["depth"].as_i64().unwrap() >= 1, "{answer}");
         assert!(answer["play"].is_object(), "{answer}");
         let tiles = answer["tiles"].as_array().unwrap();
@@ -4386,9 +4417,14 @@ mod tests {
         let exact = endgame_step(whole, r#"{"ms":60000}"#);
         assert_eq!(exact["exact"], true);
         let mut finished = 0;
+        let mut nodes = 0;
         for step in 1.. {
             assert!(step <= 1000, "the steps did not end in a thousand");
             let answer = report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking).unwrap());
+            // every step searches more nodes, whether its answer is taken or not
+            let now = answer["nodes"].as_u64().unwrap();
+            assert!(now > nodes, "step {step}: {now} nodes after {nodes}");
+            nodes = now;
             if answer["exact"] == true {
                 assert_eq!(answer["value"], exact["value"]);
                 assert!(step > 2, "{step} steps");
@@ -4407,6 +4443,43 @@ mod tests {
         do_endgame_free(whole).unwrap();
     }
 
+    // a tile in the bag, the search stepped: each step's answer counts more
+    // endgames and nodes, and says how many moves the pass under way has valued,
+    // of all, some step stopping partway through a pass; a last step with no
+    // time limit ends the search, every move of its pass valued
+    #[test]
+    fn a_tile_in_the_bags_steps_count_their_endgames_and_nodes() {
+        let rack = [S, E, A, T, C, A, T];
+        let others = [A, T, E, S, E, A, T, E];
+        let handle = endgame_of("tiny-end-bag-steps", &rack, &others, "").unwrap();
+        let (mut endgames, mut nodes, mut partway) = (0, 0, false);
+        let mut counted = |answer: &serde_json::Value| {
+            let (now_endgames, now_nodes) = (
+                answer["endgames"].as_u64().unwrap(),
+                answer["nodes"].as_u64().unwrap(),
+            );
+            assert!(now_endgames > endgames, "{answer}");
+            assert!(now_nodes > nodes, "{answer}");
+            (endgames, nodes) = (now_endgames, now_nodes);
+            let moves = answer["moves"].as_array().unwrap();
+            let (valued, of) = (moves[0].as_u64().unwrap(), moves[1].as_u64().unwrap());
+            assert!(valued <= of && of > 0, "{answer}");
+            partway |= valued < of;
+            (valued, of)
+        };
+        for _ in 0..50 {
+            let answer = report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking).unwrap());
+            assert_eq!(answer["exact"], false, "{answer}");
+            counted(&answer);
+        }
+        let answer = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(answer["exact"], true, "{answer}");
+        let (valued, of) = counted(&answer);
+        assert_eq!(valued, of);
+        assert!(partway, "no step stopped partway through a pass");
+        do_endgame_free(handle).unwrap();
+    }
+
     // an empty bag's answer gives way to a step's only when that is exact,
     // deeper, or at its depth worth more, so a step that stopped sooner than
     // one before it leaves the deeper answer
@@ -4415,6 +4488,7 @@ mod tests {
         let answer = |exact: bool, depth: i8, value: f64| EndgameAnswer {
             bag: 0,
             steps: 1,
+            nodes: 0,
             exact,
             play: Some(kibitzer::JsonPlay::Exchange {
                 tiles: Vec::new().into(),
@@ -4425,6 +4499,8 @@ mod tests {
             line: Some(Vec::new()),
             win: None,
             tiles: None,
+            endgames: None,
+            moves: None,
         };
         let held = answer(false, 3, 5.0);
         assert!(held.gives_way_to(&answer(false, 4, -9.0)), "deeper");
@@ -4447,13 +4523,14 @@ mod tests {
         steps.take(
             EndgameAnswer {
                 steps: 7,
+                nodes: 99,
                 ..answer(false, 4, 30.0)
             },
             false,
         );
         assert_eq!(
-            (steps.depth, steps.value, steps.steps),
-            (Some(5), Some(19.0), 7)
+            (steps.depth, steps.value, steps.steps, steps.nodes),
+            (Some(5), Some(19.0), 7, 99)
         );
         // with a tile in the bag every step's answer is taken, its depth never
         // below the one before
