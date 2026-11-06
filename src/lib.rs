@@ -904,7 +904,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
                 .tables
         }
     };
-    let mut leaves = infer::kept_leaves_packed(
+    let mut leaves = infer::kept_leaves_packed_lean(
         tables,
         &mut move_generator,
         &movegen::BoardSnapshot {
@@ -2395,7 +2395,7 @@ fn points(equity: equity::Equity) -> f64 {
 impl Endgame {
     // one solve of at most ms on the clock, on the table earlier steps kept
     fn solve(&mut self, ms: f64, clock: endgame::Clock) -> Result<(), String> {
-        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
             &self.game_config,
             &self.kwg,
             &self.arm_tables,
@@ -3400,7 +3400,7 @@ mod tests {
         let board = serde_json::from_str::<Vec<Vec<i8>>>(&cat_board()).unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
         let play = serde_json::from_str::<SimPlay>(CATS).unwrap().to_play();
-        let mut wolges = infer::kept_leaves(
+        let mut wolges = infer::kept_leaves_lean(
             &mut infer::InferTables::new(&game_config, &klv.klv).unwrap(),
             &mut movegen::KurniaMoveGenerator::new(&game_config),
             &movegen::BoardSnapshot {
@@ -4525,7 +4525,7 @@ mod tests {
         .unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
         let arm_tables = anagrams::ArmTables::None;
-        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
             &game_config,
             &kwg.kwg,
             &arm_tables,
@@ -4580,7 +4580,7 @@ mod tests {
             let board = serde_json::from_str::<Vec<Vec<i8>>>(&board).unwrap();
             kibitzer.prepare(&game_config, &rack, &board).unwrap();
             let arm_tables = anagrams::ArmTables::None;
-            let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+            let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
                 &game_config,
                 &kwg.kwg,
                 &arm_tables,
@@ -4705,7 +4705,7 @@ mod tests {
         .unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
         let arm_tables = anagrams::ArmTables::None;
-        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24>::new(
+        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
             &game_config,
             &kwg.kwg,
             &arm_tables,
