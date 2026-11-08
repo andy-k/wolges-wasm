@@ -433,7 +433,9 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
 
-    let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
+    let mut move_generator =
+        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+            .map_err(err_to_str)?;
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
@@ -720,17 +722,19 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
     // that make the run of tiles down through it a word and those that make the
     // run across one, each 0 when no tile is beside it that way
     let mut hooks = vec![(0u64, 0u64); kibitzer.board_tiles.len()];
-    movegen::KurniaMoveGenerator::new(&game_config).gen_hooks(
-        &movegen::BoardSnapshot {
-            board_tiles: &kibitzer.board_tiles,
-            game_config: &game_config,
-            kwg: &kwg.kwg,
-            anagrams: None,
-            rack_lengths: None,
-            klv: &Klv::empty().map_err(err_to_str)?,
-        },
-        |idx, down, across| hooks[idx] = (down, across),
-    );
+    movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+        .map_err(err_to_str)?
+        .gen_hooks(
+            &movegen::BoardSnapshot {
+                board_tiles: &kibitzer.board_tiles,
+                game_config: &game_config,
+                kwg: &kwg.kwg,
+                anagrams: None,
+                rack_lengths: None,
+                klv: &Klv::empty().map_err(err_to_str)?,
+            },
+            |idx, down, across| hooks[idx] = (down, across),
+        );
     let alphabet_len = game_config.alphabet().len();
     let letters = |bits: u64| {
         (bits != 0).then(|| {
@@ -887,7 +891,9 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
-    let mut move_generator = movegen::KurniaMoveGenerator::new(&game_config);
+    let mut move_generator =
+        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+            .map_err(err_to_str)?;
     let mut cached = CACHED_INFER.lock().map_err(err_to_str)?;
     let tables = match &mut *cached {
         Some(held) if held.rules == req.rules && held.leave == req.leave => &mut held.tables,
@@ -1160,7 +1166,7 @@ struct Sim {
     kwg: std::sync::Arc<CachedKwg>,
     klv: std::sync::Arc<CachedKlv>,
     game_state: game_state::GameState,
-    simmer: simmer::Simmer,
+    simmer: simmer::Simmer<simmer::DefaultRng, u32, false, false>,
     pristine: game_state::GameState,
     plies: Option<usize>,
     seed: u64,
@@ -1204,7 +1210,7 @@ fn iteration_seed(seed: u64, iteration: u64) -> u64 {
 // in its two parts (in points alone, and the leaves left); its plies are the
 // simmer's to read until the next
 fn rollout(
-    simmer: &mut simmer::Simmer,
+    simmer: &mut simmer::Simmer<simmer::DefaultRng, u32, false, false>,
     game_config: &game_config::GameConfig,
     kwg: &Kwg,
     klv: &Klv,
@@ -1762,7 +1768,11 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
-    let mut simmer = simmer::Simmer::new(&game_config).map_err(err_to_str)?;
+    let mut simmer = simmer::Simmer::with_generator(
+        &game_config,
+        movegen::KurniaMoveGenerator::try_new(&game_config).map_err(err_to_str)?,
+    )
+    .map_err(err_to_str)?;
     simmer.set_opponents_pass(req.opponents_pass);
     simmer.prepare(
         &game_config,
@@ -2395,12 +2405,14 @@ fn points(equity: equity::Equity) -> f64 {
 impl Endgame {
     // one solve of at most ms on the clock, on the table earlier steps kept
     fn solve(&mut self, ms: f64, clock: endgame::Clock) -> Result<(), String> {
-        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
-            &self.game_config,
-            &self.kwg,
-            &self.arm_tables,
-        )
-        .map_err(err_to_str)?;
+        let mut solver =
+            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
+                &self.game_config,
+                &self.kwg,
+                &self.arm_tables,
+                movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
+            )
+            .map_err(err_to_str)?;
         if let Some(table) = self.table.take()
             && solver.give_table(table).is_err()
         {
@@ -2681,19 +2693,21 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     // into the endgame's own graph, as wolges's endgame command prunes its own:
     // the same answers, a far smaller graph to generate on
     let mut words = fash::MyHashSet::<bites::Bites>::default();
-    movegen::KurniaMoveGenerator::new(&game_config).gen_remaining_words(
-        &movegen::BoardSnapshot {
-            board_tiles: &kibitzer.board_tiles,
-            game_config: &game_config,
-            kwg: &kwg.kwg,
-            anagrams: None,
-            rack_lengths: None,
-            klv: &Klv::empty().map_err(err_to_str)?,
-        },
-        |word: &[u8]| {
-            words.insert(word.into());
-        },
-    );
+    movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+        .map_err(err_to_str)?
+        .gen_remaining_words(
+            &movegen::BoardSnapshot {
+                board_tiles: &kibitzer.board_tiles,
+                game_config: &game_config,
+                kwg: &kwg.kwg,
+                anagrams: None,
+                rack_lengths: None,
+                klv: &Klv::empty().map_err(err_to_str)?,
+            },
+            |word: &[u8]| {
+                words.insert(word.into());
+            },
+        );
     let mut words = words.into_iter().collect::<Vec<_>>();
     words.sort_unstable();
     let bytes = match game_config.game_rules() {
@@ -3402,7 +3416,7 @@ mod tests {
         let play = serde_json::from_str::<SimPlay>(CATS).unwrap().to_play();
         let mut wolges = infer::kept_leaves_lean(
             &mut infer::InferTables::new(&game_config, &klv.klv).unwrap(),
-            &mut movegen::KurniaMoveGenerator::new(&game_config),
+            &mut movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config).unwrap(),
             &movegen::BoardSnapshot {
                 board_tiles: &kibitzer.board_tiles,
                 game_config: &game_config,
@@ -4525,12 +4539,14 @@ mod tests {
         .unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
         let arm_tables = anagrams::ArmTables::None;
-        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
-            &game_config,
-            &kwg.kwg,
-            &arm_tables,
-        )
-        .unwrap();
+        let mut solver =
+            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
+                &game_config,
+                &kwg.kwg,
+                &arm_tables,
+                movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
+            )
+            .unwrap();
         let mut sorted = rack.to_vec();
         sorted.sort_unstable();
         solver.init(&kibitzer.board_tiles, [&sorted, &others]);
@@ -4580,10 +4596,18 @@ mod tests {
             let board = serde_json::from_str::<Vec<Vec<i8>>>(&board).unwrap();
             kibitzer.prepare(&game_config, &rack, &board).unwrap();
             let arm_tables = anagrams::ArmTables::None;
-            let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
+            let mut solver = endgame::EndgameSolver::<
+                kwg::Node24,
+                kwg::Node24,
+                true,
+                u32,
+                false,
+                false,
+            >::with_generator(
                 &game_config,
                 &kwg.kwg,
                 &arm_tables,
+                movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
             .unwrap();
             let mut sorted = rack.to_vec();
@@ -4705,12 +4729,14 @@ mod tests {
         .unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
         let arm_tables = anagrams::ArmTables::None;
-        let mut solver = endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true>::new(
-            &game_config,
-            &kwg.kwg,
-            &arm_tables,
-        )
-        .unwrap();
+        let mut solver =
+            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
+                &game_config,
+                &kwg.kwg,
+                &arm_tables,
+                movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
+            )
+            .unwrap();
         let mut sorted = rack.to_vec();
         sorted.sort_unstable();
         let result = solver
