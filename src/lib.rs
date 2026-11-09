@@ -2220,12 +2220,13 @@ fn page_clock() -> std::time::Duration {
     std::time::Duration::from_secs_f64(step_clock().max(0.0) / 1000.0)
 }
 
-// endgame_new: a position whose bag holds at most one tile (rack, board,
-// lexicon, rules, each seat's score in points, the seat to move, and the
-// scoreless turns and the passes in a row so far), and the most memory the wasm
-// may hold while it solves, in MiB. With none given, the solver's table grows
-// until the page refuses it more; a caller whose page may be refused sooner
-// than it can cope with (a phone's browser) gives one
+// endgame_new: a position (rack, board, lexicon, rules, each seat's score in
+// points, the seat to move, and the scoreless turns and the passes in a row so
+// far), and the most memory the wasm may hold while it solves, in MiB. With
+// none given, the solver's table grows until the page refuses it more; a caller
+// whose page may be refused sooner than it can cope with (a phone's browser)
+// gives one. With a tile in the bag the rack is full; with two or more, the
+// model and the exchanges below are the position's too
 #[derive(serde::Deserialize)]
 struct EndgameNewRequest {
     rack: Vec<u8>,
