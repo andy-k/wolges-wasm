@@ -2254,6 +2254,9 @@ struct EndgameNewRequest {
     model: Option<String>,
     #[serde(default)]
     exchanges: Option<[i16; 2]>,
+    // an endgame whose graph and table this one takes (an empty bag's what-if)
+    #[serde(default)]
+    warm_from: Option<u32>,
 }
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer
@@ -2344,8 +2347,10 @@ struct EndgameAnswer {
 // two or more's), and the last answer
 struct Endgame {
     game_config: std::sync::Arc<game_config::GameConfig>,
-    kwg: Box<Kwg>,
-    arm_tables: Box<anagrams::ArmTables>,
+    kwg: std::sync::Arc<Kwg>,
+    arm_tables: std::sync::Arc<anagrams::ArmTables>,
+    lexicon: String, // the lexicon its graph was pruned from
+    rules: String,   // and the rules it was asked of
     board_tiles: Vec<u8>,
     rack: Vec<u8>,
     unseen: Vec<u8>,
@@ -2705,42 +2710,95 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     };
     let mut rack = req.rack;
     rack.sort_unstable();
-    // the lexicon's words the board can still take, whatever the racks, made
-    // into the endgame's own graph, as wolges's endgame command prunes its own:
-    // the same answers, a far smaller graph to generate on
-    let mut words = fash::MyHashSet::<bites::Bites>::default();
-    movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-        .map_err(err_to_str)?
-        .gen_remaining_words(
-            &movegen::BoardSnapshot {
-                board_tiles: &kibitzer.board_tiles,
-                game_config: &game_config,
-                kwg: &kwg.kwg,
-                anagrams: None,
-                rack_lengths: None,
-                klv: &Klv::empty().map_err(err_to_str)?,
-            },
-            |word: &[u8]| {
-                words.insert(word.into());
-            },
-        );
-    let mut words = words.into_iter().collect::<Vec<_>>();
-    words.sort_unstable();
-    let bytes = match game_config.game_rules() {
-        game_config::GameRules::Classic => build::build_big(
-            build::BuildContent::Gaddawg,
-            build::BuildLayout::Wolges,
-            build::BuildOrder::Sorted,
-            &words,
-        ),
-        game_config::GameRules::Jumbled => build::build_big(
-            build::BuildContent::DawgOnly,
-            build::BuildLayout::Wolges,
-            build::BuildOrder::Sorted,
-            &build::make_alphagrams(&words),
-        ),
-    }
-    .map_err(err_to_str)?;
+    // a what-if warmed by an endgame before it (warm_from): with the bag empty
+    // in both, of the same rules and lexicon, on a board holding every tile of
+    // that one's on its square, the new one takes that one's graph (its words
+    // are all this board can still take) and its table, which then leaves that
+    // one, whose later steps start cold
+    let warm = match req.warm_from {
+        None => None,
+        Some(from) => {
+            let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+            let source = endgames
+                .live
+                .get_mut(&from)
+                .ok_or_else(|| format!("warm_from: {}", no_endgame(from)))?;
+            if in_bag || source.in_bag {
+                return Err("warm_from: both endgames must have an empty bag".into());
+            }
+            if source.rules != req.rules || source.lexicon != req.lexicon {
+                return Err(format!(
+                    "warm_from: endgame {from} has other rules or another lexicon"
+                ));
+            }
+            if (source.board_tiles.iter())
+                .zip(&kibitzer.board_tiles)
+                .any(|(&was, &now)| was != 0 && was != now)
+            {
+                return Err(format!(
+                    "warm_from: the board lacks a tile of endgame {from}'s board"
+                ));
+            }
+            // the source's own game_config too: a table goes only to a solver
+            // of the very tables it was made with
+            Some((
+                std::sync::Arc::clone(&source.game_config),
+                std::sync::Arc::clone(&source.kwg),
+                std::sync::Arc::clone(&source.arm_tables),
+                source
+                    .table
+                    .take()
+                    .map(endgame::KeptTable::for_another_root),
+            ))
+        }
+    };
+    let (game_config, kwg, arm_tables, table) = match warm {
+        Some(warm) => warm,
+        None => {
+            // the lexicon's words the board can still take, whatever the racks, made
+            // into the endgame's own graph, as wolges's endgame command prunes its own:
+            // the same answers, a far smaller graph to generate on
+            let mut words = fash::MyHashSet::<bites::Bites>::default();
+            movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+                .map_err(err_to_str)?
+                .gen_remaining_words(
+                    &movegen::BoardSnapshot {
+                        board_tiles: &kibitzer.board_tiles,
+                        game_config: &game_config,
+                        kwg: &kwg.kwg,
+                        anagrams: None,
+                        rack_lengths: None,
+                        klv: &Klv::empty().map_err(err_to_str)?,
+                    },
+                    |word: &[u8]| {
+                        words.insert(word.into());
+                    },
+                );
+            let mut words = words.into_iter().collect::<Vec<_>>();
+            words.sort_unstable();
+            let bytes = match game_config.game_rules() {
+                game_config::GameRules::Classic => build::build_big(
+                    build::BuildContent::Gaddawg,
+                    build::BuildLayout::Wolges,
+                    build::BuildOrder::Sorted,
+                    &words,
+                ),
+                game_config::GameRules::Jumbled => build::build_big(
+                    build::BuildContent::DawgOnly,
+                    build::BuildLayout::Wolges,
+                    build::BuildOrder::Sorted,
+                    &build::make_alphagrams(&words),
+                ),
+            }
+            .map_err(err_to_str)?;
+            (
+                std::sync::Arc::clone(&game_config),
+                std::sync::Arc::new(Kwg::from_bytes_alloc(&bytes).map_err(err_to_str)?),
+                std::sync::Arc::new(anagrams::ArmTables::None),
+                None,
+            )
+        }
+    };
     let peg_bag = match bag_search {
         Some((model, exchanges)) => Some(
             endgame::PegBagProgress::new(endgame::PegBagPosition {
@@ -2771,8 +2829,10 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
     let endgame = Endgame {
         game_config,
-        kwg: Box::new(Kwg::from_bytes_alloc(&bytes).map_err(err_to_str)?),
-        arm_tables: Box::new(anagrams::ArmTables::None),
+        kwg,
+        arm_tables,
+        lexicon: req.lexicon,
+        rules: req.rules,
         board_tiles: kibitzer.board_tiles.clone(),
         rack,
         unseen,
@@ -2784,7 +2844,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         pass_turns: req.pass_turns,
         zero_turns: req.zero_turns,
         max_memory,
-        table: None,
+        table,
         peg,
         finished: None,
         nodes: 0,
@@ -4965,6 +5025,71 @@ mod tests {
             let handle = endgame_of("tiny-end-cap", &[S], &[A, T], more).unwrap();
             let max_memory = ENDGAMES.lock().unwrap().live[&handle].max_memory;
             assert_eq!(max_memory, cap, "{more}");
+            do_endgame_free(handle).unwrap();
+        }
+    }
+
+    // a what-if warmed by an endgame before it answers as a cold one does, on
+    // fewer nodes, taking that one's table; refused with tiles in the bag, on a
+    // board lacking a tile of that one's, or from no such endgame
+    #[test]
+    fn a_warm_what_if_answers_as_a_cold_one() {
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let lexicon = "tiny-end-warm";
+        let cold = endgame_of(lexicon, &rack, &others, "").unwrap();
+        let cold_answer = endgame_step(cold, r#"{"ms":60000}"#);
+        assert_eq!(cold_answer["exact"], true);
+        let source = endgame_of(lexicon, &rack, &others, "").unwrap();
+        assert_eq!(endgame_step(source, r#"{"ms":60000}"#), cold_answer);
+        let warm = endgame_of(
+            lexicon,
+            &rack,
+            &others,
+            &format!(r#","warm_from":{source}"#),
+        )
+        .unwrap();
+        let warm_answer = endgame_step(warm, r#"{"ms":60000}"#);
+        assert_eq!(warm_answer["exact"], true);
+        for field in ["play", "value", "spread", "line"] {
+            assert_eq!(warm_answer[field], cold_answer[field], "{field}");
+        }
+        assert!(
+            warm_answer["nodes"].as_u64().unwrap() < cold_answer["nodes"].as_u64().unwrap(),
+            "{warm_answer} {cold_answer}"
+        );
+        // the source keeps its answer; its table left it
+        assert_eq!(endgame_step(source, r#"{"ms":0}"#), cold_answer);
+
+        // a board lacking a tile of the source's
+        let late = serde_json::from_str::<Vec<Vec<i8>>>(&late_board(
+            &rack.iter().chain(&others).copied().collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        let mut lacking = late.clone();
+        lacking[2][8] = 0;
+        let err = do_endgame_new(&format!(
+            r#"{{"rack":[{S},{E},{A},{T},{T}],"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"warm_from":{warm}}}"#,
+            serde_json::to_string(&lacking).unwrap()
+        ))
+        .unwrap_err();
+        assert!(err.contains("lacks a tile"), "{err}");
+        // tiles in the bag
+        let bag = endgame_of(
+            lexicon,
+            &[S, E, A, T, C, A, T],
+            &[A, T, E, S, E, A, T, E],
+            "",
+        )
+        .unwrap();
+        let err =
+            endgame_of(lexicon, &rack, &others, &format!(r#","warm_from":{bag}"#)).unwrap_err();
+        assert!(err.contains("empty bag"), "{err}");
+        // no such endgame
+        do_endgame_free(cold).unwrap();
+        let err =
+            endgame_of(lexicon, &rack, &others, &format!(r#","warm_from":{cold}"#)).unwrap_err();
+        assert!(err.contains("freed"), "{err}");
+        for handle in [source, warm, bag] {
             do_endgame_free(handle).unwrap();
         }
     }
