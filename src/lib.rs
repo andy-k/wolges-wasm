@@ -160,6 +160,8 @@ fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
 // lexicon: kwg.
 // leave: klv.
 // rules: hardcoded on startup.
+// exchanges: how many exchanges the rack's player has made (0 if not given),
+//  so rules with a cap offer none past it.
 #[derive(serde::Deserialize)]
 struct AnalyzeRequest {
     rack: Vec<u8>,
@@ -170,6 +172,8 @@ struct AnalyzeRequest {
     lexicon: String,
     leave: String,
     rules: String,
+    #[serde(default)]
+    exchanges: i16,
 }
 
 #[derive(serde::Deserialize)]
@@ -415,6 +419,9 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
+    if req.exchanges < 0 {
+        return_js_error!(format!("exchanges: must be >= 0, found {}", req.exchanges));
+    }
     if !kwg.fits_alphabet(game_config.alphabet().len()) {
         return_js_error!(format!(
             "lexicon: has tiles the {:?} rules do not have",
@@ -477,7 +484,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
                 board_snapshot,
                 rack: &req.rack,
                 max_gen: req.max_gen,
-                num_exchanges_by_this_player: 0, // TODO: this should be specified externally
+                num_exchanges_by_this_player: req.exchanges,
                 pass_policy: movegen::PassPolicy::OnlyWhenForced,
                 dynamic_leaves: None,
             },
@@ -2684,6 +2691,9 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         };
         let exchanges = (req.exchanges)
             .ok_or_else(|| format!("exchanges: each seat's, with {bag} tiles in the bag"))?;
+        if exchanges.iter().any(|&made| made < 0) {
+            return Err(format!("exchanges: each must be >= 0, found {exchanges:?}"));
+        }
         Some((model, exchanges))
     } else {
         None
@@ -2845,6 +2855,23 @@ fn do_endgame_free(handle: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // analyze takes the exchanges the rack's player has made, none if not
+    // given, as wolges's i16 (a count past it is refused as the request is
+    // read; one below none, by do_analyze)
+    #[test]
+    fn analyze_takes_the_players_exchanges() {
+        let base = r#""rack":[1],"board":[],"count":1,"lexicon":"x","leave":"y","rules":"z""#;
+        let given =
+            serde_json::from_str::<AnalyzeRequest>(&format!("{{{base},\"exchanges\":3}}")).unwrap();
+        assert_eq!(given.exchanges, 3);
+        let none = serde_json::from_str::<AnalyzeRequest>(&format!("{{{base}}}")).unwrap();
+        assert_eq!(none.exchanges, 0);
+        assert!(
+            serde_json::from_str::<AnalyzeRequest>(&format!("{{{base},\"exchanges\":32768}}"))
+                .is_err()
+        );
+    }
 
     // the rules are wolges's own, fixed when the wasm is built, so the
     // reckoning of each one's best play that a game made at run time needs is
@@ -4959,6 +4986,12 @@ mod tests {
                 &[A, T, E, S, E, A, T, E, E][..],
                 r#","model":"info_sets""#,
                 "exchanges: each seat's, with 2 tiles in the bag",
+            ),
+            (
+                &full[..],
+                &[A, T, E, S, E, A, T, E, E][..],
+                r#","model":"info_sets","exchanges":[0,-1]"#,
+                "exchanges: each must be >= 0, found [0, -1]",
             ),
             (
                 &[S, E, A, T][..],
