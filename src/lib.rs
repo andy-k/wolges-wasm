@@ -2450,8 +2450,10 @@ impl Endgame {
                     return Err(e);
                 }
             };
-            // the search's margins are the leads the game ends with
-            let value = points(peg.expected_margin) - lead;
+            // the search's margins are the leads the game ends with; none yet
+            // when a limit stopped it before it valued a move, as before a step
+            let valued = peg.best_move.is_some();
+            let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
             EndgameAnswer {
                 bag: self.bag,
@@ -2459,11 +2461,11 @@ impl Endgame {
                 nodes,
                 exact: peg.exact,
                 play: peg.best_move.as_ref().map(Into::into),
-                value: Some(value),
-                spread: lead + value,
+                value,
+                spread: lead + value.unwrap_or(0.0),
                 depth: Some(peg.depth),
                 line: None,
-                win: Some(peg.win_pct),
+                win: valued.then_some(peg.win_pct),
                 tiles: None,
                 draws: Some(
                     (peg.hypotheses.iter())
@@ -2499,8 +2501,11 @@ impl Endgame {
                     return Err(e);
                 }
             };
-            // the search's margins are the leads the game ends with
-            let value = points(peg.expected_margin) - lead;
+            // the search's margins are the leads the game ends with; none yet
+            // when a limit stopped it before a pass valued every tile, as
+            // before a step
+            let valued = !peg.hypotheses.is_empty();
+            let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
             EndgameAnswer {
                 bag: 1,
@@ -2513,11 +2518,11 @@ impl Endgame {
                     },
                     endgame::PegMove::Place(play) => (&play).into(),
                 }),
-                value: Some(value),
-                spread: lead + value,
+                value,
+                spread: lead + value.unwrap_or(0.0),
                 depth: Some(peg.depth),
                 line: None,
-                win: Some(peg.win_pct as f64),
+                win: valued.then_some(peg.win_pct as f64),
                 tiles: Some(
                     (peg.hypotheses.iter())
                         .map(|&(tile, count, margin)| EndgameBagTile {
