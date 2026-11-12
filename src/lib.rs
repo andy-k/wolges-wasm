@@ -2292,12 +2292,14 @@ struct EndgameBagDraw {
 }
 
 // a play the search with two tiles or more in the bag valued: the share of the
-// deals it wins (a tie counted half) and its mean gain, in points
+// deals it wins (a tie counted half) and its mean gain, in points; and whether
+// its value is exact
 #[derive(serde::Serialize)]
 struct EndgameCandidate {
     play: kibitzer::JsonPlay,
     win: f64,
     value: f64,
+    exact: bool,
 }
 
 // endgame_step's answer: the bag's tiles, the steps that solved and the nodes
@@ -2487,6 +2489,7 @@ impl Endgame {
                             play: (&valued.play).into(),
                             win: valued.win_pct,
                             value: points(valued.expected_margin) - lead,
+                            exact: valued.exact,
                         })
                         .collect(),
                 ),
