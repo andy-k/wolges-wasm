@@ -1,7 +1,13 @@
-from rust:1.99.1
+from debian:13.7
+
+# rust from rustup at the version named here, where the rust images keep it
+# (so panic messages name the registry's sources as before)
+env RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+run ["apt-get", "update"]
+run ["apt-get", "install", "-y", "--no-install-recommends", "ca-certificates", "curl", "gcc", "libc6-dev", "git"]
+run curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.100.0 --target wasm32-unknown-unknown
 
 run ["cargo", "install", "wasm-pack", "--locked"]
-run ["rustup", "target", "add", "wasm32-unknown-unknown"]
 
 workdir /workdir
 
