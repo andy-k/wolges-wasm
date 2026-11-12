@@ -2458,7 +2458,7 @@ impl Endgame {
                 steps,
                 nodes,
                 exact: peg.exact,
-                play: Some((&peg.best_move).into()),
+                play: peg.best_move.as_ref().map(Into::into),
                 value: Some(value),
                 spread: lead + value,
                 depth: Some(peg.depth),
@@ -4783,7 +4783,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let play: kibitzer::JsonPlay = (&result.best_move).into();
+        let play: kibitzer::JsonPlay = result.best_move.as_ref().unwrap().into();
         assert_eq!(
             answer["play"],
             serde_json::to_value(&play).unwrap(),
