@@ -2222,6 +2222,13 @@ fn held_bytes() -> usize {
     HELD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// the bytes the wasm holds now, as an endgame's memory cap counts them: what a
+// page reads after endgame_new to size each worker's share of the memory
+#[wasm_bindgen]
+pub fn memory_held() -> f64 {
+    held_bytes() as f64
+}
+
 // the page's clock as an endgame reads it: performance.now, as a sim's step's
 fn page_clock() -> std::time::Duration {
     std::time::Duration::from_secs_f64(step_clock().max(0.0) / 1000.0)
@@ -4783,6 +4790,14 @@ mod tests {
 
     fn endgame_step(handle: u32, req: &str) -> serde_json::Value {
         report(&do_endgame_step(handle, req, frozen).unwrap())
+    }
+
+    // the bytes held count every byte live, so never fewer than a buffer kept
+    #[test]
+    fn the_wasm_says_how_many_bytes_it_holds() {
+        let kept = std::hint::black_box(vec![1u8; 1 << 20]);
+        assert!(memory_held() >= kept.len() as f64);
+        drop(kept);
     }
 
     // an empty bag asked for every first move's value: each exact, best first,
