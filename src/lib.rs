@@ -1949,9 +1949,10 @@ fn opponent_leaves(
 // opp_rack_size (a rack's tiles, or all unseen when fewer); what the opponent
 // holds as sim_new takes it (one of known, kept (or leaves) and inferred; none:
 // a rack dealt from the tiles unseen); count, how many best plays to list (all
-// if not given); ms, a time to run, listing included (none: no limit); seed,
-// for the racks drawn when ms runs out. The tiles the watcher would draw stay
-// unseen, so a board with a play on it asks after it.
+// if not given); ms, a time to run, listing included (none: no limit;
+// threats_new ignores it); seed, for the racks drawn when ms runs out. The
+// tiles the watcher would draw stay unseen, so a board with a play on it asks
+// after it.
 #[derive(serde::Deserialize)]
 struct ThreatsRequest {
     #[serde(default)]
@@ -2222,6 +2223,20 @@ struct Threats {
     rng: rand::rngs::ChaCha20Rng,
     list_ms: f64,
     listed: f64, // when listing every play ended
+}
+
+// the threats made, by handle; a handle is never used twice
+#[derive(Default)]
+struct ThreatsMade {
+    made: u32,
+    live: fash::MyHashMap<u32, Threats>,
+}
+
+static THREATS: std::sync::LazyLock<std::sync::Mutex<ThreatsMade>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn no_threats(handle: u32) -> String {
+    format!("threats {handle}: none such, or freed")
 }
 
 // what threats is asked, every play listed (ms not read)
@@ -2603,6 +2618,60 @@ fn do_threats(req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
     let listed = threats.listed;
     let half = deadline.map(|deadline| listed + (deadline - listed).max(0.0) / 2.0);
     threats.step(half, deadline, &now)
+}
+
+// threats_new: a threats question as threats takes it (ms not read), every play
+// listed now, its racks left to threats_step; its handle
+#[wasm_bindgen]
+pub fn threats_new(req_str: String) -> Result<u32, JsValue> {
+    Ok(do_threats_new(&req_str, step_clock)?)
+}
+
+fn do_threats_new(req_str: &str, now: impl Fn() -> f64) -> Result<u32, String> {
+    let req = serde_json::from_str::<ThreatsRequest>(req_str).map_err(err_to_str)?;
+    let threats = threats_made(req, &now)?;
+    let mut made = THREATS.lock().map_err(err_to_str)?;
+    let handle = made.made.checked_add(1).ok_or("too many threats made")?;
+    made.made = handle;
+    made.live.insert(handle, threats);
+    Ok(handle)
+}
+
+// threats_step: ms, a time to run (none: every rack counted). The racks not yet
+// counted counted exactly in the first half of it, then racks drawn from those
+// left in the rest; the answer as threats gives it, exact once every rack is
+// counted
+#[derive(serde::Deserialize)]
+struct ThreatsStepRequest {
+    ms: Option<f64>,
+}
+
+#[wasm_bindgen]
+pub fn threats_step(threats: u32, req_str: String) -> Result<String, JsValue> {
+    Ok(do_threats_step(threats, &req_str, step_clock)?)
+}
+
+fn do_threats_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
+    let req = serde_json::from_str::<ThreatsStepRequest>(req_str).map_err(err_to_str)?;
+    let deadline = threats_deadline(req.ms, &now)?;
+    let half = (req.ms.zip(deadline)).map(|(ms, deadline)| deadline - ms / 2.0);
+    let mut made = THREATS.lock().map_err(err_to_str)?;
+    let threats = (made.live.get_mut(&handle)).ok_or_else(|| no_threats(handle))?;
+    threats.step(half, deadline, &now)
+}
+
+// a threats question let go, with the plays and racks it holds
+#[wasm_bindgen]
+pub fn threats_free(threats: u32) -> Result<(), JsValue> {
+    Ok(do_threats_free(threats)?)
+}
+
+fn do_threats_free(handle: u32) -> Result<(), String> {
+    let mut made = THREATS.lock().map_err(err_to_str)?;
+    made.live
+        .remove(&handle)
+        .map(|_| ())
+        .ok_or_else(|| no_threats(handle))
 }
 
 #[wasm_bindgen]
@@ -6566,5 +6635,56 @@ mod tests {
         for play in answer["plays"].as_array().unwrap() {
             assert_near(&play["chance"], 1.0);
         }
+    }
+
+    // threats a step at a time: a step of no time counts 16 racks, the
+    // likeliest, and draws 16 from the rest, as threats with ms does; a step
+    // with no ms counts the rest, the answer then exact and as threats gives
+    // it. Freed once only, and no step after.
+    #[test]
+    fn threats_step_count_every_rack_in_the_end() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        tiny_lexicon("tiny-threats");
+        let req = format!(
+            r#"{{"rack":{},"board":{},"lexicon":"tiny-threats","rules":"CrosswordGame","seed":7}}"#,
+            serde_json::to_string(&rack).unwrap(),
+            threats_board(&unseen, &rack),
+        );
+        let clock = std::cell::Cell::new(0.0);
+        let now = || {
+            let time = clock.get();
+            clock.set(time + 1.0);
+            time
+        };
+        let handle = do_threats_new(&req, now).unwrap();
+        let step = |ms: &str| {
+            let answer = do_threats_step(handle, &format!(r#"{{{ms}}}"#), now).unwrap();
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap()
+        };
+        let first = step(r#""ms":0"#);
+        assert_eq!(first["exact"], false);
+        assert_near(&first["covered"], 23.0 / 36.0);
+        assert_eq!(first["samples"], 16);
+        for play in first["plays"].as_array().unwrap() {
+            assert_near(&play["chance"], 35.0 / 36.0);
+        }
+        let mut last = step("");
+        assert_eq!(last["exact"], true);
+        assert_eq!(last["covered"], 1.0);
+        assert_eq!(last["samples"], 0);
+        let mut all = threats_of(&unseen, &rack, "");
+        for answer in [&mut last, &mut all] {
+            answer.as_object_mut().unwrap().remove("list_ms");
+            for play in answer["plays"].as_array_mut().unwrap() {
+                let chance = play["chance"].as_f64().unwrap();
+                play["chance"] = serde_json::json!((chance * 1e9).round());
+            }
+        }
+        assert_eq!(last, all);
+        assert_eq!(do_threats_free(handle), Ok(()));
+        let gone = format!("threats {handle}: none such, or freed");
+        assert_eq!(do_threats_free(handle), Err(gone.clone()));
+        assert_eq!(do_threats_step(handle, "{}", now), Err(gone));
     }
 }
