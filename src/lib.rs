@@ -2259,10 +2259,14 @@ struct EndgameNewRequest {
     warm_from: Option<u32>,
 }
 
-// endgame_step: at most this many milliseconds; 0 reads the last answer
+// endgame_step: at most this many milliseconds; 0 reads the last answer. With
+// an empty bag, first_moves_ms asks for every first move's value too, on the
+// table the steps kept, in at most that many milliseconds more
 #[derive(serde::Deserialize)]
 struct EndgameStepRequest {
     ms: Option<f64>,
+    #[serde(default)]
+    first_moves_ms: Option<f64>,
 }
 
 // a ply of an endgame's line: the play, and its mover's gain on the other from
@@ -2291,9 +2295,9 @@ struct EndgameBagDraw {
     value: f64,
 }
 
-// a play the search with two tiles or more in the bag valued: the share of the
-// deals it wins (a tie counted half) and its mean gain, in points; and whether
-// its value is exact
+// a play the search valued: the share of the deals it wins (a tie counted half;
+// with an empty bag, 1, a half, or 0 by the lead it ends with) and its mean
+// gain, in points; and whether its value is exact
 #[derive(serde::Serialize)]
 struct EndgameCandidate {
     play: kibitzer::JsonPlay,
@@ -2604,6 +2608,74 @@ impl Endgame {
         self.answer.take(answer, self.in_bag);
         Ok(())
     }
+
+    // with an empty bag, every first move's value, on the table the steps kept,
+    // in at most ms milliseconds, into the answer's candidates: best first,
+    // each exact once no line is cut short; one a limit stopped before its
+    // first depth is left out
+    fn value_first_moves(&mut self, ms: f64, clock: endgame::Clock) -> Result<(), String> {
+        let mut solver =
+            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
+                &self.game_config,
+                &self.kwg,
+                &self.arm_tables,
+                movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
+            )
+            .map_err(err_to_str)?;
+        if let Some(table) = self.table.take()
+            && solver.give_table(table).is_err()
+        {
+            return Err("endgame: its table belongs to other tables".into());
+        }
+        solver.set_clock(clock);
+        let limits = endgame::Limits {
+            time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+            states: None,
+            memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
+                bytes,
+                held: held_bytes,
+            }),
+        };
+        let lead = points(equity::Equity::new(self.lead));
+        let mut racks = [Vec::new(), Vec::new()];
+        racks[self.turn as usize].extend_from_slice(&self.rack);
+        racks[1 - self.turn as usize].extend(
+            (0u8..)
+                .zip(&self.unseen)
+                .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
+        );
+        solver.init_after_scoreless_turns(
+            &self.board_tiles,
+            [&racks[0], &racks[1]],
+            self.pass_turns,
+            self.zero_turns,
+        );
+        let valued = solver.value_first_moves(self.turn, &limits);
+        self.nodes += solver.searched();
+        self.table = Some(solver.take_table());
+        let valued = valued.map_err(err_to_str)?;
+        self.answer.candidates = Some(
+            (valued.iter())
+                .filter_map(|first| {
+                    let value = points(first.value?);
+                    let spread = lead + value;
+                    Some(EndgameCandidate {
+                        play: (&first.play).into(),
+                        win: if spread > 0.0 {
+                            1.0
+                        } else if spread < 0.0 {
+                            0.0
+                        } else {
+                            0.5
+                        },
+                        value,
+                        exact: first.exact,
+                    })
+                })
+                .collect(),
+        );
+        Ok(())
+    }
 }
 
 // a new endgame's handle
@@ -2901,6 +2973,18 @@ fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<
     // an exact answer stays: no solve can better it
     if ms > 0.0 && !endgame.answer.exact {
         endgame.solve(ms, clock)?;
+    }
+    match req.first_moves_ms {
+        None => {}
+        Some(ms) if !(ms >= 0.0 && ms.is_finite()) => {
+            return Err(format!("first_moves_ms: {ms} is not a time to run"));
+        }
+        Some(_) if endgame.bag != 0 => {
+            return Err(
+                "first_moves_ms: with tiles in the bag every move is valued in candidates".into(),
+            );
+        }
+        Some(ms) => endgame.value_first_moves(ms, clock)?,
     }
     serde_json::to_string(&endgame.answer).map_err(err_to_str)
 }
@@ -4600,6 +4684,40 @@ mod tests {
 
     fn endgame_step(handle: u32, req: &str) -> serde_json::Value {
         report(&do_endgame_step(handle, req, frozen).unwrap())
+    }
+
+    // an empty bag asked for every first move's value: each exact, best first,
+    // the first the answer's play and value, none worth more; with tiles in the
+    // bag the asking is refused (candidates hold them already)
+    #[test]
+    fn an_endgame_values_every_first_move_when_asked() {
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let handle = endgame_of("tiny-end-first", &rack, &others, "").unwrap();
+        let plain = endgame_step(handle, r#"{"ms":60000}"#);
+        assert!(plain.get("candidates").is_none(), "{plain}");
+        let answer = endgame_step(handle, r#"{"ms":0,"first_moves_ms":60000}"#);
+        let candidates = answer["candidates"].as_array().unwrap();
+        assert!(candidates.len() > 1, "{answer}");
+        assert_eq!(candidates[0]["value"], answer["value"]);
+        assert!(candidates.iter().all(|c| c["exact"] == true), "{answer}");
+        let best = answer["value"].as_f64().unwrap();
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c["value"].as_f64().unwrap() <= best),
+            "{answer}"
+        );
+        for pair in candidates.windows(2) {
+            assert!(pair[0]["value"].as_f64() >= pair[1]["value"].as_f64());
+        }
+        let bag = endgame_of(
+            "tiny-end-first-bag",
+            &[S, E, A, T, C, A, T],
+            &[A, T, E, S, E, A, T, E],
+            "",
+        )
+        .unwrap();
+        assert!(do_endgame_step(bag, r#"{"ms":0,"first_moves_ms":1}"#, frozen).is_err());
     }
 
     // an empty bag: the other side holds the tiles unseen, and the answer is
