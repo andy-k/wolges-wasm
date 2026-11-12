@@ -2257,6 +2257,12 @@ struct EndgameNewRequest {
     // an endgame whose graph and table this one takes (an empty bag's what-if)
     #[serde(default)]
     warm_from: Option<u32>,
+    // with two tiles or more in the bag, part k of n: the search values only
+    // the splits whose index is k mod n, so n endgames (a page's workers), one
+    // a part, value every split between them once; each candidate's draws of
+    // all n, weighed by their counts, are the whole search's
+    #[serde(default)]
+    part: Option<[usize; 2]>,
 }
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer. With
@@ -2378,6 +2384,9 @@ struct EndgameAnswer {
     endgames: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     moves: Option<[usize; 2]>,
+    // the part of the search it is, k of n (endgame_new's part)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part: Option<[usize; 2]>,
 }
 
 // an endgame a caller steps and frees: its rules and its own word graph, of the
@@ -2504,7 +2513,9 @@ impl Endgame {
             let valued = peg.best_move.is_some();
             let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
+            let (k, n) = progress.part_of();
             EndgameAnswer {
+                part: (n > 1).then_some([k, n]),
                 bag: self.bag,
                 steps,
                 nodes,
@@ -2557,6 +2568,7 @@ impl Endgame {
             let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
             EndgameAnswer {
+                part: None,
                 bag: 1,
                 steps,
                 nodes,
@@ -2631,6 +2643,7 @@ impl Endgame {
             solver.collect_pv(self.turn, &mut line);
             let value = points(solved.value);
             EndgameAnswer {
+                part: None,
                 bag: 0,
                 steps,
                 nodes: self.nodes,
@@ -2939,8 +2952,8 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         }
     };
     let peg_bag = match bag_search {
-        Some((model, exchanges)) => Some(
-            endgame::PegBagProgress::new(endgame::PegBagPosition {
+        Some((model, exchanges)) => {
+            let mut progress = endgame::PegBagProgress::new(endgame::PegBagPosition {
                 mover: req.turn,
                 board: kibitzer.board_tiles.clone(),
                 mover_rack: rack.clone(),
@@ -2950,8 +2963,17 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
                 exchanges,
                 model,
             })
-            .map_err(err_to_str)?,
-        ),
+            .map_err(err_to_str)?;
+            if let Some([k, n]) = req.part {
+                progress.part(k, n).map_err(err_to_str)?;
+            }
+            Some(progress)
+        }
+        None if req.part.is_some() => {
+            return Err(format!(
+                "part: with two tiles or more in the bag, found {bag} in it"
+            ));
+        }
         None => None,
     };
     let peg = (bag == 1).then(|| {
@@ -2988,6 +3010,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         finished: None,
         nodes: 0,
         answer: EndgameAnswer {
+            part: req.part.filter(|&[_, n]| n > 1),
             bag,
             steps: 0,
             nodes: 0,
@@ -4969,6 +4992,57 @@ mod tests {
         do_endgame_free(handle).unwrap();
     }
 
+    // two tiles in the bag searched in two parts (a page's two workers): each
+    // part says it is one, and each candidate's draws from both are the whole
+    // search's; a part with fewer than two tiles in the bag is refused
+    #[test]
+    fn an_endgame_in_parts_draws_what_the_whole_does() {
+        let rack = [S, E, A, T, C, A, T];
+        let others = [A, T, E, S, E, A, T, E, E];
+        let solve = |part: &str| {
+            let more = format!(r#","model":"random_draws","exchanges":[0,0]{part}"#);
+            let handle = endgame_of("tiny-end-parts", &rack, &others, &more).unwrap();
+            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            do_endgame_free(handle).unwrap();
+            answer
+        };
+        let whole = solve("");
+        assert!(whole.get("part").is_none(), "{whole}");
+        let parts = [solve(r#","part":[0,2]"#), solve(r#","part":[1,2]"#)];
+        assert_eq!(parts[0]["part"], serde_json::json!([0, 2]));
+        assert_eq!(parts[1]["part"], serde_json::json!([1, 2]));
+        let mut merged = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for part in &parts {
+            assert_eq!(part["exact"], true, "{part}");
+            for candidate in part["candidates"].as_array().unwrap() {
+                let at = merged.entry(candidate["play"].to_string()).or_default();
+                for draw in candidate["draws"].as_array().unwrap() {
+                    at.push(draw.to_string());
+                }
+            }
+        }
+        let candidates = whole["candidates"].as_array().unwrap();
+        assert_eq!(merged.len(), candidates.len(), "{whole}");
+        for candidate in candidates {
+            let mut want = (candidate["draws"].as_array().unwrap().iter())
+                .map(|draw| draw.to_string())
+                .collect::<Vec<_>>();
+            let mut got = merged.remove(&candidate["play"].to_string()).unwrap();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "{candidate}");
+        }
+        assert!(
+            endgame_of(
+                "tiny-end-parts",
+                &[S, E, A, T],
+                &[A, T, E],
+                r#","part":[0,2]"#
+            )
+            .is_err()
+        );
+    }
+
     // two tiles in the bag: the answer is wolges's own search of the position
     // (random draws; info sets is taken the same way, but its search of even
     // this position is too long for a test), each set of tiles the bag may hold
@@ -5209,6 +5283,7 @@ mod tests {
     #[test]
     fn an_empty_bags_answer_gives_way_only_to_a_better_one() {
         let answer = |exact: bool, depth: i8, value: f64| EndgameAnswer {
+            part: None,
             bag: 0,
             steps: 1,
             nodes: 0,
