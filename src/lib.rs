@@ -1943,6 +1943,668 @@ fn opponent_leaves(
     Ok(OpponentLeaves::Inferred(leaves))
 }
 
+// threats: what the opponent may play next, by score alone (no leave is read).
+// A board, lexicon and rules as analyze takes them; the tiles unseen as unseen
+// (a count each tile) or as the rack of the one who watches, not both;
+// opp_rack_size (a rack's tiles, or all unseen when fewer); what the opponent
+// holds as sim_new takes it (one of known, kept (or leaves) and inferred; none:
+// a rack dealt from the tiles unseen); count, how many best plays to list (all
+// if not given); ms, a time to run, listing included (none: no limit); seed,
+// for the racks drawn when ms runs out. The tiles the watcher would draw stay
+// unseen, so a board with a play on it asks after it.
+#[derive(serde::Deserialize)]
+struct ThreatsRequest {
+    #[serde(default)]
+    rack: Vec<u8>,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    lexicon: String,
+    rules: String,
+    unseen: Option<Vec<u8>>,
+    opp_rack_size: Option<usize>,
+    #[serde(default)]
+    known: Vec<u8>,
+    #[serde(default, alias = "leaves")]
+    kept: Vec<WeightedLeave>,
+    inferred: Option<u32>,
+    count: Option<usize>,
+    ms: Option<f64>,
+    seed: Option<u64>,
+}
+
+// a play the opponent may make as analyze gives one (its score in points).
+// tiles: the tiles it places in tile order (0 for a blank). chance: the chance
+// the opponent's rack holds them.
+#[derive(serde::Serialize)]
+struct ThreatPlay {
+    #[serde(flatten)]
+    play: kibitzer::JsonPlay,
+    tiles: Vec<u8>,
+    chance: f64,
+}
+
+// an empty square. best: the best score in points of a play placing a tile on
+// it (0 if none does). chance: the chance the opponent holds a play that does
+// and scores that much. expected: the expected score in points of the
+// opponent's best play placing a tile on it (a rack with none scores 0).
+#[derive(serde::Serialize)]
+struct ThreatSquare {
+    best: i32,
+    chance: f64,
+    expected: f64,
+}
+
+// what the opponent may play, by its rack's chance of holding the tiles. exact:
+// false when ms ran out before every rack was counted, every chance and
+// expected score then the likeliest racks' exact sums plus an unbiased estimate
+// of the rest's from racks drawn among them. plays: the best first (those alike
+// in score in placement order).
+#[derive(serde::Serialize)]
+struct ThreatsAnswer {
+    racks: usize,       // how many distinct racks it may hold
+    count: usize,       // how many plays it may make of the tiles unseen
+    expected_best: f64, // its best play's expected score (0 with no play)
+    bingo: Option<f64>, // a whole rack's play's chance (null: a short rack)
+    covered: f64,       // the chance the racks counted exactly hold
+    samples: usize,     // how many racks were drawn
+    list_ms: f64,       // listing every play's time, which ms cannot cut
+    exact: bool,
+    plays: Vec<ThreatPlay>,
+    squares: Vec<Vec<Option<ThreatSquare>>>, // row by row; null where a tile is
+}
+
+// the ways to choose k of n, as a float
+fn choose(n: usize, k: usize) -> f64 {
+    (0..k).fold(1.0, |ways, i| ways * (n - i) as f64 / (i + 1) as f64)
+}
+
+// each way to deal more tiles from tally (a count each tile) from tile on,
+// found with the ways to deal it: held, the tiles dealt so far, in tile order,
+// and rest, the tiles in tally from each tile on
+fn deal(
+    tally: &[u8],
+    rest: &[usize],
+    tile: usize,
+    more: usize,
+    ways: f64,
+    held: &mut Vec<u8>,
+    found: &mut dyn FnMut(&[u8], f64),
+) {
+    if more == 0 {
+        found(held, ways);
+        return;
+    }
+    if rest[tile] < more {
+        return;
+    }
+    let len = held.len();
+    for take in 0..=more.min(tally[tile] as usize) {
+        if take > 0 {
+            held.push(tile as u8);
+        }
+        let ways = ways * choose(tally[tile] as usize, take);
+        deal(tally, rest, tile + 1, more - take, ways, held, found);
+    }
+    held.truncate(len);
+}
+
+// a play's squares it places a tile on, each as row * cols + col
+fn placed_squares(
+    (down, lane, idx, word): (bool, i8, i8, &[u8]),
+    cols: usize,
+) -> impl Iterator<Item = usize> + '_ {
+    (idx..)
+        .zip(word)
+        .filter(|&(_, &tile)| tile != 0)
+        .map(move |(i, _)| {
+            let (row, col) = if down { (i, lane) } else { (lane, i) };
+            row as usize * cols + col as usize
+        })
+}
+
+// a play the opponent may make, its tiles' multiset by its id, its word at word
+// in the buffer of every play's words
+struct ThreatFound {
+    down: bool,
+    lane: i8,
+    idx: i8,
+    word: std::ops::Range<u32>,
+    score: i32,
+    id: u32,
+}
+
+// the sums over racks of what the opponent may hold: each multiset's chance,
+// each square's chance and expected best, the best play's expected score and
+// the chance of a bingo
+struct ThreatSums {
+    holds: Vec<f64>,
+    square_chance: Vec<f64>,
+    square_expected: Vec<f64>,
+    expected_best: f64,
+    bingo: f64,
+}
+
+impl ThreatSums {
+    fn new(multisets: usize, squares: usize) -> Self {
+        Self {
+            holds: vec![0.0; multisets],
+            square_chance: vec![0.0; squares],
+            square_expected: vec![0.0; squares],
+            expected_best: 0.0,
+            bingo: 0.0,
+        }
+    }
+
+    // these sums plus each times those
+    fn plus(mut self, those: &Self, each: f64) -> Self {
+        let add = |sums: &mut [f64], more: &[f64]| {
+            for (sum, more) in sums.iter_mut().zip(more) {
+                *sum += each * more;
+            }
+        };
+        add(&mut self.holds, &those.holds);
+        add(&mut self.square_chance, &those.square_chance);
+        add(&mut self.square_expected, &those.square_expected);
+        self.expected_best += each * those.expected_best;
+        self.bingo += each * those.bingo;
+        self
+    }
+}
+
+// what weighing a rack reads: each multiset's id and best score, each
+// multiset's squares with its best score through each, and each square's best
+struct ThreatTables<'a> {
+    ids: &'a fash::MyHashMap<Box<[u8]>, u32>,
+    best: &'a [i32],
+    reach: &'a [(u32, usize, i32)],
+    reach_from: &'a [usize],
+    square_best: &'a [i32],
+    rack_size: usize,
+}
+
+// a rack's weighing, its scratch kept from rack to rack: each square's best
+// score through it for the rack stamped
+struct ThreatWeigher {
+    rack_square: Vec<(usize, i32)>,
+    touched: Vec<usize>,
+    distinct: Vec<(u8, u8)>,
+    taken: Vec<u8>,
+    sub: Vec<u8>,
+    stamp: usize,
+}
+
+impl ThreatWeigher {
+    // the rack (its tiles in tile order) weighed by weight into sums
+    fn weigh(
+        &mut self,
+        tables: &ThreatTables<'_>,
+        rack: &[u8],
+        weight: f64,
+        sums: &mut ThreatSums,
+    ) {
+        self.stamp += 1;
+        let stamp = self.stamp;
+        self.distinct.clear();
+        for &tile in rack {
+            match self.distinct.last_mut() {
+                Some((last, count)) if *last == tile => *count += 1,
+                _ => self.distinct.push((tile, 1)),
+            }
+        }
+        self.taken.clear();
+        self.taken.resize(self.distinct.len(), 0);
+        self.touched.clear();
+        let mut top = 0;
+        let mut whole = false;
+        while let Some(j) = (0..self.distinct.len()).find(|&j| self.taken[j] < self.distinct[j].1) {
+            self.taken[..j].fill(0);
+            self.taken[j] += 1;
+            self.sub.clear();
+            for (&(tile, _), &n) in self.distinct.iter().zip(&self.taken) {
+                self.sub.extend(std::iter::repeat_n(tile, n as usize));
+            }
+            let Some(&id) = tables.ids.get(&self.sub[..]) else {
+                continue;
+            };
+            let id = id as usize;
+            sums.holds[id] += weight;
+            top = top.max(tables.best[id]);
+            whole |= self.sub.len() == tables.rack_size;
+            let reach = &tables.reach[tables.reach_from[id]..tables.reach_from[id + 1]];
+            for &(_, at, score) in reach {
+                let (seen, square) = &mut self.rack_square[at];
+                if *seen != stamp {
+                    *seen = stamp;
+                    *square = score;
+                    self.touched.push(at);
+                } else {
+                    *square = (*square).max(score);
+                }
+            }
+        }
+        for &at in &self.touched {
+            let score = self.rack_square[at].1;
+            sums.square_expected[at] += weight * score as f64;
+            if score == tables.square_best[at] {
+                sums.square_chance[at] += weight;
+            }
+        }
+        sums.expected_best += weight * top as f64;
+        if whole {
+            sums.bingo += weight;
+        }
+    }
+}
+
+// a threats question made, every play listed and every rack dealt, weighed a
+// step at a time: the racks counted exactly so far (the likeliest first), their
+// sums and what an answer reads
+struct Threats {
+    ids: fash::MyHashMap<Box<[u8]>, u32>,
+    keys: Vec<Box<[u8]>>,
+    best: Vec<i32>,
+    plays: Vec<ThreatFound>, // every play, the best first
+    words: Vec<u8>,          // every play's word, each at its play's word
+    count: usize,            // how many plays there are
+    count_asked: Option<usize>,
+    reach: Vec<(u32, usize, i32)>,
+    reach_from: Vec<usize>,
+    square_best: Vec<i32>,
+    board_tiles: Vec<u8>, // each square's tile, 0 for none
+    cols: usize,
+    rack_size: usize,
+    opponent_rack: usize,
+    racks: Vec<(Box<[u8]>, f64)>,
+    counted: usize,
+    covered: f64,
+    exact_sums: ThreatSums,
+    weigher: ThreatWeigher,
+    rng: rand::rngs::ChaCha20Rng,
+    list_ms: f64,
+    listed: f64, // when listing every play ended
+}
+
+// what threats is asked, every play listed (ms not read)
+fn threats_made(req: ThreatsRequest, now: &impl Fn() -> f64) -> Result<Threats, String> {
+    let kwg = (CACHED_KWG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.lexicon)
+        .cloned())
+    .ok_or("missing kwg")?;
+    let game_config = (CACHED_GAME_CONFIG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.rules)
+        .cloned())
+    .ok_or("missing game_config")?;
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return Err(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
+    let rack_size = game_config.rack_size() as usize;
+    if req.rack.len() > rack_size {
+        return Err(format!(
+            "rack: max {rack_size} tiles, found {} tiles",
+            req.rack.len()
+        ));
+    }
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &req.rack, &req.board_tiles)
+        .map_err(err_to_str)?;
+    if let Some(unseen) = req.unseen {
+        if !req.rack.is_empty() {
+            return Err("rack, unseen: give one or the other".into());
+        }
+        let alphabet_len = game_config.alphabet().len() as usize;
+        if unseen.len() != alphabet_len {
+            return Err(format!(
+                "unseen: a count each of {alphabet_len} tiles, found {} counts",
+                unseen.len()
+            ));
+        }
+        kibitzer.available_tally = unseen;
+    }
+    let unseen = &kibitzer.available_tally;
+    let num_unseen = unseen.iter().map(|&count| count as usize).sum::<usize>();
+    let opponent_rack = match req.opp_rack_size {
+        None => rack_size.min(num_unseen),
+        Some(size) if size <= rack_size && size <= num_unseen => size,
+        Some(size) => {
+            return Err(format!(
+                "opp_rack_size: max {} tiles, found {size} tiles",
+                rack_size.min(num_unseen)
+            ));
+        }
+    };
+    let opponent = opponent_leaves(
+        (req.known, req.kept, req.inferred),
+        game_config.num_players() as usize,
+        opponent_rack,
+        unseen,
+    )?;
+    let leaves = match &opponent {
+        OpponentLeaves::Listed(listed) if listed.is_empty() => vec![(&[][..], 1.0)],
+        OpponentLeaves::Listed(listed) => (listed.iter())
+            .map(|(tiles, weight)| (&tiles[..], *weight))
+            .collect(),
+        OpponentLeaves::Inferred(packed) => (0..packed.len())
+            .map(|i| (packed.leave(i), packed.weight(i)))
+            .collect::<Vec<_>>(),
+    };
+    let total = leaves.iter().map(|&(_, weight)| weight).sum::<f64>();
+
+    // the racks the opponent may hold, each its chance: a leave's chance, and
+    // the rest of the rack dealt from the tiles unseen but the leave's
+    let mut racks = fash::MyHashMap::<Box<[u8]>, f64>::default();
+    let mut left = vec![0u8; unseen.len()];
+    let mut rest = vec![0usize; unseen.len() + 1];
+    let mut held = Vec::new();
+    let mut rack = Vec::new();
+    for &(leave, weight) in &leaves {
+        if weight == 0.0 {
+            continue;
+        }
+        left.copy_from_slice(unseen);
+        for &tile in leave {
+            left[tile as usize] -= 1;
+        }
+        for tile in (0..left.len()).rev() {
+            rest[tile] = rest[tile + 1] + left[tile] as usize;
+        }
+        let more = opponent_rack - leave.len();
+        let chance = weight / total / choose(rest[0], more);
+        deal(
+            &left,
+            &rest,
+            0,
+            more,
+            chance,
+            &mut held,
+            &mut |dealt, ways| {
+                rack.clear();
+                rack.extend_from_slice(leave);
+                rack.extend_from_slice(dealt);
+                rack.sort_unstable();
+                *racks.entry(rack[..].into()).or_insert(0.0) += ways;
+            },
+        );
+    }
+    // the likeliest racks first, so a time cut weighs the most of them
+    let mut racks = racks.into_iter().collect::<Vec<_>>();
+    racks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    // every play of the tiles unseen, its tiles' multiset given an id as it is
+    // first found, with each multiset's best score
+    let mut move_generator =
+        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+            .map_err(err_to_str)?;
+    let empty_klv = Klv::empty().map_err(err_to_str)?;
+    let board_snapshot = movegen::BoardSnapshot {
+        board_tiles: &kibitzer.board_tiles,
+        game_config: &game_config,
+        kwg: &kwg.kwg,
+        anagrams: None,
+        rack_lengths: None,
+        klv: &empty_klv,
+    };
+    let pool = (0u8..)
+        .zip(unseen.iter())
+        .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize))
+        .collect::<Vec<_>>();
+    let listing = now();
+    let mut ids = fash::MyHashMap::<Box<[u8]>, u32>::default();
+    let mut keys = Vec::<Box<[u8]>>::new();
+    let mut best = Vec::<i32>::new();
+    let mut plays = Vec::<ThreatFound>::new();
+    let mut words = Vec::<u8>::new();
+    if !pool.is_empty() {
+        let mut key = Vec::new();
+        move_generator.pool_plays(&board_snapshot, &pool, |down, lane, idx, word, score| {
+            key.clear();
+            key.extend(
+                word.iter().filter(|&&tile| tile != 0).map(
+                    |&tile| {
+                        if tile & 0x80 != 0 { 0 } else { tile }
+                    },
+                ),
+            );
+            key.sort_unstable();
+            let id = match ids.get(&key[..]) {
+                Some(&id) => {
+                    best[id as usize] = best[id as usize].max(score);
+                    id
+                }
+                None => {
+                    let id = keys.len() as u32;
+                    ids.insert(key[..].into(), id);
+                    keys.push(key[..].into());
+                    best.push(score);
+                    id
+                }
+            };
+            let from = words.len() as u32;
+            words.extend_from_slice(word);
+            plays.push(ThreatFound {
+                down,
+                lane,
+                idx,
+                word: from..words.len() as u32,
+                score,
+                id,
+            });
+        });
+    }
+    let listed = now();
+    let list_ms = listed - listing;
+
+    // each square's best score of a play placing a tile on it, and for each
+    // multiset each square a play of it places a tile on, with the best score
+    // of such a play
+    let dim = game_config.board_layout().dim();
+    let cols = dim.cols as usize;
+    let mut square_best = vec![i32::MIN; kibitzer.board_tiles.len()];
+    let mut reach = Vec::<(u32, usize, i32)>::new();
+    let word = |play: &ThreatFound| &words[play.word.start as usize..play.word.end as usize];
+    for play in &plays {
+        for at in placed_squares((play.down, play.lane, play.idx, word(play)), cols) {
+            square_best[at] = square_best[at].max(play.score);
+            reach.push((play.id, at, play.score));
+        }
+    }
+    reach.sort_unstable_by(|a, b| (a.0, a.1, b.2).cmp(&(b.0, b.1, a.2)));
+    reach.dedup_by_key(|&mut (id, at, _)| (id, at));
+    let mut reach_from = vec![0usize; keys.len() + 1];
+    for &(id, _, _) in &reach {
+        reach_from[id as usize + 1] += 1;
+    }
+    for id in 0..keys.len() {
+        reach_from[id + 1] += reach_from[id];
+    }
+
+    let count = plays.len();
+    plays.sort_unstable_by(|a, b| {
+        (b.score.cmp(&a.score))
+            .then_with(|| (a.down, a.lane, a.idx, word(a)).cmp(&(b.down, b.lane, b.idx, word(b))))
+    });
+    let seed = req
+        .seed
+        .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
+    Ok(Threats {
+        exact_sums: ThreatSums::new(keys.len(), square_best.len()),
+        weigher: ThreatWeigher {
+            rack_square: vec![(usize::MAX, 0i32); square_best.len()],
+            touched: Vec::new(),
+            distinct: Vec::new(),
+            taken: Vec::new(),
+            sub: Vec::new(),
+            stamp: 0,
+        },
+        ids,
+        keys,
+        best,
+        plays,
+        words,
+        count,
+        count_asked: req.count,
+        reach,
+        reach_from,
+        square_best,
+        board_tiles: kibitzer.board_tiles,
+        cols,
+        rack_size,
+        opponent_rack,
+        racks,
+        counted: 0,
+        covered: 0.0,
+        rng: rand::rngs::ChaCha20Rng::seed_from_u64(seed),
+        list_ms,
+        listed,
+    })
+}
+
+impl Threats {
+    // the racks not yet counted counted exactly, the likeliest first, till half
+    // (if given) passes, then racks drawn from those left (each as likely as
+    // its chance) till deadline (if given) does; the answer, as ThreatsAnswer.
+    // Each multiset of a rack's tiles that a play is of adds the rack's weight
+    // to that multiset's; the rack's best play through each square, and its
+    // best play, are weighed in too. The racks counted exactly weigh their
+    // chance; the draws, each the chance those left hold over how many were
+    // drawn, an unbiased estimate of those left. The racks counted stay
+    // counted; the draws are made again each step.
+    fn step(
+        &mut self,
+        half: Option<f64>,
+        deadline: Option<f64>,
+        now: &impl Fn() -> f64,
+    ) -> Result<String, String> {
+        let tables = ThreatTables {
+            ids: &self.ids,
+            best: &self.best,
+            reach: &self.reach,
+            reach_from: &self.reach_from,
+            square_best: &self.square_best,
+            rack_size: self.rack_size,
+        };
+        let from = self.counted;
+        while self.counted < self.racks.len() {
+            let r = self.counted - from;
+            if r.is_multiple_of(16) && r > 0 && half.is_some_and(|half| now() >= half) {
+                break;
+            }
+            let (rack, chance) = &self.racks[self.counted];
+            self.weigher
+                .weigh(&tables, rack, *chance, &mut self.exact_sums);
+            self.covered += *chance;
+            self.counted += 1;
+        }
+        let exact = self.counted == self.racks.len();
+        let mut drawn_sums = ThreatSums::new(self.keys.len(), self.square_best.len());
+        let mut samples = 0usize;
+        let mut rest_chance = 0.0;
+        if !exact {
+            let upto = (self.racks[self.counted..].iter())
+                .map(|(_, chance)| {
+                    rest_chance += chance;
+                    rest_chance
+                })
+                .collect::<Vec<_>>();
+            while rest_chance > 0.0
+                && !(samples.is_multiple_of(16)
+                    && samples > 0
+                    && deadline.is_some_and(|deadline| now() >= deadline))
+            {
+                let at = self.rng.random::<f64>() * rest_chance;
+                let i = (upto.partition_point(|&upto| upto <= at)).min(upto.len() - 1);
+                let rack = &self.racks[self.counted + i].0;
+                self.weigher.weigh(&tables, rack, 1.0, &mut drawn_sums);
+                samples += 1;
+            }
+        }
+        let each = if samples > 0 {
+            rest_chance / samples as f64
+        } else {
+            0.0
+        };
+        let sums = (ThreatSums::new(self.keys.len(), self.square_best.len()))
+            .plus(&self.exact_sums, 1.0)
+            .plus(&drawn_sums, each);
+        let word =
+            |play: &ThreatFound| &self.words[play.word.start as usize..play.word.end as usize];
+        let plays = (self.plays.iter())
+            .take(self.count_asked.unwrap_or(usize::MAX))
+            .map(|play| ThreatPlay {
+                tiles: self.keys[play.id as usize].to_vec(),
+                chance: sums.holds[play.id as usize],
+                play: (&movegen::Play::Place {
+                    down: play.down,
+                    lane: play.lane,
+                    idx: play.idx,
+                    word: word(play).into(),
+                    score: play.score,
+                })
+                    .into(),
+            })
+            .collect();
+        let squares = (self.board_tiles.chunks(self.cols))
+            .zip((0..).step_by(self.cols))
+            .map(|(row, from)| {
+                (row.iter().zip(from..))
+                    .map(|(&tile, at)| {
+                        (tile == 0).then(|| ThreatSquare {
+                            best: equity::descale_score(self.square_best[at].max(0)),
+                            chance: sums.square_chance[at],
+                            expected: sums.square_expected[at] / equity::SCALE as f64,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        serde_json::to_string(&ThreatsAnswer {
+            racks: self.racks.len(),
+            count: self.count,
+            expected_best: sums.expected_best / equity::SCALE as f64,
+            bingo: (self.opponent_rack == self.rack_size).then_some(sums.bingo),
+            covered: if exact { 1.0 } else { self.covered },
+            samples,
+            list_ms: self.list_ms,
+            exact,
+            plays,
+            squares,
+        })
+        .map_err(err_to_str)
+    }
+}
+
+// a time to run, as a request's ms gives it: a deadline from now
+fn threats_deadline(ms: Option<f64>, now: &impl Fn() -> f64) -> Result<Option<f64>, String> {
+    match ms {
+        Some(ms) if ms >= 0.0 && ms.is_finite() => Ok(Some(now() + ms)),
+        Some(ms) => Err(format!("ms: {ms} is not a time to run")),
+        None => Ok(None),
+    }
+}
+
+// threats in one call: listing every play counts against ms, the racks counted
+// exactly in half of what is left and drawn in the rest
+#[wasm_bindgen]
+pub fn threats(req_str: String) -> Result<String, JsValue> {
+    Ok(do_threats(&req_str, step_clock)?)
+}
+
+fn do_threats(req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
+    let req = serde_json::from_str::<ThreatsRequest>(req_str).map_err(err_to_str)?;
+    let deadline = threats_deadline(req.ms, &now)?;
+    let mut threats = threats_made(req, &now)?;
+    let listed = threats.listed;
+    let half = deadline.map(|deadline| listed + (deadline - listed).max(0.0) / 2.0);
+    threats.step(half, deadline, &now)
+}
+
 #[wasm_bindgen]
 extern "C" {
     // performance.now, whose throw (where there is no performance object) comes
@@ -5563,5 +6225,346 @@ mod tests {
             "ms: -1 is not a time to run"
         );
         do_endgame_free(handle).unwrap();
+    }
+
+    // more english tiles, none of them in a tiny lexicon's words
+    const B: u8 = 2;
+    const D: u8 = 4;
+    const F: u8 = 6;
+    const G: u8 = 7;
+    const H: u8 = 8;
+    const I: u8 = 9;
+    const J: u8 = 10;
+
+    // a board as json for threats: CAT across row 11 from column 6. Every other
+    // tile not unseen and not on the watcher's rack lies in a block from the
+    // top left row by row. Its first row and first column hold tiles no word
+    // has. So no play touches it.
+    fn threats_board(unseen: &[u8], rack: &[u8]) -> String {
+        do_this_on_startup().unwrap();
+        let rules = CACHED_GAME_CONFIG.read().unwrap();
+        let alphabet = rules["CrosswordGame"].alphabet();
+        let mut left = (0..alphabet.len())
+            .map(|tile| alphabet.freq(tile))
+            .collect::<Vec<_>>();
+        for &tile in unseen.iter().chain(rack).chain(&[C, A, T]) {
+            left[tile as usize] -= 1;
+        }
+        assert_eq!(left[0], 0, "a blank goes unseen or on the rack");
+        let (mut junk, mut others) = (Vec::new(), Vec::new());
+        for tile in 1..alphabet.len() {
+            for _ in 0..left[tile as usize] {
+                if [A, C, E, S, T].contains(&tile) {
+                    others.push(tile);
+                } else {
+                    junk.push(tile);
+                }
+            }
+        }
+        let mut board = vec![vec![0i8; 15]; 15];
+        let block = junk.len() + others.len();
+        assert!(block / 15 < 10, "the block stays clear of CAT");
+        for at in 0..block {
+            let (row, col) = (at / 15, at % 15);
+            board[row][col] = if row == 0 || col == 0 {
+                junk.pop()
+            } else {
+                others.pop().or_else(|| junk.pop())
+            }
+            .unwrap() as i8;
+        }
+        board[11][6] = C as i8;
+        board[11][7] = A as i8;
+        board[11][8] = T as i8;
+        serde_json::to_string(&board).unwrap()
+    }
+
+    // a threats answer to a request on threats_board, parsed
+    fn threats_of(unseen: &[u8], rack: &[u8], more: &str) -> serde_json::Value {
+        tiny_lexicon("tiny-threats");
+        let req = format!(
+            r#"{{"rack":{},"board":{},"lexicon":"tiny-threats","rules":"CrosswordGame"{more}}}"#,
+            serde_json::to_string(rack).unwrap(),
+            threats_board(unseen, rack),
+        );
+        serde_json::from_str(&do_threats(&req, || 0.0).unwrap()).unwrap()
+    }
+
+    fn assert_near(found: &serde_json::Value, want: f64) {
+        let found = found.as_f64().unwrap();
+        assert!((found - want).abs() < 1e-12, "{found} is not {want}");
+    }
+
+    // each square some play places a tile on, as (row, col, square), row by
+    // row; every square a tile is on is null, every other one not
+    fn threat_squares(answer: &serde_json::Value) -> Vec<(i64, i64, serde_json::Value)> {
+        let rows = answer["squares"].as_array().unwrap();
+        assert_eq!(rows.len(), 15);
+        let mut reached = Vec::new();
+        for (row, squares) in (0..).zip(rows) {
+            let squares = squares.as_array().unwrap();
+            assert_eq!(squares.len(), 15);
+            for (col, square) in (0..).zip(squares) {
+                if square.is_null() {
+                    continue;
+                }
+                if square["best"] == 0 {
+                    assert_eq!(square["chance"], 0.0);
+                    assert_eq!(square["expected"], 0.0);
+                } else {
+                    reached.push((row, col, square.clone()));
+                }
+            }
+        }
+        reached
+    }
+
+    // each play, as (down, lane, idx, word, tiles)
+    fn threat_plays(answer: &serde_json::Value) -> Vec<serde_json::Value> {
+        (answer["plays"].as_array().unwrap().iter())
+            .map(|play| {
+                serde_json::json!([
+                    play["down"],
+                    play["lane"],
+                    play["idx"],
+                    play["word"],
+                    play["tiles"]
+                ])
+            })
+            .collect()
+    }
+
+    // unseen: two S and seven tiles no word has. A rack of 7 of them is one of
+    // C(9, 7) = 36 ways. There are 29 racks: 1 with no S, 7 with one S, and 21
+    // with two. Only the one with no S (all seven others) holds no play: each
+    // play places one S (cats, scat, as down). So each play, each square some
+    // play places a tile on, and the best play are held 35 times in 36.
+    #[test]
+    fn threats_deal_the_opponent_a_rack_from_the_tiles_unseen() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        let all = threats_of(&unseen, &rack, "");
+        assert_eq!(all["racks"], 29);
+        assert_eq!(all["count"], 3);
+        let mut plays = threat_plays(&all);
+        plays.sort_by_key(|play| play.to_string());
+        let mut want = vec![
+            serde_json::json!([false, 11, 6, [0, 0, 0, S], [S]]),
+            serde_json::json!([false, 11, 5, [S, 0, 0, 0], [S]]),
+            serde_json::json!([true, 7, 11, [0, S], [S]]),
+        ];
+        want.sort_by_key(|play| play.to_string());
+        assert_eq!(plays, want);
+        let listed = all["plays"].as_array().unwrap();
+        for play in listed {
+            assert_near(&play["chance"], 35.0 / 36.0);
+        }
+        let top = listed[0]["score"].as_i64().unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|play| play["score"].as_i64().unwrap() <= top)
+        );
+        assert_near(&all["expected_best"], 35.0 / 36.0 * top as f64);
+        assert_eq!(all["bingo"], 0.0);
+        assert_eq!(all["exact"], true);
+        assert_eq!(all["covered"], 1.0);
+        assert_eq!(all["samples"], 0);
+        assert!(all["squares"][11][6].is_null());
+        let squares = threat_squares(&all);
+        assert_eq!(squares.len(), 3);
+        for (row, col, square) in &squares {
+            assert_near(&square["chance"], 35.0 / 36.0);
+            let best = square["best"].as_f64().unwrap();
+            assert_near(&square["expected"], 35.0 / 36.0 * best);
+            let (row, col) = (Some(*row), Some(*col));
+            let placing = listed.iter().find(|play| {
+                let (lane, idx) = (play["lane"].as_i64(), play["idx"].as_i64());
+                let word = play["word"].as_array().unwrap();
+                let at = word.iter().position(|tile| tile != 0).unwrap() as i64;
+                if play["down"] == true {
+                    (lane, idx.map(|idx| idx + at)) == (col, row)
+                } else {
+                    (lane, idx.map(|idx| idx + at)) == (row, col)
+                }
+            });
+            assert_eq!(square["best"], placing.unwrap()["score"]);
+        }
+        // the best two of them, the best first
+        let two = threats_of(&unseen, &rack, r#","count":2"#);
+        assert_eq!(two["count"], 3);
+        assert_eq!(two["plays"].as_array().unwrap()[..], listed[..2]);
+    }
+
+    // the opponent kept an S or a B, alike. With the S it holds every play.
+    // With the B its other six are 6 of the 8 left (two S among them): none is
+    // an S once in C(8, 6) = 28 ways. So each play is held 1/2 + 1/2 * 27/28 =
+    // 55/56 of the time. There are 29 racks: 28 with the S kept, and the one
+    // with the B but no S.
+    #[test]
+    fn threats_weigh_the_leaves_the_opponent_may_have_kept() {
+        let kept =
+            format!(r#","kept":[{{"tiles":[{S}],"weight":1}},{{"tiles":[{B}],"weight":1}}]"#);
+        let answer = threats_of(&[S, S, B, D, F, G, H, I, J], &[0, 0, I, I, I, I, I], &kept);
+        assert_eq!(answer["racks"], 29);
+        for play in answer["plays"].as_array().unwrap() {
+            assert_near(&play["chance"], 55.0 / 56.0);
+        }
+        for (_, _, square) in threat_squares(&answer) {
+            assert_near(&square["chance"], 55.0 / 56.0);
+        }
+        // the same leaves as leaves
+        let leaves = kept.replace("kept", "leaves");
+        let again = threats_of(
+            &[S, S, B, D, F, G, H, I, J],
+            &[0, 0, I, I, I, I, I],
+            &leaves,
+        );
+        assert_eq!(again, answer);
+    }
+
+    // fewer tiles unseen than a rack holds: the opponent holds them all, so
+    // every play of them is certain, a blank's as any letter as well as the S
+    // as itself (cats with the S, or with the blank as an S)
+    #[test]
+    fn threats_give_the_opponent_every_tile_unseen_when_too_few_are_left() {
+        let answer = threats_of(&[0, S, B], &[0, I, I, I, I, I, I], "");
+        assert_eq!(answer["racks"], 1);
+        let listed = answer["plays"].as_array().unwrap();
+        assert_eq!(answer["count"], listed.len());
+        for play in listed {
+            assert_eq!(play["chance"], 1.0);
+        }
+        for (_, _, square) in threat_squares(&answer) {
+            assert_eq!(square["chance"], 1.0);
+            assert_eq!(square["expected"], square["best"].as_f64().unwrap());
+        }
+        assert_eq!(
+            answer["expected_best"],
+            listed[0]["score"].as_f64().unwrap()
+        );
+        assert!(answer["bingo"].is_null(), "three tiles, not a rack's");
+        let plays = threat_plays(&answer);
+        let blank_s = -(S as i8);
+        for want in [
+            serde_json::json!([false, 11, 6, [0, 0, 0, S], [S]]),
+            serde_json::json!([false, 11, 6, [0, 0, 0, blank_s], [0]]),
+        ] {
+            assert!(plays.contains(&want), "{want}");
+        }
+    }
+
+    // the tiles unseen as counts, the rack then empty: the same answer as the
+    // rack gives. Not both.
+    #[test]
+    fn threats_take_the_tiles_unseen_as_counts() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        let want = threats_of(&unseen, &rack, "");
+        let mut counts = vec![0u8; 27];
+        for tile in unseen {
+            counts[tile as usize] += 1;
+        }
+        let board = threats_board(&unseen, &rack);
+        let req = |rack: &str| {
+            format!(
+                r#"{{"rack":{rack},"board":{board},"lexicon":"tiny-threats","rules":"CrosswordGame","unseen":{}}}"#,
+                serde_json::to_string(&counts).unwrap(),
+            )
+        };
+        let found = do_threats(&req("[]"), || 0.0).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&found).unwrap(),
+            want
+        );
+        assert_eq!(
+            do_threats(&req("[9]"), || 0.0).unwrap_err(),
+            "rack, unseen: give one or the other"
+        );
+    }
+
+    // an opponent holding six tiles, 6 of the 9 unseen: none is an S in C(7, 6)
+    // = 7 of C(9, 6) = 84 ways, so each play is held 11 times in 12, and no
+    // rack's tiles are there to bingo with. More than a rack is an error.
+    #[test]
+    fn threats_deal_the_opponent_the_tiles_it_holds() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        let six = threats_of(&unseen, &rack, r#","opp_rack_size":6"#);
+        for play in six["plays"].as_array().unwrap() {
+            assert_near(&play["chance"], 11.0 / 12.0);
+        }
+        assert!(six["bingo"].is_null());
+        tiny_lexicon("tiny-threats");
+        let req = format!(
+            r#"{{"rack":{},"board":{},"lexicon":"tiny-threats","rules":"CrosswordGame","opp_rack_size":8}}"#,
+            serde_json::to_string(&rack).unwrap(),
+            threats_board(&unseen, &rack),
+        );
+        assert_eq!(
+            do_threats(&req, || 0.0).unwrap_err(),
+            "opp_rack_size: max 7 tiles, found 8 tiles"
+        );
+    }
+
+    // ms run out (a clock moving a whole ms each read): the half of it left
+    // after the listing is gone once 16 racks are counted, the likeliest first:
+    // the 7 with one S (2 ways in 36 each), then of those dealt 1 way, in tile
+    // order, the one with no S and 8 with two. They hold 23/36 of the chance
+    // and the plays 22/36 of it. Then 16 racks are drawn from the 13 left, each
+    // with two S, so each play's chance is estimated at 22/36 plus the 13/36
+    // left: 35/36, as an unbiased estimate must be here. The same seed draws
+    // the same racks.
+    #[test]
+    fn threats_count_the_likeliest_racks_then_draw_from_the_rest() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        tiny_lexicon("tiny-threats");
+        let req = format!(
+            r#"{{"rack":{},"board":{},"lexicon":"tiny-threats","rules":"CrosswordGame","ms":0,"seed":7}}"#,
+            serde_json::to_string(&rack).unwrap(),
+            threats_board(&unseen, &rack),
+        );
+        let ask = || {
+            let clock = std::cell::Cell::new(0.0);
+            let now = || {
+                let time = clock.get();
+                clock.set(time + 1.0);
+                time
+            };
+            let answer = do_threats(&req, now).unwrap();
+            assert_eq!(
+                clock.get(),
+                5.0,
+                "read when asked, listing, listed, cut, drawn"
+            );
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap()
+        };
+        let answer = ask();
+        assert_eq!(answer["exact"], false);
+        assert_eq!(answer["list_ms"], 1.0);
+        assert_near(&answer["covered"], 23.0 / 36.0);
+        assert_eq!(answer["samples"], 16);
+        assert_eq!(answer["racks"], 29);
+        for play in answer["plays"].as_array().unwrap() {
+            assert_near(&play["chance"], 35.0 / 36.0);
+        }
+        for (_, _, square) in threat_squares(&answer) {
+            assert_near(&square["chance"], 35.0 / 36.0);
+        }
+        assert_eq!(ask(), answer);
+    }
+
+    // the opponent known to hold an S: every rack holds one, so every play is
+    // certain
+    #[test]
+    fn threats_deal_around_the_tiles_the_opponent_is_known_to_hold() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        let answer = threats_of(&unseen, &rack, &format!(r#","known":[{S}]"#));
+        assert_eq!(answer["racks"], 28);
+        for play in answer["plays"].as_array().unwrap() {
+            assert_near(&play["chance"], 1.0);
+        }
     }
 }
