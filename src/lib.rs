@@ -2286,19 +2286,25 @@ struct EndgameBagTile {
     value: f64,
 }
 
-// tiles the bag may hold, with two or more in it: the deals that give them, and
-// the play's gain if they are the bag's, in points
+// tiles the bag may hold, with two or more in it: the deals that give them, the
+// play's gain if they are the bag's, in points, and its chance to win then;
+// with the model of random draws, the tiles the play then draws, each draw with
+// the same (drawn: its deals within the set, its gain, its chance)
 #[derive(serde::Serialize)]
 struct EndgameBagDraw {
     tiles: Vec<u8>,
     count: u64,
     value: f64,
+    win: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    drawn: Vec<EndgameBagDraw>,
 }
 
 // a play the search valued: the share of the deals it wins (a tie counted half;
 // with an empty bag, 1, a half, or 0 by the lead it ends with) and its mean
 // gain, in points; with one tile in the bag, its gain for each tile the bag may
-// be; and whether its value is exact
+// be; with two or more, for each set it may hold; and whether its value is
+// exact
 #[derive(serde::Serialize)]
 struct EndgameCandidate {
     play: kibitzer::JsonPlay,
@@ -2306,7 +2312,36 @@ struct EndgameCandidate {
     value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tiles: Option<Vec<EndgameBagTile>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draws: Option<Vec<EndgameBagDraw>>,
     exact: bool,
+}
+
+// a move's splits with two or more in the bag, as the page reads them, each
+// with the draws the move makes there where the model has them
+fn bag_draws(
+    hypotheses: &[(Vec<u8>, u64, equity::Equity)],
+    wins: &[f64],
+    draws: &[Vec<endgame::PegBagDraw>],
+    lead: f64,
+) -> Vec<EndgameBagDraw> {
+    (hypotheses.iter().zip(wins).zip(draws))
+        .map(|(((tiles, count, margin), &win), draws)| EndgameBagDraw {
+            tiles: tiles.clone(),
+            count: *count,
+            value: points(*margin) - lead,
+            win,
+            drawn: (draws.iter())
+                .map(|draw| EndgameBagDraw {
+                    tiles: draw.tiles.clone(),
+                    count: draw.ways,
+                    value: points(draw.margin) - lead,
+                    win: draw.win,
+                    drawn: Vec::new(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 // endgame_step's answer: the bag's tiles, the steps that solved and the nodes
@@ -2481,15 +2516,7 @@ impl Endgame {
                 line: None,
                 win: valued.then_some(peg.win_pct),
                 tiles: None,
-                draws: Some(
-                    (peg.hypotheses.iter())
-                        .map(|(tiles, count, margin)| EndgameBagDraw {
-                            tiles: tiles.clone(),
-                            count: *count,
-                            value: points(*margin) - lead,
-                        })
-                        .collect(),
-                ),
+                draws: Some(bag_draws(&peg.hypotheses, &peg.wins, &peg.draws, lead)),
                 candidates: Some(
                     (peg.moves.iter())
                         .map(|valued| EndgameCandidate {
@@ -2497,6 +2524,12 @@ impl Endgame {
                             win: valued.win_pct,
                             value: points(valued.expected_margin) - lead,
                             tiles: None,
+                            draws: Some(bag_draws(
+                                &valued.hypotheses,
+                                &valued.wins,
+                                &valued.draws,
+                                lead,
+                            )),
                             exact: valued.exact,
                         })
                         .collect(),
@@ -2559,6 +2592,7 @@ impl Endgame {
                                     })
                                     .collect(),
                             ),
+                            draws: None,
                             exact: valued.exact,
                         })
                         .collect(),
@@ -2687,6 +2721,7 @@ impl Endgame {
                         },
                         value,
                         tiles: None,
+                        draws: None,
                         exact: first.exact,
                     })
                 })
@@ -4975,6 +5010,64 @@ mod tests {
                 .all(|d| d["tiles"].as_array().unwrap().len() == 2),
             "{name}: {answer}"
         );
+        // every candidate with its own draws, the answer's the first's, each
+        // with its chance to win, the chances making the candidate's win
+        assert_eq!(candidates[0]["draws"], answer["draws"], "{name}");
+        for candidate in candidates {
+            let own = candidate["draws"].as_array().unwrap();
+            assert_eq!(own.len(), draws.len(), "{name}: {candidate}");
+            assert_eq!(candidate["exact"], true, "{name}: {candidate}");
+            let total = own
+                .iter()
+                .map(|d| d["count"].as_f64().unwrap())
+                .sum::<f64>();
+            let won = (own.iter())
+                .map(|d| {
+                    let win = d["win"].as_f64().unwrap();
+                    assert!((0.0..=1.0).contains(&win), "{name}: {candidate}");
+                    d["count"].as_f64().unwrap() * win
+                })
+                .sum::<f64>();
+            assert!(
+                (won / total - candidate["win"].as_f64().unwrap()).abs() < 1e-9,
+                "{name}: {candidate}"
+            );
+            // under each set, the draws the play makes from it (random draws),
+            // their deals within the set, their gains, and their chances making
+            // it; a pass draws nothing
+            let passes = candidate["play"]["action"] == "exchange"
+                && candidate["play"]["tiles"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty);
+            for row in own {
+                if passes {
+                    assert!(row.get("drawn").is_none(), "{name}: {row}");
+                    continue;
+                }
+                let drawn = row["drawn"].as_array().unwrap();
+                assert!(!drawn.is_empty(), "{name}: {row}");
+                let deals = drawn
+                    .iter()
+                    .map(|d| d["count"].as_f64().unwrap())
+                    .sum::<f64>();
+                let gain = (drawn.iter())
+                    .map(|d| d["count"].as_f64().unwrap() * d["value"].as_f64().unwrap())
+                    .sum::<f64>()
+                    / deals;
+                let chance = (drawn.iter())
+                    .map(|d| d["count"].as_f64().unwrap() * d["win"].as_f64().unwrap())
+                    .sum::<f64>()
+                    / deals;
+                assert!(
+                    (gain - row["value"].as_f64().unwrap()).abs() < 0.002,
+                    "{name}: {row}"
+                );
+                assert!(
+                    (chance - row["win"].as_f64().unwrap()).abs() < 1e-9,
+                    "{name}: {row}"
+                );
+            }
+        }
 
         // wolges's search on the same position
         let Tables {
