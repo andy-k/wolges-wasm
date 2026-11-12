@@ -2297,12 +2297,15 @@ struct EndgameBagDraw {
 
 // a play the search valued: the share of the deals it wins (a tie counted half;
 // with an empty bag, 1, a half, or 0 by the lead it ends with) and its mean
-// gain, in points; and whether its value is exact
+// gain, in points; with one tile in the bag, its gain for each tile the bag may
+// be; and whether its value is exact
 #[derive(serde::Serialize)]
 struct EndgameCandidate {
     play: kibitzer::JsonPlay,
     win: f64,
     value: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tiles: Option<Vec<EndgameBagTile>>,
     exact: bool,
 }
 
@@ -2493,6 +2496,7 @@ impl Endgame {
                             play: (&valued.play).into(),
                             win: valued.win_pct,
                             value: points(valued.expected_margin) - lead,
+                            tiles: None,
                             exact: valued.exact,
                         })
                         .collect(),
@@ -2524,12 +2528,7 @@ impl Endgame {
                 steps,
                 nodes,
                 exact: peg.exact,
-                play: peg.best_move.map(|best| match best {
-                    endgame::PegMove::Pass => kibitzer::JsonPlay::Exchange {
-                        tiles: Vec::new().into(),
-                    },
-                    endgame::PegMove::Place(play) => (&play).into(),
-                }),
+                play: peg.best_move.as_ref().map(peg_play),
                 value,
                 spread: lead + value.unwrap_or(0.0),
                 depth: Some(peg.depth),
@@ -2545,7 +2544,25 @@ impl Endgame {
                         .collect(),
                 ),
                 draws: None,
-                candidates: None,
+                candidates: Some(
+                    (peg.moves.iter())
+                        .map(|valued| EndgameCandidate {
+                            play: peg_play(&valued.play),
+                            win: valued.win_pct as f64,
+                            value: points(valued.expected_margin) - lead,
+                            tiles: Some(
+                                (valued.hypotheses.iter())
+                                    .map(|&(tile, count, margin)| EndgameBagTile {
+                                        tile,
+                                        count,
+                                        value: points(margin) - lead,
+                                    })
+                                    .collect(),
+                            ),
+                            exact: valued.exact,
+                        })
+                        .collect(),
+                ),
                 endgames: Some(endgames),
                 moves: progress.moves().map(|(valued, of)| [valued, of]),
             }
@@ -2669,12 +2686,24 @@ impl Endgame {
                             0.5
                         },
                         value,
+                        tiles: None,
                         exact: first.exact,
                     })
                 })
                 .collect(),
         );
         Ok(())
+    }
+}
+
+// a move of a search with a tile in the bag, as the page reads it (a pass as an
+// exchange of no tiles)
+fn peg_play(play: &endgame::PegMove) -> kibitzer::JsonPlay {
+    match play {
+        endgame::PegMove::Pass => kibitzer::JsonPlay::Exchange {
+            tiles: Vec::new().into(),
+        },
+        endgame::PegMove::Place(play) => play.into(),
     }
 }
 
@@ -2936,7 +2965,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             win: None,
             tiles: (bag == 1).then(Vec::new),
             draws: (bag >= 2).then(Vec::new),
-            candidates: (bag >= 2).then(Vec::new),
+            candidates: in_bag.then(Vec::new),
             endgames: in_bag.then_some(0),
             moves: None,
         },
@@ -4846,7 +4875,8 @@ mod tests {
         assert_eq!(
             before,
             serde_json::json!({"bag": 1, "steps": 0, "nodes": 0, "exact": false,
-                "play": null, "spread": 0.0, "depth": 0, "tiles": [], "endgames": 0})
+                "play": null, "spread": 0.0, "depth": 0, "tiles": [], "candidates": [],
+                "endgames": 0})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 1);
@@ -4862,6 +4892,20 @@ mod tests {
         );
         assert!(answer["depth"].as_i64().unwrap() >= 1, "{answer}");
         assert!(answer["play"].is_object(), "{answer}");
+        // every move the pass valued, best first, the first the answer's own,
+        // each with its tiles, all exact
+        let candidates = answer["candidates"].as_array().unwrap();
+        assert!(!candidates.is_empty(), "{answer}");
+        assert_eq!(candidates[0]["play"], answer["play"]);
+        assert_eq!(candidates[0]["value"], answer["value"]);
+        assert_eq!(candidates[0]["win"], answer["win"]);
+        assert_eq!(candidates[0]["tiles"], answer["tiles"]);
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c["exact"] == true && c["tiles"].is_array()),
+            "{answer}"
+        );
         let tiles = answer["tiles"].as_array().unwrap();
         let count = |t: &serde_json::Value| t["count"].as_f64().unwrap();
         let value = |t: &serde_json::Value| t["value"].as_f64().unwrap();
