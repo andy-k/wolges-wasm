@@ -2263,6 +2263,12 @@ struct EndgameNewRequest {
     // all n, weighed by their counts, are the whole search's
     #[serde(default)]
     part: Option<[usize; 2]>,
+    // with two tiles or more in the bag, whether the search's early passes
+    // value every move fast by its equity where a line still leaves tiles in
+    // the bag (each such value an estimate, the answer then not exact), later
+    // passes refining them to exact; off unless asked
+    #[serde(default)]
+    estimates: bool,
 }
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer. With
@@ -2967,7 +2973,13 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             if let Some([k, n]) = req.part {
                 progress.part(k, n).map_err(err_to_str)?;
             }
+            progress.set_estimates(req.estimates);
             Some(progress)
+        }
+        None if req.estimates => {
+            return Err(format!(
+                "estimates: with two tiles or more in the bag, found {bag} in it"
+            ));
         }
         None if req.part.is_some() => {
             return Err(format!(
@@ -4990,6 +5002,37 @@ mod tests {
             "{answer}"
         );
         do_endgame_free(handle).unwrap();
+    }
+
+    // two tiles in the bag with estimates asked for, and no limit: the answer
+    // the steps end on is the one without them, every candidate exact; with
+    // fewer than two in the bag, asking is refused
+    #[test]
+    fn an_endgame_asked_for_estimates_ends_as_one_without() {
+        let rack = [S, E, A, T, C, A, T];
+        let others = [A, T, E, S, E, A, T, E, E];
+        let solve = |more: &str| {
+            let more = format!(r#","model":"random_draws","exchanges":[0,0]{more}"#);
+            let handle = endgame_of("tiny-end-estimates", &rack, &others, &more).unwrap();
+            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            do_endgame_free(handle).unwrap();
+            answer
+        };
+        let plain = solve("");
+        let estimated = solve(r#","estimates":true"#);
+        assert_eq!(estimated["exact"], true, "{estimated}");
+        for field in ["play", "value", "win", "draws", "candidates"] {
+            assert_eq!(estimated[field], plain[field], "{field}");
+        }
+        assert!(
+            endgame_of(
+                "tiny-end-estimates",
+                &[S, E, A, T],
+                &[A, T, E],
+                r#","estimates":true"#
+            )
+            .is_err()
+        );
     }
 
     // two tiles in the bag searched in two parts (a page's two workers): each
