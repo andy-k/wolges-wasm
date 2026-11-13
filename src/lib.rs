@@ -4540,6 +4540,16 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    // a late board to infer on: the watcher's rack (S E A T) and fourteen tiles
+    // unseen, CATS's S among them, off the board, so the opponent's leaves are
+    // few to weigh, the bag still holding seven, so they may exchange
+    fn infer_board() -> String {
+        late_board(&[S, E, A, T, A, C, E, E, S, T, B, D, F, G, H, I, I, J])
+    }
+
+    // CATS on the late board: S after its CAT
+    const LATE_CATS: &str = r#"{"action":"play","down":false,"lane":2,"idx":6,"word":[0,0,0,19]}"#;
+
     // infer answers as wolges's own inference does, weights made to sum to 1: a
     // new handle each time, the count, and as many of the likeliest as asked
     // (the likeliest first; none unless asked); fuzz the caller's, never left
@@ -4551,8 +4561,8 @@ mod tests {
         let rack = [S, E, A, T];
         let ask = |more: &str| {
             do_infer(&format!(
-                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{CATS}{more}}}"#,
-                cat_board()
+                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{LATE_CATS}{more}}}"#,
+                infer_board()
             ))
         };
         let fuzz = infer::FUZZ;
@@ -4564,9 +4574,11 @@ mod tests {
             game_config,
         } = tables("tiny-infer", "noleave", "CrosswordGame").unwrap();
         let mut kibitzer = kibitzer::Kibitzer::new();
-        let board = serde_json::from_str::<Vec<Vec<i8>>>(&cat_board()).unwrap();
+        let board = serde_json::from_str::<Vec<Vec<i8>>>(&infer_board()).unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
-        let play = serde_json::from_str::<SimPlay>(CATS).unwrap().to_play();
+        let play = serde_json::from_str::<SimPlay>(LATE_CATS)
+            .unwrap()
+            .to_play();
         let mut wolges = infer::kept_leaves_lean(
             &mut infer::InferTables::new(&game_config, &klv.klv).unwrap(),
             &mut movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config).unwrap(),
@@ -4661,8 +4673,8 @@ mod tests {
         for more in [r#""bonus":5"#, r#""challenged_off":true"#] {
             let err = do_infer(&format!(
                 r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{},{more}}},"fuzz":{fuzz}}}"#,
-                cat_board(),
-                CATS.strip_suffix('}').unwrap()
+                infer_board(),
+                LATE_CATS.strip_suffix('}').unwrap()
             ))
             .unwrap_err();
             assert!(err.starts_with("play: "), "{err}");
@@ -4713,8 +4725,8 @@ mod tests {
         let ask = |leave: &str, (lexicon, rules): (&str, &str)| {
             let answer = report(
                 &do_infer(&format!(
-                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"{lexicon}","leave":"{leave}","rules":"{rules}","play":{CATS},"fuzz":{},"list":{}}}"#,
-                    cat_board(),
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"{lexicon}","leave":"{leave}","rules":"{rules}","play":{LATE_CATS},"fuzz":{},"list":{}}}"#,
+                    infer_board(),
                     infer::FUZZ,
                     u32::MAX
                 ))
