@@ -3088,6 +3088,11 @@ struct EndgameNewRequest {
     pass_turns: u16,
     #[serde(default)]
     max_memory_mb: Option<usize>,
+    // the solver's table from the start, in MiB (none or 0: it grows from one
+    // bucket), held to half of max_memory_mb, as a growing table holds its old
+    // buckets beside the new ones
+    #[serde(default)]
+    reserve_mb: Option<usize>,
     // with two tiles or more in the bag: what each player knows once the first
     // move is made ("info_sets" or "random_draws", wolges's PegModel), and the
     // exchanges each seat has made
@@ -3266,6 +3271,7 @@ struct Endgame {
     pass_turns: u16,
     zero_turns: u16,
     max_memory: Option<usize>,
+    reserve: usize, // the table's bytes a first step reserves, 0 for none
     table: Option<endgame::KeptTable>,
     peg: Option<endgame::PegProgress>,
     finished: Option<(i8, equity::Equity)>, // an empty bag's deepest pass done, its value
@@ -3330,10 +3336,16 @@ impl Endgame {
                 movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
             )
             .map_err(err_to_str)?;
-        if let Some(table) = self.table.take()
-            && solver.give_table(table).is_err()
-        {
-            return Err("endgame: its table belongs to other tables".into());
+        match self.table.take() {
+            Some(table) => {
+                if solver.give_table(table).is_err() {
+                    return Err("endgame: its table belongs to other tables".into());
+                }
+            }
+            None if self.reserve != 0 => {
+                solver.reserve_table(self.reserve);
+            }
+            None => {}
         }
         solver.set_clock(clock);
         let limits = endgame::Limits {
@@ -3540,10 +3552,16 @@ impl Endgame {
                 movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
             )
             .map_err(err_to_str)?;
-        if let Some(table) = self.table.take()
-            && solver.give_table(table).is_err()
-        {
-            return Err("endgame: its table belongs to other tables".into());
+        match self.table.take() {
+            Some(table) => {
+                if solver.give_table(table).is_err() {
+                    return Err("endgame: its table belongs to other tables".into());
+                }
+            }
+            None if self.reserve != 0 => {
+                solver.reserve_table(self.reserve);
+            }
+            None => {}
         }
         solver.set_clock(clock);
         let limits = endgame::Limits {
@@ -3848,6 +3866,8 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
     // shifted would wrap to none)
     let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
+    let reserve = (req.reserve_mb.unwrap_or(0).saturating_mul(1 << 20))
+        .min(max_memory.map_or(usize::MAX, |bytes| bytes / 2));
     let endgame = Endgame {
         game_config,
         kwg,
@@ -3865,6 +3885,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         pass_turns: req.pass_turns,
         zero_turns: req.zero_turns,
         max_memory,
+        reserve,
         table,
         peg,
         finished: None,
