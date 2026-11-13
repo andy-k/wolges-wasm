@@ -3234,6 +3234,10 @@ struct EndgameAnswer {
     // the part of the search it is, k of n (endgame_new's part)
     #[serde(skip_serializing_if = "Option::is_none")]
     part: Option<[usize; 2]>,
+    // the step stopped short of exact holding max_memory_mb or more: the search
+    // has no room to go on (left out when not so)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    out_of_memory: bool,
 }
 
 // an endgame a caller steps and frees: its rules and its own word graph, of the
@@ -3363,6 +3367,7 @@ impl Endgame {
             let (k, n) = progress.part_of();
             EndgameAnswer {
                 part: (n > 1).then_some([k, n]),
+                out_of_memory: false,
                 bag: self.bag,
                 steps,
                 nodes,
@@ -3416,6 +3421,7 @@ impl Endgame {
             let (endgames, nodes) = progress.searched();
             EndgameAnswer {
                 part: None,
+                out_of_memory: false,
                 bag: 1,
                 steps,
                 nodes,
@@ -3491,6 +3497,7 @@ impl Endgame {
             let value = points(solved.value);
             EndgameAnswer {
                 part: None,
+                out_of_memory: false,
                 bag: 0,
                 steps,
                 nodes: self.nodes,
@@ -3864,6 +3871,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         nodes: 0,
         answer: EndgameAnswer {
             part: req.part.filter(|&[_, n]| n > 1),
+            out_of_memory: false,
             bag,
             steps: 0,
             nodes: 0,
@@ -3926,6 +3934,10 @@ fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<
         }
         Some(ms) => endgame.value_first_moves(ms, clock)?,
     }
+    endgame.answer.out_of_memory = !endgame.answer.exact
+        && endgame
+            .max_memory
+            .is_some_and(|bytes| held_bytes() >= bytes);
     serde_json::to_string(&endgame.answer).map_err(err_to_str)
 }
 
@@ -6218,6 +6230,7 @@ mod tests {
     fn an_empty_bags_answer_gives_way_only_to_a_better_one() {
         let answer = |exact: bool, depth: i8, value: f64| EndgameAnswer {
             part: None,
+            out_of_memory: false,
             bag: 0,
             steps: 1,
             nodes: 0,
@@ -6293,6 +6306,35 @@ mod tests {
             let max_memory = ENDGAMES.lock().unwrap().live[&handle].max_memory;
             assert_eq!(max_memory, cap, "{more}");
             do_endgame_free(handle).unwrap();
+        }
+    }
+
+    // a step says it is out of memory exactly when it stops short of exact
+    // holding its cap (1 MiB, less than the tests' tables already hold), in an
+    // empty bag's search and in a pre-endgame's; one with no cap never says so
+    #[test]
+    fn an_endgame_step_says_when_it_is_out_of_memory() {
+        let cases = [
+            (&[S, E, A, T][..], &[A, T, E][..], ""),
+            (
+                &[S, E, A, T, C, A, T][..],
+                &[A, T, E, S, E, A, T, E, E][..],
+                r#","model":"random_draws","exchanges":[0,0]"#,
+            ),
+        ];
+        for (rack, others, model) in cases {
+            for (cap, out) in [("", false), (r#","max_memory_mb":1"#, true)] {
+                let more = format!("{model}{cap}");
+                let handle = endgame_of("tiny-end-oom", rack, others, &more).unwrap();
+                let answer = endgame_step(handle, r#"{"ms":60000}"#);
+                let short = answer["exact"] == false;
+                let says = answer.get("out_of_memory").is_some();
+                assert_eq!(says, out && short, "{more}: {answer}");
+                if says {
+                    assert_eq!(answer["out_of_memory"], true, "{more}: {answer}");
+                }
+                do_endgame_free(handle).unwrap();
+            }
         }
     }
 
