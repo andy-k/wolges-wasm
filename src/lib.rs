@@ -2483,10 +2483,10 @@ impl Endgame {
                 ),
                 candidates: Some(
                     (peg.moves.iter())
-                        .map(|(play, win, margin)| EndgameCandidate {
-                            play: play.into(),
-                            win: *win,
-                            value: points(*margin) - lead,
+                        .map(|valued| EndgameCandidate {
+                            play: (&valued.play).into(),
+                            win: valued.win_pct,
+                            value: points(valued.expected_margin) - lead,
                         })
                         .collect(),
                 ),
