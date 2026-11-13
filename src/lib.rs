@@ -1988,11 +1988,13 @@ struct ThreatPlay {
 // it (0 if none does). chance: the chance the opponent holds a play that does
 // and scores that much. expected: the expected score in points of the
 // opponent's best play placing a tile on it (a rack with none scores 0).
+// reach: the chance the opponent holds any play placing a tile on it.
 #[derive(serde::Serialize)]
 struct ThreatSquare {
     best: i32,
     chance: f64,
     expected: f64,
+    reach: f64,
 }
 
 // what the opponent may play, by its rack's chance of holding the tiles. exact:
@@ -2075,12 +2077,13 @@ struct ThreatFound {
 }
 
 // the sums over racks of what the opponent may hold: each multiset's chance,
-// each square's chance and expected best, the best play's expected score and
-// the chance of a bingo
+// each square's chance, expected best and reach, the best play's expected score
+// and the chance of a bingo
 struct ThreatSums {
     holds: Vec<f64>,
     square_chance: Vec<f64>,
     square_expected: Vec<f64>,
+    square_reach: Vec<f64>,
     expected_best: f64,
     bingo: f64,
 }
@@ -2091,6 +2094,7 @@ impl ThreatSums {
             holds: vec![0.0; multisets],
             square_chance: vec![0.0; squares],
             square_expected: vec![0.0; squares],
+            square_reach: vec![0.0; squares],
             expected_best: 0.0,
             bingo: 0.0,
         }
@@ -2106,6 +2110,7 @@ impl ThreatSums {
         add(&mut self.holds, &those.holds);
         add(&mut self.square_chance, &those.square_chance);
         add(&mut self.square_expected, &those.square_expected);
+        add(&mut self.square_reach, &those.square_reach);
         self.expected_best += each * those.expected_best;
         self.bingo += each * those.bingo;
         self
@@ -2186,6 +2191,7 @@ impl ThreatWeigher {
         for &at in &self.touched {
             let score = self.rack_square[at].1;
             sums.square_expected[at] += weight * score as f64;
+            sums.square_reach[at] += weight;
             if score == tables.square_best[at] {
                 sums.square_chance[at] += weight;
             }
@@ -2574,6 +2580,7 @@ impl Threats {
                             best: equity::descale_score(self.square_best[at].max(0)),
                             chance: sums.square_chance[at],
                             expected: sums.square_expected[at] / equity::SCALE as f64,
+                            reach: sums.square_reach[at],
                         })
                     })
                     .collect()
@@ -6380,7 +6387,11 @@ mod tests {
                 if square["best"] == 0 {
                     assert_eq!(square["chance"], 0.0);
                     assert_eq!(square["expected"], 0.0);
+                    assert_eq!(square["reach"], 0.0);
                 } else {
+                    // a rack holding the best play there holds a play there
+                    let (chance, reach) = (square["chance"].as_f64(), square["reach"].as_f64());
+                    assert!(reach.unwrap() >= chance.unwrap() - 1e-12, "{square}");
                     reached.push((row, col, square.clone()));
                 }
             }
@@ -6446,6 +6457,7 @@ mod tests {
             assert_near(&square["chance"], 35.0 / 36.0);
             let best = square["best"].as_f64().unwrap();
             assert_near(&square["expected"], 35.0 / 36.0 * best);
+            assert_near(&square["reach"], 35.0 / 36.0);
             let (row, col) = (Some(*row), Some(*col));
             let placing = listed.iter().find(|play| {
                 let (lane, idx) = (play["lane"].as_i64(), play["idx"].as_i64());
