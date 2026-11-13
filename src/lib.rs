@@ -5872,8 +5872,8 @@ mod tests {
     // unseen; the value is their weighted mean, the win their weighted share
     #[test]
     fn an_endgame_with_a_tile_in_the_bag_weighs_each_tile() {
-        let rack = [S, E, A, T, C, A, T];
-        let others = [A, T, E, S, E, A, T, E];
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I];
         let handle = endgame_of("tiny-end-bag", &rack, &others, "").unwrap();
         // read before any step: no depth searched, nothing to play, no gain,
         // and no win
@@ -5945,8 +5945,8 @@ mod tests {
     // fewer than two in the bag, asking is refused
     #[test]
     fn an_endgame_asked_for_estimates_ends_as_one_without() {
-        let rack = [S, E, A, T, C, A, T];
-        let others = [A, T, E, S, E, A, T, E, E];
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
         let solve = |more: &str| {
             let more = format!(r#","model":"random_draws","exchanges":[0,0]{more}"#);
             let handle = endgame_of("tiny-end-estimates", &rack, &others, &more).unwrap();
@@ -5976,8 +5976,8 @@ mod tests {
     // search's; a part with fewer than two tiles in the bag is refused
     #[test]
     fn an_endgame_in_parts_draws_what_the_whole_does() {
-        let rack = [S, E, A, T, C, A, T];
-        let others = [A, T, E, S, E, A, T, E, E];
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
         let solve = |part: &str| {
             let more = format!(r#","model":"random_draws","exchanges":[0,0]{part}"#);
             let handle = endgame_of("tiny-end-parts", &rack, &others, &more).unwrap();
@@ -6028,8 +6028,8 @@ mod tests {
     // with its deals, and every play valued, the answer's first
     #[test]
     fn an_endgame_with_two_tiles_in_the_bag_is_wolges_s_search() {
-        let rack = [S, E, A, T, C, A, T];
-        let others = [A, T, E, S, E, A, T, E, E];
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
         let more = r#","model":"info_sets","exchanges":[0,0]"#;
         let handle = endgame_of("tiny-end-bag2", &rack, &others, more).unwrap();
         assert_eq!(endgame_step(handle, r#"{"ms":0}"#)["bag"], 2);
@@ -6225,8 +6225,8 @@ mod tests {
     // time limit ends the search, every move of its pass valued
     #[test]
     fn a_tile_in_the_bags_steps_count_their_endgames_and_nodes() {
-        let rack = [S, E, A, T, C, A, T];
-        let others = [A, T, E, S, E, A, T, E];
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I];
         let handle = endgame_of("tiny-end-bag-steps", &rack, &others, "").unwrap();
         let (mut endgames, mut nodes, mut partway) = (0, 0, false);
         let mut counted = |answer: &serde_json::Value| {
@@ -6350,8 +6350,8 @@ mod tests {
         let cases = [
             (&[S, E, A, T][..], &[A, T, E][..], ""),
             (
-                &[S, E, A, T, C, A, T][..],
-                &[A, T, E, S, E, A, T, E, E][..],
+                &[S, B, D, F, G, H, I][..],
+                &[E, S, B, D, F, G, H, I, J][..],
                 r#","model":"random_draws","exchanges":[0,0]"#,
             ),
         ];
