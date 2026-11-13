@@ -1950,9 +1950,9 @@ fn opponent_leaves(
 // holds as sim_new takes it (one of known, kept (or leaves) and inferred; none:
 // a rack dealt from the tiles unseen); count, how many best plays to list (all
 // if not given); ms, a time to run, listing included (none: no limit;
-// threats_new ignores it); seed, for the racks drawn when ms runs out. The
-// tiles the watcher would draw stay unseen, so a board with a play on it asks
-// after it.
+// threats_new ignores it); seed, for the racks drawn when ms runs out; square,
+// [row, col], to list only the plays placing a tile there. The tiles the
+// watcher would draw stay unseen, so a board with a play on it asks after it.
 #[derive(serde::Deserialize)]
 struct ThreatsRequest {
     #[serde(default)]
@@ -1971,6 +1971,7 @@ struct ThreatsRequest {
     count: Option<usize>,
     ms: Option<f64>,
     seed: Option<u64>,
+    square: Option<[usize; 2]>,
 }
 
 // a play the opponent may make as analyze gives one (its score in points).
@@ -2228,7 +2229,8 @@ struct Threats {
     weigher: ThreatWeigher,
     rng: rand::rngs::ChaCha20Rng,
     list_ms: f64,
-    listed: f64, // when listing every play ended
+    listed: f64,                     // when listing every play ended
+    drawn: (ThreatSums, f64, usize), // the last weighing's draws, each's weight, their number
 }
 
 // the threats made, by handle; a handle is never used twice
@@ -2484,25 +2486,32 @@ fn threats_made(req: ThreatsRequest, now: &impl Fn() -> f64) -> Result<Threats, 
         rng: rand::rngs::ChaCha20Rng::seed_from_u64(seed),
         list_ms,
         listed,
+        drawn: (ThreatSums::new(0, 0), 0.0, 0), // none yet
     })
 }
 
 impl Threats {
     // the racks not yet counted counted exactly, the likeliest first, till half
     // (if given) passes, then racks drawn from those left (each as likely as
-    // its chance) till deadline (if given) does; the answer, as ThreatsAnswer.
-    // Each multiset of a rack's tiles that a play is of adds the rack's weight
-    // to that multiset's; the rack's best play through each square, and its
-    // best play, are weighed in too. The racks counted exactly weigh their
-    // chance; the draws, each the chance those left hold over how many were
-    // drawn, an unbiased estimate of those left. The racks counted stay
-    // counted; the draws are made again each step.
+    // its chance) till deadline does; the answer, as ThreatsAnswer. Each rack
+    // weighs its chance in (ThreatWeigher::weigh), each draw the chance left
+    // over the draws. A step that does not weigh answers from the last one's
+    // draws. The plays: those placing a tile on square if given, count of them
+    // (else as many as asked of the handle).
     fn step(
         &mut self,
         half: Option<f64>,
         deadline: Option<f64>,
+        weigh: bool,
+        (count, square): (Option<usize>, Option<[usize; 2]>),
         now: &impl Fn() -> f64,
     ) -> Result<String, String> {
+        let rows = self.board_tiles.len() / self.cols;
+        let through = match square {
+            None => None,
+            Some([row, col]) if row < rows && col < self.cols => Some(row * self.cols + col),
+            Some([row, col]) => return Err(format!("square: [{row}, {col}] is off the board")),
+        };
         let tables = ThreatTables {
             ids: &self.ids,
             best: &self.best,
@@ -2512,7 +2521,7 @@ impl Threats {
             rack_size: self.rack_size,
         };
         let from = self.counted;
-        while self.counted < self.racks.len() {
+        while weigh && self.counted < self.racks.len() {
             let r = self.counted - from;
             if r.is_multiple_of(16) && r > 0 && half.is_some_and(|half| now() >= half) {
                 break;
@@ -2527,7 +2536,7 @@ impl Threats {
         let mut drawn_sums = ThreatSums::new(self.keys.len(), self.square_best.len());
         let mut samples = 0usize;
         let mut rest_chance = 0.0;
-        if !exact {
+        if weigh && !exact {
             let upto = (self.racks[self.counted..].iter())
                 .map(|(_, chance)| {
                     rest_chance += chance;
@@ -2551,13 +2560,24 @@ impl Threats {
         } else {
             0.0
         };
+        if weigh {
+            self.drawn = (drawn_sums, each, samples);
+        }
+        let (drawn_sums, each, samples) = &self.drawn;
+        let samples = if exact { 0 } else { *samples };
         let sums = (ThreatSums::new(self.keys.len(), self.square_best.len()))
             .plus(&self.exact_sums, 1.0)
-            .plus(&drawn_sums, each);
+            .plus(drawn_sums, *each);
         let word =
             |play: &ThreatFound| &self.words[play.word.start as usize..play.word.end as usize];
         let plays = (self.plays.iter())
-            .take(self.count_asked.unwrap_or(usize::MAX))
+            .filter(|play| {
+                through.is_none_or(|through| {
+                    placed_squares((play.down, play.lane, play.idx, word(play)), self.cols)
+                        .any(|at| at == through)
+                })
+            })
+            .take(count.or(self.count_asked).unwrap_or(usize::MAX))
             .map(|play| ThreatPlay {
                 tiles: self.keys[play.id as usize].to_vec(),
                 chance: sums.holds[play.id as usize],
@@ -2621,10 +2641,11 @@ pub fn threats(req_str: String) -> Result<String, JsValue> {
 fn do_threats(req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
     let req = serde_json::from_str::<ThreatsRequest>(req_str).map_err(err_to_str)?;
     let deadline = threats_deadline(req.ms, &now)?;
+    let square = req.square;
     let mut threats = threats_made(req, &now)?;
     let listed = threats.listed;
     let half = deadline.map(|deadline| listed + (deadline - listed).max(0.0) / 2.0);
-    threats.step(half, deadline, &now)
+    threats.step(half, deadline, true, (None, square), &now)
 }
 
 // threats_new: a threats question as threats takes it (ms not read), every play
@@ -2644,13 +2665,17 @@ fn do_threats_new(req_str: &str, now: impl Fn() -> f64) -> Result<u32, String> {
     Ok(handle)
 }
 
-// threats_step: ms, a time to run (none: every rack counted). The racks not yet
-// counted counted exactly in the first half of it, then racks drawn from those
-// left in the rest; the answer as threats gives it, exact once every rack is
-// counted
+// threats_step: ms, a time to run (none: every rack counted; 0: nothing more
+// weighed, the answer from what was). The racks not yet counted counted exactly
+// in the first half of it, then racks drawn from those left in the rest; the
+// answer as threats gives it, exact once every rack is counted, its plays those
+// through square ([row, col]) if given, count of them if given (else as many as
+// threats_new was asked for)
 #[derive(serde::Deserialize)]
 struct ThreatsStepRequest {
     ms: Option<f64>,
+    count: Option<usize>,
+    square: Option<[usize; 2]>,
 }
 
 #[wasm_bindgen]
@@ -2662,9 +2687,10 @@ fn do_threats_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<
     let req = serde_json::from_str::<ThreatsStepRequest>(req_str).map_err(err_to_str)?;
     let deadline = threats_deadline(req.ms, &now)?;
     let half = (req.ms.zip(deadline)).map(|(ms, deadline)| deadline - ms / 2.0);
+    let weigh = req.ms != Some(0.0);
     let mut made = THREATS.lock().map_err(err_to_str)?;
     let threats = (made.live.get_mut(&handle)).ok_or_else(|| no_threats(handle))?;
-    threats.step(half, deadline, &now)
+    threats.step(half, deadline, weigh, (req.count, req.square), &now)
 }
 
 // a threats question let go, with the plays and racks it holds
@@ -6649,10 +6675,11 @@ mod tests {
         }
     }
 
-    // threats a step at a time: a step of no time counts 16 racks, the
-    // likeliest, and draws 16 from the rest, as threats with ms does; a step
-    // with no ms counts the rest, the answer then exact and as threats gives
-    // it. Freed once only, and no step after.
+    // threats a step at a time: a step whose time is up at its first read of
+    // the clock (each read moves it on) counts 16 racks, the likeliest, and
+    // draws 16 from the rest, as threats with ms does; a step with no ms counts
+    // the rest, the answer then exact and as threats gives it. Freed once only,
+    // and no step after.
     #[test]
     fn threats_step_count_every_rack_in_the_end() {
         let unseen = [S, S, B, D, F, G, H, I, J];
@@ -6674,7 +6701,7 @@ mod tests {
             let answer = do_threats_step(handle, &format!(r#"{{{ms}}}"#), now).unwrap();
             serde_json::from_str::<serde_json::Value>(&answer).unwrap()
         };
-        let first = step(r#""ms":0"#);
+        let first = step(r#""ms":1"#);
         assert_eq!(first["exact"], false);
         assert_near(&first["covered"], 23.0 / 36.0);
         assert_eq!(first["samples"], 16);
@@ -6698,5 +6725,53 @@ mod tests {
         let gone = format!("threats {handle}: none such, or freed");
         assert_eq!(do_threats_free(handle), Err(gone.clone()));
         assert_eq!(do_threats_step(handle, "{}", now), Err(gone));
+    }
+
+    // a step of no time weighs nothing: before any weighing every chance is 0.
+    // Once every rack is weighed, a step of no time lists the plays through a
+    // square (S on (11, 9) is cats's alone), as many as asked; a square off the
+    // board is refused
+    #[test]
+    fn threats_step_list_the_plays_through_a_square() {
+        let unseen = [S, S, B, D, F, G, H, I, J];
+        let rack = [0, 0, I, I, I, I, I];
+        tiny_lexicon("tiny-threats");
+        let req = format!(
+            r#"{{"rack":{},"board":{},"lexicon":"tiny-threats","rules":"CrosswordGame"}}"#,
+            serde_json::to_string(&rack).unwrap(),
+            threats_board(&unseen, &rack),
+        );
+        let handle = do_threats_new(&req, || 0.0).unwrap();
+        let step = |more: &str| {
+            let answer = do_threats_step(handle, &format!("{{{more}}}"), || 0.0).unwrap();
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap()
+        };
+        let none = step(r#""ms":0"#);
+        assert_eq!(none["exact"], false);
+        assert_eq!(none["covered"], 0.0);
+        assert_eq!(none["samples"], 0);
+        let all = step("");
+        assert_eq!(all["exact"], true);
+        let plays = all["plays"].as_array().unwrap();
+        assert_eq!(plays.len(), 3);
+        let through = step(r#""ms":0,"square":[11,9]"#);
+        assert_eq!(through["exact"], true);
+        assert_eq!(through["squares"], all["squares"]);
+        let listed = through["plays"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["word"], serde_json::json!([0, 0, 0, S]));
+        let two = step(r#""ms":0,"count":2"#);
+        assert_eq!(two["plays"].as_array().unwrap()[..], plays[..2]);
+        assert!(
+            step(r#""ms":0,"square":[0,0]"#)["plays"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            do_threats_step(handle, r#"{"ms":0,"square":[15,0]}"#, || 0.0).unwrap_err(),
+            "square: [15, 0] is off the board"
+        );
+        do_threats_free(handle).unwrap();
     }
 }
