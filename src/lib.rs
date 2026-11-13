@@ -6343,8 +6343,9 @@ mod tests {
     }
 
     // a step says it is out of memory exactly when it stops short of exact
-    // holding its cap (1 MiB, less than the tests' tables already hold), in an
-    // empty bag's search and in a pre-endgame's; one with no cap never says so
+    // holding its cap (1 MiB, less than a buffer kept while it steps holds,
+    // whatever other tests hold), in an empty bag's search and in a
+    // pre-endgame's; one with no cap never says so
     #[test]
     fn an_endgame_step_says_when_it_is_out_of_memory() {
         let cases = [
@@ -6355,6 +6356,7 @@ mod tests {
                 r#","model":"random_draws","exchanges":[0,0]"#,
             ),
         ];
+        let kept = std::hint::black_box(vec![1u8; 2 << 20]);
         for (rack, others, model) in cases {
             for (cap, out) in [("", false), (r#","max_memory_mb":1"#, true)] {
                 let more = format!("{model}{cap}");
@@ -6369,6 +6371,7 @@ mod tests {
                 do_endgame_free(handle).unwrap();
             }
         }
+        drop(kept);
     }
 
     // a what-if warmed by an endgame before it answers as a cold one does, on
