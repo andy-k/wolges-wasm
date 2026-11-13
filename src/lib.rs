@@ -806,6 +806,60 @@ struct InferAnswer {
     handle: u32,
     count: usize,
     leaves: Vec<WeightedLeave>,
+    tiles: Vec<InferTile>, // one a tile, in tile order (0 the blank)
+}
+
+// a tile (its place in the list), what the inference says of it: the chance the
+// opponent's rack holds one or more, the rack its kept leave by the inference's
+// weights and the rest dealt from the tiles unseen less that leave (held), or
+// dealt from the tiles unseen alone (prior)
+#[derive(serde::Serialize)]
+struct InferTile {
+    held: f64,
+    prior: f64,
+}
+
+// each tile's InferTile: unseen, the tiles unseen after the play (a count each
+// tile); rack, the tiles the opponent's rack holds; leaves, the inference's
+// leaves, their weights summing to 1 (none: held is prior)
+fn infer_tiles<'a>(
+    unseen: &[u8],
+    rack: usize,
+    leaves: impl Iterator<Item = (&'a [u8], f64)>,
+) -> Vec<InferTile> {
+    let total = unseen.iter().map(|&count| count as usize).sum::<usize>();
+    // the chance a rack of more tiles dealt from left (n tiles) holds tile
+    let dealt = |left: &[u8], n: usize, more: usize, tile: usize| {
+        let others = n - left[tile] as usize;
+        1.0 - choose(others, more) / choose(n, more)
+    };
+    let prior = (0..unseen.len())
+        .map(|tile| dealt(unseen, total, rack.min(total), tile))
+        .collect::<Vec<_>>();
+    let mut held = vec![0.0; unseen.len()];
+    let mut left = vec![0u8; unseen.len()];
+    let mut any = false;
+    for (leave, weight) in leaves {
+        any = true;
+        left.copy_from_slice(unseen);
+        for &tile in leave {
+            left[tile as usize] = left[tile as usize].saturating_sub(1);
+        }
+        let n = total - leave.len().min(total);
+        let more = rack.saturating_sub(leave.len()).min(n);
+        for (tile, held) in held.iter_mut().enumerate() {
+            *held += weight
+                * if leave.contains(&(tile as u8)) {
+                    1.0
+                } else {
+                    dealt(&left, n, more, tile)
+                };
+        }
+    }
+    let held = if any { held } else { prior.clone() };
+    (held.into_iter().zip(prior))
+        .map(|(held, prior)| InferTile { held, prior })
+        .collect()
 }
 
 // the inferences made, by handle, each its leaves (shared with the sims given
@@ -938,6 +992,21 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     leaves.normalize();
     let listed = likeliest(&leaves, req.list);
     let count = leaves.len();
+    // the tiles unseen after the play: those it placed are on the board
+    let mut unseen = kibitzer.available_tally.clone();
+    if let movegen::Play::Place { word, .. } = req.play.to_play() {
+        for &tile in word.iter().filter(|&&tile| tile != 0) {
+            let tile = if tile & 0x80 != 0 { 0 } else { tile as usize };
+            unseen[tile] = unseen[tile].saturating_sub(1);
+        }
+    }
+    let num_unseen = unseen.iter().map(|&count| count as usize).sum::<usize>();
+    let rack = (game_config.rack_size() as usize).min(num_unseen);
+    let tiles = infer_tiles(
+        &unseen,
+        rack,
+        (0..count).map(|i| (leaves.leave(i), leaves.weight(i))),
+    );
     let mut inferences = INFERENCES.lock().map_err(err_to_str)?;
     let handle = (inferences.made.checked_add(1)).ok_or("too many inferences made")?;
     inferences.made = handle;
@@ -947,6 +1016,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
         handle,
         count,
         leaves: listed,
+        tiles,
     })
     .map_err(err_to_str)
 }
@@ -4498,15 +4568,49 @@ mod tests {
                 handle,
                 count: listed.len(),
                 leaves: listed[..n].to_vec(),
+                tiles: Vec::new(),
             })
             .unwrap()
         };
+        // the answer as text but its tiles (checked below); a weight read back
+        // from JSON can be off in its last place, so the text is compared
+        let but_tiles = |answer: &str| {
+            let cut = answer.find(r#","tiles":"#).unwrap();
+            format!("{}}}", &answer[..cut])
+        };
         let first = handle_of(&answer);
-        assert_eq!(answer, want(first, listed.len()));
+        assert_eq!(but_tiles(&answer), but_tiles(&want(first, listed.len())));
         let three = ask(&format!(r#","fuzz":{fuzz},"list":3"#)).unwrap();
-        assert_eq!(three, want(first + 1, 3));
+        assert_eq!(but_tiles(&three), but_tiles(&want(first + 1, 3)));
         let none = ask(&format!(r#","fuzz":{fuzz}"#)).unwrap();
-        assert_eq!(none, want(first + 2, 0));
+        assert_eq!(but_tiles(&none), but_tiles(&want(first + 2, 0)));
+        // each tile over every leave, however many were listed: the tiles
+        // unseen after CATS (its S on the board), a rack of 7 of them; a tile
+        // unseen nowhere is {0, 0}, and the prior is the deal's alone
+        let mut unseen = kibitzer.available_tally.clone();
+        unseen[S as usize] -= 1;
+        let total = unseen.iter().map(|&count| count as usize).sum::<usize>();
+        let tiles = infer_tiles(
+            &unseen,
+            7.min(total),
+            listed.iter().map(|leave| (&leave.tiles[..], leave.weight)),
+        );
+        for answer in [&answer, &three, &none] {
+            let found = report(answer)["tiles"].as_array().unwrap().clone();
+            assert_eq!(found.len(), unseen.len());
+            for (tile, (found, want)) in found.iter().zip(&tiles).enumerate() {
+                let held = found["held"].as_f64().unwrap();
+                let prior = found["prior"].as_f64().unwrap();
+                assert!((held - want.held).abs() < 1e-9, "{tile}: {found}");
+                assert_eq!(prior, want.prior, "{tile}");
+                let left = total - unseen[tile] as usize;
+                let deal = 1.0 - choose(left, 7.min(total)) / choose(total, 7.min(total));
+                assert!((prior - deal).abs() < 1e-12, "{tile}");
+                if unseen[tile] == 0 {
+                    assert_eq!((held, prior), (0.0, 0.0), "{tile}");
+                }
+            }
+        }
         for handle in first..first + 3 {
             do_infer_free(handle).unwrap();
         }
@@ -4629,9 +4733,17 @@ mod tests {
             .unwrap(),
         );
         let handle = answer["handle"].clone();
+        // no leaves: each tile's held is its prior, and with three tiles unseen
+        // and the bag empty the rack holds them all, A, T and E for certain
+        let tiles = (0..27)
+            .map(|tile| {
+                let p = if [A, T, E].contains(&tile) { 1.0 } else { 0.0 };
+                serde_json::json!({"held": p, "prior": p})
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             answer,
-            serde_json::json!({"handle": handle, "count": 0, "leaves": []})
+            serde_json::json!({"handle": handle, "count": 0, "leaves": [], "tiles": tiles})
         );
         do_infer_free(handle.as_u64().unwrap() as u32).unwrap();
     }
