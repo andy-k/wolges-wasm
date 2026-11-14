@@ -3056,11 +3056,22 @@ fn held_bytes() -> usize {
     HELD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// the bytes the wasm holds now, as an endgame's memory cap counts them: what a
-// page reads after endgame_new to size each worker's share of the memory
+// the bytes the wasm's allocator holds now
 #[wasm_bindgen]
 pub fn memory_held() -> f64 {
     held_bytes() as f64
+}
+
+// the bytes of the wasm's whole linear memory, as an endgame's memory cap
+// counts them
+#[cfg(target_arch = "wasm32")]
+fn page_memory() -> usize {
+    core::arch::wasm32::memory_size(0) * 65536
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn page_memory() -> usize {
+    held_bytes()
 }
 
 // the page's clock as an endgame reads it: performance.now, as a sim's step's
@@ -3369,7 +3380,12 @@ fn points(equity: equity::Equity) -> f64 {
 
 impl Endgame {
     // one solve of at most ms on the clock, on the table earlier steps kept
-    fn solve(&mut self, ms: f64, clock: endgame::Clock) -> Result<(), String> {
+    fn solve(
+        &mut self,
+        ms: f64,
+        clock: endgame::Clock,
+        memory: fn() -> usize,
+    ) -> Result<(), String> {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &self.game_config,
@@ -3395,7 +3411,7 @@ impl Endgame {
             states: None,
             memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
                 bytes,
-                held: held_bytes,
+                held: memory,
             }),
         };
         let lead = points(equity::Equity::new(self.lead));
@@ -3587,7 +3603,12 @@ impl Endgame {
     // in at most ms milliseconds, into the answer's candidates: best first,
     // each exact once no line is cut short; one a limit stopped before its
     // first depth is left out
-    fn value_first_moves(&mut self, ms: f64, clock: endgame::Clock) -> Result<(), String> {
+    fn value_first_moves(
+        &mut self,
+        ms: f64,
+        clock: endgame::Clock,
+        memory: fn() -> usize,
+    ) -> Result<(), String> {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &self.game_config,
@@ -3613,7 +3634,7 @@ impl Endgame {
             states: None,
             memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
                 bytes,
-                held: held_bytes,
+                held: memory,
             }),
         };
         let lead = points(equity::Equity::new(self.lead));
@@ -3971,10 +3992,15 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
 // a step of an endgame, as EndgameAnswer
 #[wasm_bindgen]
 pub fn endgame_step(handle: u32, req_str: String) -> Result<String, JsValue> {
-    Ok(do_endgame_step(handle, &req_str, page_clock)?)
+    Ok(do_endgame_step(handle, &req_str, page_clock, page_memory)?)
 }
 
-fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<String, String> {
+fn do_endgame_step(
+    handle: u32,
+    req_str: &str,
+    clock: endgame::Clock,
+    memory: fn() -> usize,
+) -> Result<String, String> {
     let req = serde_json::from_str::<EndgameStepRequest>(req_str).map_err(err_to_str)?;
     let ms = match req.ms {
         Some(ms) if ms >= 0.0 && ms.is_finite() => ms,
@@ -3988,7 +4014,7 @@ fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<
         .ok_or_else(|| no_endgame(handle))?;
     // an exact answer stays: no solve can better it
     if ms > 0.0 && !endgame.answer.exact {
-        endgame.solve(ms, clock)?;
+        endgame.solve(ms, clock, memory)?;
     }
     match req.first_moves_ms {
         None => {}
@@ -4000,12 +4026,10 @@ fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<
                 "first_moves_ms: with tiles in the bag every move is valued in candidates".into(),
             );
         }
-        Some(ms) => endgame.value_first_moves(ms, clock)?,
+        Some(ms) => endgame.value_first_moves(ms, clock, memory)?,
     }
-    endgame.answer.out_of_memory = !endgame.answer.exact
-        && endgame
-            .max_memory
-            .is_some_and(|bytes| held_bytes() >= bytes);
+    endgame.answer.out_of_memory =
+        !endgame.answer.exact && endgame.max_memory.is_some_and(|bytes| memory() >= bytes);
     if req.brief {
         if req.draws_of.is_some() {
             return Err("brief: no draws come with it, so not with draws_of".into());
@@ -5811,7 +5835,7 @@ mod tests {
     }
 
     fn endgame_step(handle: u32, req: &str) -> serde_json::Value {
-        report(&do_endgame_step(handle, req, frozen).unwrap())
+        report(&do_endgame_step(handle, req, frozen, held_bytes).unwrap())
     }
 
     fn with_draws(handle: u32, answer: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -5862,7 +5886,9 @@ mod tests {
             "",
         )
         .unwrap();
-        assert!(do_endgame_step(bag, r#"{"ms":0,"first_moves_ms":1}"#, frozen).is_err());
+        assert!(
+            do_endgame_step(bag, r#"{"ms":0,"first_moves_ms":1}"#, frozen, held_bytes).is_err()
+        );
     }
 
     // an empty bag: the other side holds the tiles unseen, and the answer is
@@ -5923,7 +5949,7 @@ mod tests {
         do_endgame_free(again).unwrap();
         do_endgame_free(handle).unwrap();
         for err in [
-            do_endgame_step(handle, r#"{"ms":1}"#, frozen).unwrap_err(),
+            do_endgame_step(handle, r#"{"ms":1}"#, frozen, held_bytes).unwrap_err(),
             do_endgame_free(handle).unwrap_err(),
         ] {
             assert!(err.contains("freed"), "{err}");
@@ -6168,7 +6194,10 @@ mod tests {
         );
         let candidates = &with_draws(handle, &answer);
         let past = format!(r#"{{"ms":0,"draws_of":{}}}"#, candidates.len());
-        assert!(do_endgame_step(handle, &past, frozen).is_err(), "{name}");
+        assert!(
+            do_endgame_step(handle, &past, frozen, held_bytes).is_err(),
+            "{name}"
+        );
         let whole = candidates[0]["draws"].as_array().unwrap();
         let page = endgame_step(handle, r#"{"ms":0,"draws_of":0,"draws_range":[1,2]}"#);
         let page = &page["candidates"][0];
@@ -6185,7 +6214,7 @@ mod tests {
             "{name}"
         );
         let alone = r#"{"ms":0,"draws_range":[0,1]}"#;
-        assert!(do_endgame_step(handle, alone, frozen).is_err());
+        assert!(do_endgame_step(handle, alone, frozen, held_bytes).is_err());
         let brief = endgame_step(handle, r#"{"ms":0,"brief":true}"#);
         let mut state = answer.clone();
         for key in ["candidates", "draws", "tiles", "line"] {
@@ -6193,7 +6222,10 @@ mod tests {
         }
         assert_eq!(brief, state, "{name}");
         let both = r#"{"ms":0,"brief":true,"draws_of":0}"#;
-        assert!(do_endgame_step(handle, both, frozen).is_err(), "{name}");
+        assert!(
+            do_endgame_step(handle, both, frozen, held_bytes).is_err(),
+            "{name}"
+        );
         assert_eq!(answer["play"], candidates[0]["play"], "{name}");
         assert_eq!(answer["value"], candidates[0]["value"], "{name}");
         assert_eq!(answer["win"], candidates[0]["win"], "{name}");
@@ -6344,7 +6376,8 @@ mod tests {
         let mut nodes = 0;
         for step in 1.. {
             assert!(step <= 1000, "the steps did not end in a thousand");
-            let answer = report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking).unwrap());
+            let answer =
+                report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking, held_bytes).unwrap());
             // every step searches more nodes, whether its answer is taken or not
             let now = answer["nodes"].as_u64().unwrap();
             assert!(now > nodes, "step {step}: {now} nodes after {nodes}");
@@ -6392,7 +6425,8 @@ mod tests {
             (valued, of)
         };
         for _ in 0..50 {
-            let answer = report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking).unwrap());
+            let answer =
+                report(&do_endgame_step(handle, r#"{"ms":4}"#, ticking, held_bytes).unwrap());
             assert_eq!(answer["exact"], false, "{answer}");
             counted(&answer);
         }
@@ -6657,11 +6691,11 @@ mod tests {
         }
         let handle = endgame_of("tiny-end-refuse", &[S], &[A, T], "").unwrap();
         assert_eq!(
-            do_endgame_step(handle, "{}", frozen).unwrap_err(),
+            do_endgame_step(handle, "{}", frozen, held_bytes).unwrap_err(),
             "endgame_step: give ms"
         );
         assert_eq!(
-            do_endgame_step(handle, r#"{"ms":-1}"#, frozen).unwrap_err(),
+            do_endgame_step(handle, r#"{"ms":-1}"#, frozen, held_bytes).unwrap_err(),
             "ms: -1 is not a time to run"
         );
         do_endgame_free(handle).unwrap();
