@@ -3119,12 +3119,19 @@ struct EndgameNewRequest {
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer. With
 // an empty bag, first_moves_ms asks for every first move's value too, on the
-// table the steps kept, in at most that many milliseconds more
+// table the steps kept, in at most that many milliseconds more. With two tiles
+// or more in the bag, draws_of asks for one candidate's draws (its index in the
+// answer's candidates)
 #[derive(serde::Deserialize)]
 struct EndgameStepRequest {
     ms: Option<f64>,
     #[serde(default)]
     first_moves_ms: Option<f64>,
+    #[serde(default)]
+    draws_of: Option<usize>,
+    // with draws_of, its rows from the first given to before the second
+    #[serde(default)]
+    draws_range: Option<[usize; 2]>,
 }
 
 // a ply of an endgame's line: the play, and its mover's gain on the other from
@@ -3172,6 +3179,12 @@ struct EndgameCandidate {
     tiles: Option<Vec<EndgameBagTile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     draws: Option<Vec<EndgameBagDraw>>,
+    // with two or more in the bag, the deals its draws count
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deals: Option<u64>,
+    // with draws_of: the rows its whole draws hold (draws_range pages them)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draws_total: Option<usize>,
     exact: bool,
 }
 
@@ -3266,6 +3279,7 @@ struct Endgame {
     in_bag: bool,
     bag: usize,
     peg_bag: Option<endgame::PegBagProgress>,
+    bag_moves: Vec<endgame::PegBagMove>, // the last answer's candidates, two or more in the bag
     turn: u8,
     lead: i32,
     pass_turns: u16,
@@ -3359,6 +3373,7 @@ impl Endgame {
         let lead = points(equity::Equity::new(self.lead));
         let steps = self.answer.steps + 1;
         let answer = if let Some(progress) = self.peg_bag.as_mut() {
+            self.bag_moves = Vec::new();
             solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
             let peg = solver.resume_peg(progress, &limits);
             let peg = peg
@@ -3377,7 +3392,7 @@ impl Endgame {
             let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
             let (k, n) = progress.part_of();
-            EndgameAnswer {
+            let answer = EndgameAnswer {
                 part: (n > 1).then_some([k, n]),
                 out_of_memory: false,
                 bag: self.bag,
@@ -3399,19 +3414,18 @@ impl Endgame {
                             win: valued.win_pct,
                             value: points(valued.expected_margin) - lead,
                             tiles: None,
-                            draws: Some(bag_draws(
-                                &valued.hypotheses,
-                                &valued.wins,
-                                &valued.draws,
-                                lead,
-                            )),
+                            draws: None,
+                            deals: Some(valued.hypotheses.iter().map(|h| h.1).sum()),
+                            draws_total: None,
                             exact: valued.exact,
                         })
                         .collect(),
                 ),
                 endgames: Some(endgames),
                 moves: progress.moves().map(|(valued, of)| [valued, of]),
-            }
+            };
+            self.bag_moves = peg.moves;
+            answer
         } else if let Some(progress) = self.peg.as_mut() {
             solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
             let peg = solver.resume_peg_one_in_bag(progress, &limits);
@@ -3470,6 +3484,8 @@ impl Endgame {
                                     .collect(),
                             ),
                             draws: None,
+                            deals: None,
+                            draws_total: None,
                             exact: valued.exact,
                         })
                         .collect(),
@@ -3607,6 +3623,8 @@ impl Endgame {
                         value,
                         tiles: None,
                         draws: None,
+                        deals: None,
+                        draws_total: None,
                         exact: first.exact,
                     })
                 })
@@ -3880,6 +3898,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         in_bag,
         bag,
         peg_bag,
+        bag_moves: Vec::new(),
         turn: req.turn,
         lead: scores,
         pass_turns: req.pass_turns,
@@ -3959,7 +3978,39 @@ fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<
         && endgame
             .max_memory
             .is_some_and(|bytes| held_bytes() >= bytes);
-    serde_json::to_string(&endgame.answer).map_err(err_to_str)
+    let Some(i) = req.draws_of else {
+        if req.draws_range.is_some() {
+            return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
+        }
+        return serde_json::to_string(&endgame.answer).map_err(err_to_str);
+    };
+    let Some(valued) = endgame.bag_moves.get(i) else {
+        return Err(format!(
+            "draws_of: {i} is no candidate of the {} with draws",
+            endgame.bag_moves.len()
+        ));
+    };
+    let lead = points(equity::Equity::new(endgame.lead));
+    let total = valued.hypotheses.len();
+    let [from, to] = req
+        .draws_range
+        .unwrap_or([0, total])
+        .map(|at| at.min(total));
+    let to = to.max(from);
+    let draws = bag_draws(
+        &valued.hypotheses[from..to],
+        &valued.wins[from..to],
+        &valued.draws[from..to],
+        lead,
+    );
+    let candidate = &mut endgame.answer.candidates.as_mut().unwrap()[i];
+    candidate.draws = Some(draws);
+    candidate.draws_total = Some(total);
+    let answer = serde_json::to_string(&endgame.answer).map_err(err_to_str);
+    let candidate = &mut endgame.answer.candidates.as_mut().unwrap()[i];
+    candidate.draws = None;
+    candidate.draws_total = None;
+    answer
 }
 
 // an endgame let go, with its table and the tables it holds
@@ -5713,6 +5764,15 @@ mod tests {
         report(&do_endgame_step(handle, req, frozen).unwrap())
     }
 
+    fn with_draws(handle: u32, answer: &serde_json::Value) -> Vec<serde_json::Value> {
+        (0..answer["candidates"].as_array().unwrap().len())
+            .map(|i| {
+                let one = endgame_step(handle, &format!(r#"{{"ms":0,"draws_of":{i}}}"#));
+                one["candidates"][i].clone()
+            })
+            .collect()
+    }
+
     // the bytes held count every byte live, so never fewer than a buffer kept
     #[test]
     fn the_wasm_says_how_many_bytes_it_holds() {
@@ -5981,7 +6041,8 @@ mod tests {
         let solve = |part: &str| {
             let more = format!(r#","model":"random_draws","exchanges":[0,0]{part}"#);
             let handle = endgame_of("tiny-end-parts", &rack, &others, &more).unwrap();
-            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            let mut answer = endgame_step(handle, r#"{"ms":60000}"#);
+            answer["candidates"] = serde_json::Value::Array(with_draws(handle, &answer));
             do_endgame_free(handle).unwrap();
             answer
         };
@@ -6050,7 +6111,31 @@ mod tests {
         assert_eq!(answer["exact"], true, "{name}");
         assert!(answer["endgames"].as_u64().unwrap() > 0, "{name}: {answer}");
         assert!(answer["nodes"].as_u64().unwrap() > 0, "{name}: {answer}");
-        let candidates = answer["candidates"].as_array().unwrap();
+        let plain = answer["candidates"].as_array().unwrap();
+        assert!(
+            plain.iter().all(|c| c.get("draws").is_none()),
+            "{name}: {answer}"
+        );
+        let candidates = &with_draws(handle, &answer);
+        let past = format!(r#"{{"ms":0,"draws_of":{}}}"#, candidates.len());
+        assert!(do_endgame_step(handle, &past, frozen).is_err(), "{name}");
+        let whole = candidates[0]["draws"].as_array().unwrap();
+        let page = endgame_step(handle, r#"{"ms":0,"draws_of":0,"draws_range":[1,2]}"#);
+        let page = &page["candidates"][0];
+        assert_eq!(page["draws"].as_array().unwrap()[..], whole[1..2], "{name}");
+        assert_eq!(page["draws_total"], whole.len(), "{name}");
+        let past = format!(
+            r#"{{"ms":0,"draws_of":0,"draws_range":[{0},{0}]}}"#,
+            whole.len() + 1
+        );
+        let past = endgame_step(handle, &past);
+        assert_eq!(
+            past["candidates"][0]["draws"],
+            serde_json::json!([]),
+            "{name}"
+        );
+        let alone = r#"{"ms":0,"draws_range":[0,1]}"#;
+        assert!(do_endgame_step(handle, alone, frozen).is_err());
         assert_eq!(answer["play"], candidates[0]["play"], "{name}");
         assert_eq!(answer["value"], candidates[0]["value"], "{name}");
         assert_eq!(answer["win"], candidates[0]["win"], "{name}");
@@ -6083,6 +6168,11 @@ mod tests {
                 .sum::<f64>();
             assert!(
                 (won / total - candidate["win"].as_f64().unwrap()).abs() < 1e-9,
+                "{name}: {candidate}"
+            );
+            assert_eq!(
+                candidate["deals"].as_f64(),
+                Some(total),
                 "{name}: {candidate}"
             );
             // under each set, the draws the play makes from it (random draws),
