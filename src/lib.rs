@@ -3121,7 +3121,8 @@ struct EndgameNewRequest {
 // an empty bag, first_moves_ms asks for every first move's value too, on the
 // table the steps kept, in at most that many milliseconds more. With two tiles
 // or more in the bag, draws_of asks for one candidate's draws (its index in the
-// answer's candidates)
+// answer's candidates). brief asks for the answer's state alone: no candidates,
+// draws, tiles or line
 #[derive(serde::Deserialize)]
 struct EndgameStepRequest {
     ms: Option<f64>,
@@ -3132,6 +3133,33 @@ struct EndgameStepRequest {
     // with draws_of, its rows from the first given to before the second
     #[serde(default)]
     draws_range: Option<[usize; 2]>,
+    #[serde(default)]
+    brief: bool,
+}
+
+// endgame_step's answer when brief: its fields of the state, as they are
+#[derive(serde::Serialize)]
+struct EndgameBrief<'a> {
+    bag: usize,
+    steps: u64,
+    nodes: u64,
+    exact: bool,
+    play: &'a Option<kibitzer::JsonPlay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
+    spread: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    win: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endgames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moves: Option<[usize; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part: Option<[usize; 2]>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    out_of_memory: bool,
 }
 
 // a ply of an endgame's line: the play, and its mover's gain on the other from
@@ -3978,6 +4006,28 @@ fn do_endgame_step(handle: u32, req_str: &str, clock: endgame::Clock) -> Result<
         && endgame
             .max_memory
             .is_some_and(|bytes| held_bytes() >= bytes);
+    if req.brief {
+        if req.draws_of.is_some() {
+            return Err("brief: no draws come with it, so not with draws_of".into());
+        }
+        let a = &endgame.answer;
+        let brief = EndgameBrief {
+            bag: a.bag,
+            steps: a.steps,
+            nodes: a.nodes,
+            exact: a.exact,
+            play: &a.play,
+            value: a.value,
+            spread: a.spread,
+            depth: a.depth,
+            win: a.win,
+            endgames: a.endgames,
+            moves: a.moves,
+            part: a.part,
+            out_of_memory: a.out_of_memory,
+        };
+        return serde_json::to_string(&brief).map_err(err_to_str);
+    }
     let Some(i) = req.draws_of else {
         if req.draws_range.is_some() {
             return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
@@ -6136,6 +6186,14 @@ mod tests {
         );
         let alone = r#"{"ms":0,"draws_range":[0,1]}"#;
         assert!(do_endgame_step(handle, alone, frozen).is_err());
+        let brief = endgame_step(handle, r#"{"ms":0,"brief":true}"#);
+        let mut state = answer.clone();
+        for key in ["candidates", "draws", "tiles", "line"] {
+            state.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(brief, state, "{name}");
+        let both = r#"{"ms":0,"brief":true,"draws_of":0}"#;
+        assert!(do_endgame_step(handle, both, frozen).is_err(), "{name}");
         assert_eq!(answer["play"], candidates[0]["play"], "{name}");
         assert_eq!(answer["value"], candidates[0]["value"], "{name}");
         assert_eq!(answer["win"], candidates[0]["win"], "{name}");
