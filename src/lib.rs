@@ -3260,8 +3260,9 @@ fn bag_draws(
 // before a step solved), and the lead it then ends with, in points; with an
 // empty bag the depth searched and the line; with tiles in it the share of the
 // deals the play wins, the endgames searched, the moves its pass has valued of
-// all it values, and the gain for each tile the bag may be (one tile) or for
-// each set it may hold, with every play valued, best first (two or more)
+// all it values, and the gain for each tile the bag may be (one tile), or
+// every play valued, best first, each with its deals (two or more: a play's
+// draws, the best's too, come by draws_of)
 #[derive(serde::Serialize)]
 struct EndgameAnswer {
     bag: usize,
@@ -3280,8 +3281,6 @@ struct EndgameAnswer {
     win: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tiles: Option<Vec<EndgameBagTile>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    draws: Option<Vec<EndgameBagDraw>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     candidates: Option<Vec<EndgameCandidate>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3450,7 +3449,6 @@ impl Endgame {
                 line: None,
                 win: valued.then_some(peg.win_pct),
                 tiles: None,
-                draws: Some(bag_draws(&peg.hypotheses, &peg.wins, &peg.draws, lead)),
                 candidates: Some(
                     (peg.moves.iter())
                         .map(|valued| EndgameCandidate {
@@ -3511,7 +3509,6 @@ impl Endgame {
                         })
                         .collect(),
                 ),
-                draws: None,
                 candidates: Some(
                     (peg.moves.iter())
                         .map(|valued| EndgameCandidate {
@@ -3588,7 +3585,6 @@ impl Endgame {
                 ),
                 win: None,
                 tiles: None,
-                draws: None,
                 candidates: None,
                 endgames: None,
                 moves: None,
@@ -3972,7 +3968,6 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             line: (!in_bag).then(Vec::new),
             win: None,
             tiles: (bag == 1).then(Vec::new),
-            draws: (bag >= 2).then(Vec::new),
             candidates: in_bag.then(Vec::new),
             endgames: in_bag.then_some(0),
             moves: None,
@@ -6178,7 +6173,7 @@ mod tests {
         assert_eq!(
             before,
             serde_json::json!({"bag": 2, "steps": 0, "nodes": 0, "exact": false,
-                    "play": null, "spread": 0.0, "depth": 0, "draws": [],
+                    "play": null, "spread": 0.0, "depth": 0,
                     "candidates": [], "endgames": 0}),
             "{name}"
         );
@@ -6231,16 +6226,16 @@ mod tests {
         assert_eq!(answer["win"], candidates[0]["win"], "{name}");
         let all = candidates.len() as u64;
         assert_eq!(answer["moves"], serde_json::json!([all, all]), "{name}");
-        let draws = answer["draws"].as_array().unwrap();
+        assert!(answer.get("draws").is_none(), "{name}: {answer}");
+        let draws = candidates[0]["draws"].as_array().unwrap();
         assert!(
             draws
                 .iter()
                 .all(|d| d["tiles"].as_array().unwrap().len() == 2),
             "{name}: {answer}"
         );
-        // every candidate with its own draws, the answer's the first's, each
-        // with its chance to win, the chances making the candidate's win
-        assert_eq!(candidates[0]["draws"], answer["draws"], "{name}");
+        // every candidate with its own draws, each with its chance to win,
+        // the chances making the candidate's win
         for candidate in candidates {
             let own = candidate["draws"].as_array().unwrap();
             assert_eq!(own.len(), draws.len(), "{name}: {candidate}");
@@ -6459,7 +6454,6 @@ mod tests {
             line: Some(Vec::new()),
             win: None,
             tiles: None,
-            draws: None,
             candidates: None,
             endgames: None,
             moves: None,
