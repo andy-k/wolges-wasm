@@ -3826,6 +3826,8 @@ struct EndgameStepRequest {
 enum DrawsOf {
     // its index in the answer's candidates
     Index(usize),
+    // its play, as a candidate's play reads
+    Play(kibitzer::JsonPlay),
 }
 
 // endgame_step's answer with only some of its candidates, the count of all,
@@ -4235,6 +4237,22 @@ impl Endgame {
     fn place_of(&self, draws_of: DrawsOf) -> Result<usize, String> {
         match draws_of {
             DrawsOf::Index(i) => Ok(i),
+            DrawsOf::Play(play) => {
+                let found = (self.peg_bag.as_ref()).map(|progress| {
+                    (
+                        progress.answer_place(&(&play).into()),
+                        progress.answer_total(),
+                    )
+                });
+                match found {
+                    Some((Some(i), _)) => Ok(i),
+                    _ => Err(format!(
+                        "draws_of: {} is no candidate of the {} with draws",
+                        serde_json::to_string(&play).map_err(err_to_str)?,
+                        found.map_or(0, |(_, total)| total)
+                    )),
+                }
+            }
         }
     }
 
@@ -7239,6 +7257,60 @@ mod tests {
         assert_eq!(endgame_step(handle, r#"{"ms":0}"#), whole);
         let brief = r#"{"ms":0,"brief":true,"candidates_range":[0,1]}"#;
         assert!(do_endgame_step(handle, brief, frozen, held_bytes).is_err());
+        do_endgame_free(handle).unwrap();
+    }
+
+    // draws_of a candidate's play reads as draws_of its index, the candidate
+    // in the range asked or not; a play no candidate has is refused, named
+    #[test]
+    fn draws_of_a_play_reads_as_draws_of_its_index() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
+        let more = r#","model":"random_draws","exchanges":[0,0]"#;
+        let handle = endgame_of("tiny-end-by-play", &rack, &others, more).unwrap();
+        let whole = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(whole["exact"], true, "{whole}");
+        let all = whole["candidates"].as_array().unwrap();
+        let n = all.len();
+        assert!(n >= 3, "{whole}");
+        for i in [0, 1, n - 1] {
+            let play = &all[i]["play"];
+            for more in [
+                "",
+                r#","candidates_range":[0,1]"#,
+                r#","candidates_range":[1,3]"#,
+                r#","draws_range":[0,1]"#,
+            ] {
+                let by_index = endgame_step(handle, &format!(r#"{{"ms":0,"draws_of":{i}{more}}}"#));
+                let by_play =
+                    endgame_step(handle, &format!(r#"{{"ms":0,"draws_of":{play}{more}}}"#));
+                assert_eq!(by_play, by_index, "{i}{more}");
+            }
+        }
+        // outside the range, the play's candidate comes as drawn
+        let last = &all[n - 1]["play"];
+        let outside = endgame_step(
+            handle,
+            &format!(r#"{{"ms":0,"draws_of":{last},"candidates_range":[0,1]}}"#),
+        );
+        assert_eq!(outside["drawn"]["index"], n - 1);
+        assert!(outside["drawn"]["draws"].is_array(), "{outside}");
+        // as the page reads it: no candidates, the play's drawn
+        let page = endgame_step(
+            handle,
+            &format!(
+                r#"{{"ms":0,"draws_of":{last},"draws_range":[0,1],"candidates_range":[0,0]}}"#
+            ),
+        );
+        assert_eq!(page["candidates"], serde_json::json!([]));
+        assert_eq!(page["drawn"]["index"], n - 1);
+        assert_eq!(page["drawn"]["draws"].as_array().unwrap().len(), 1);
+        let none = format!(r#"{{"ms":0,"draws_of":{{"action":"exchange","tiles":[{J}]}}}}"#);
+        let refused = do_endgame_step(handle, &none, frozen, held_bytes).unwrap_err();
+        assert!(
+            refused.contains(r#"{"action":"exchange","tiles":[10]}"#),
+            "{refused}"
+        );
         do_endgame_free(handle).unwrap();
     }
 
