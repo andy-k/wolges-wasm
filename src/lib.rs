@@ -3930,7 +3930,6 @@ struct EndgameBrief<'a> {
     moves: Option<[usize; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     part: Option<[usize; 2]>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     out_of_memory_in: Option<&'static str>,
@@ -4055,7 +4054,6 @@ struct EndgameAnswer {
     part: Option<[usize; 2]>,
     // max_memory_mb stopped the step short of exact, or refused it room: the
     // search has no room to go on
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     out_of_memory_in: Option<&'static str>,
@@ -4933,6 +4931,21 @@ fn do_endgame_step(
     let to = to.max(from);
     let rows = match endgame.draws(&play, from..to, clock, memory)? {
         Ok(rows) => rows,
+        Err(endgame::PegBagRowsMissing::Stopped {
+            out_of_memory: true,
+        }) => {
+            // the cap stopped the rows: the answer as it is, saying so
+            let a = &mut endgame.answer;
+            let (was, was_in) = (a.out_of_memory, a.out_of_memory_in);
+            (a.out_of_memory, a.out_of_memory_in) = (true, Some("draws"));
+            let answer = match req.candidates_range {
+                Some(range) => endgame.answer_page(range, None),
+                None => endgame.answer_json(None),
+            };
+            let a = &mut endgame.answer;
+            (a.out_of_memory, a.out_of_memory_in) = (was, was_in);
+            return answer;
+        }
         Err(missing) => return Err(format!("draws_of: no rows, {missing:?}")),
     };
     let draws = bag_draws(&rows.hypotheses, &rows.wins, &rows.draws, lead);
@@ -7029,7 +7042,7 @@ mod tests {
         assert_eq!(
             before,
             serde_json::json!({"bag": 0, "steps": 0, "nodes": 0, "exact": false,
-                "play": null, "spread": 0.0, "depth": 0, "line": []})
+                "play": null, "spread": 0.0, "depth": 0, "line": [], "out_of_memory": false})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 0);
@@ -7145,7 +7158,7 @@ mod tests {
             before,
             serde_json::json!({"bag": 1, "steps": 0, "nodes": 0, "exact": false,
                 "play": null, "spread": 0.0, "depth": 0, "tiles": [], "candidates": [],
-                "endgames": 0})
+                "endgames": 0, "out_of_memory": false})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(answer["bag"], 1);
@@ -7378,7 +7391,7 @@ mod tests {
             before,
             serde_json::json!({"bag": 2, "steps": 0, "nodes": 0, "exact": false,
                     "play": null, "spread": 0.0, "depth": 0,
-                    "candidates": [], "endgames": 0}),
+                    "candidates": [], "endgames": 0, "out_of_memory": false}),
             "{name}"
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
@@ -7749,15 +7762,49 @@ mod tests {
                 let handle = endgame_of("tiny-end-oom", rack, others, &more).unwrap();
                 let answer = endgame_step(handle, r#"{"ms":60000}"#);
                 let short = answer["exact"] == false;
-                let says = answer.get("out_of_memory").is_some();
-                assert_eq!(says, out && short, "{more}: {answer}");
-                if says {
-                    assert_eq!(answer["out_of_memory"], true, "{more}: {answer}");
-                }
+                assert_eq!(answer["out_of_memory"], out && short, "{more}: {answer}");
                 do_endgame_free(handle).unwrap();
             }
         }
         drop(kept);
+    }
+
+    // draws_of stopped by the cap (1 MiB, less than a buffer kept holds) says
+    // so in out_of_memory_in, the answer otherwise the step's own: its play,
+    // value, win, moves, and candidates, none with draws
+    #[test]
+    fn draws_of_stopped_by_the_cap_says_so_and_answers_as_a_step() {
+        let handle = endgame_of(
+            "tiny-end-oom-draws",
+            &[S, B, D, F, G, H, I],
+            &[E, S, B, D, F, G, H, I, J],
+            r#","model":"random_draws","exchanges":[0,0]"#,
+        )
+        .unwrap();
+        let step = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(step["out_of_memory"], false, "{step}");
+        let roomy = endgame_step(handle, r#"{"ms":0,"draws_of":0}"#);
+        assert!(roomy["candidates"][0]["draws"].is_array(), "{roomy}");
+        let kept = std::hint::black_box(vec![1u8; 2 << 20]);
+        ENDGAMES
+            .lock()
+            .unwrap()
+            .live
+            .get_mut(&handle)
+            .unwrap()
+            .max_memory = Some(1 << 20);
+        let mut stopped = endgame_step(handle, r#"{"ms":0,"draws_of":0}"#);
+        drop(kept);
+        assert_eq!(stopped["out_of_memory"], true, "{stopped}");
+        assert_eq!(stopped["out_of_memory_in"], "draws", "{stopped}");
+        let fields = stopped.as_object_mut().unwrap();
+        fields.insert("out_of_memory".into(), false.into());
+        fields.remove("out_of_memory_in");
+        assert_eq!(stopped, step);
+        for field in ["play", "value", "win", "moves", "candidates"] {
+            assert!(step.get(field).is_some(), "{field}: {step}");
+        }
+        do_endgame_free(handle).unwrap();
     }
 
     // a what-if warmed by an endgame before it answers as a cold one does, on
