@@ -3777,7 +3777,8 @@ struct EndgameNewRequest {
     model: Option<String>,
     #[serde(default)]
     exchanges: Option<[i16; 2]>,
-    // an endgame whose graph and table this one takes (an empty bag's what-if)
+    // an endgame whose table this one takes, and its graph when this board
+    // holds every tile of its board, the bag empty or not in either
     #[serde(default)]
     warm_from: Option<u32>,
     // with two tiles or more in the bag, part k of n: the search values only
@@ -4688,50 +4689,47 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             equity::Equity::new(scores),
         )
     });
-    // a what-if warmed by an endgame before it (warm_from): with the bag empty
-    // in both, of the same rules and lexicon, on a board holding every tile of
-    // that one's on its square, the new one takes that one's graph (its words
-    // are all this board can still take) and its table, which then leaves that
-    // one, whose later steps start cold
+    // an endgame warmed by one before it (warm_from), of the same rules and
+    // lexicon: the new one takes that one's table, which then leaves that one,
+    // whose later steps start cold, and is given over to a graph pruned anew
+    // from the lexicon's own, never that one's: a phoney left on the board
+    // since lets a valid move make a word that one's prune dropped. The
+    // bag may hold tiles in either, as a search with tiles in the bag keeps
+    // what its endgames learn in the same table. Taken last, so a request
+    // refused leaves the table where it was
     let warm = match req.warm_from {
         None => None,
         Some(from) => {
-            let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+            let endgames = ENDGAMES.lock().map_err(err_to_str)?;
             let source = endgames
                 .live
-                .get_mut(&from)
+                .get(&from)
                 .ok_or_else(|| format!("warm_from: {}", no_endgame(from)))?;
-            if in_bag || source.in_bag {
-                return Err("warm_from: both endgames must have an empty bag".into());
-            }
             if source.rules != req.rules || source.lexicon != req.lexicon {
                 return Err(format!(
                     "warm_from: endgame {from} has other rules or another lexicon"
                 ));
             }
-            if (source.board_tiles.iter())
-                .zip(&kibitzer.board_tiles)
-                .any(|(&was, &now)| was != 0 && was != now)
-            {
-                return Err(format!(
-                    "warm_from: the board lacks a tile of endgame {from}'s board"
-                ));
-            }
             // the source's own game_config too: a table goes only to a solver
             // of the very tables it was made with
             Some((
+                from,
                 std::sync::Arc::clone(&source.game_config),
-                std::sync::Arc::clone(&source.kwg),
                 std::sync::Arc::clone(&source.arm_tables),
-                source
-                    .table
-                    .take()
-                    .map(endgame::KeptTable::for_another_root),
             ))
         }
     };
     let (game_config, kwg, arm_tables, table) = match warm {
-        Some(warm) => warm,
+        Some((from, game_config, arm_tables)) => {
+            let kwg =
+                std::sync::Arc::new(pruned_kwg(&game_config, &kibitzer.board_tiles, &kwg.kwg)?);
+            let table = (ENDGAMES.lock().map_err(err_to_str)?.live.get_mut(&from))
+                .ok_or_else(|| format!("warm_from: {}", no_endgame(from)))?
+                .table
+                .take()
+                .map(|table| table.for_another_graph(&*kwg));
+            (game_config, kwg, arm_tables, table)
+        }
         None => (
             std::sync::Arc::clone(&game_config),
             std::sync::Arc::new(pruned_kwg(&game_config, &kibitzer.board_tiles, &kwg.kwg)?),
@@ -7764,8 +7762,8 @@ mod tests {
     }
 
     // a what-if warmed by an endgame before it answers as a cold one does, on
-    // fewer nodes, taking that one's table; refused with tiles in the bag, on a
-    // board lacking a tile of that one's, or from no such endgame
+    // fewer nodes, taking that one's table; refused from an endgame of another
+    // lexicon, or from no such endgame
     #[test]
     fn a_warm_what_if_answers_as_a_cold_one() {
         let (rack, others) = ([S, E, A, T], [A, T, E]);
@@ -7794,37 +7792,213 @@ mod tests {
         // the source keeps its answer; its table left it
         assert_eq!(endgame_step(source, r#"{"ms":0}"#), cold_answer);
 
-        // a board lacking a tile of the source's
-        let late = serde_json::from_str::<Vec<Vec<i8>>>(&late_board(
-            &rack.iter().chain(&others).copied().collect::<Vec<_>>(),
-        ))
-        .unwrap();
-        let mut lacking = late.clone();
-        lacking[2][8] = 0;
-        let err = do_endgame_new(&format!(
-            r#"{{"rack":[{S},{E},{A},{T},{T}],"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"warm_from":{warm}}}"#,
-            serde_json::to_string(&lacking).unwrap()
-        ))
-        .unwrap_err();
-        assert!(err.contains("lacks a tile"), "{err}");
-        // tiles in the bag
-        let bag = endgame_of(
-            lexicon,
-            &[S, E, A, T, C, A, T],
-            &[A, T, E, S, E, A, T, E],
-            "",
-        )
-        .unwrap();
+        // another lexicon
+        let other = endgame_of("tiny-end-warm-other", &rack, &others, "").unwrap();
         let err =
-            endgame_of(lexicon, &rack, &others, &format!(r#","warm_from":{bag}"#)).unwrap_err();
-        assert!(err.contains("empty bag"), "{err}");
+            endgame_of(lexicon, &rack, &others, &format!(r#","warm_from":{other}"#)).unwrap_err();
+        assert!(err.contains("another lexicon"), "{err}");
         // no such endgame
         do_endgame_free(cold).unwrap();
         let err =
             endgame_of(lexicon, &rack, &others, &format!(r#","warm_from":{cold}"#)).unwrap_err();
         assert!(err.contains("freed"), "{err}");
-        for handle in [source, warm, bag] {
+        for handle in [source, warm, other] {
             do_endgame_free(handle).unwrap();
+        }
+    }
+
+    // the late board of the racks with these tiles put after its last, each
+    // then on the board and unseen no more
+    fn late_board_with(racks: &[u8], put: &[u8]) -> String {
+        let mut board = serde_json::from_str::<Vec<Vec<i8>>>(&late_board(racks)).unwrap();
+        let mut squares = (board[7..].iter_mut().flatten()).skip_while(|tile| **tile != 0);
+        for &tile in put {
+            *squares.next().unwrap() = tile as i8;
+        }
+        serde_json::to_string(&board).unwrap()
+    }
+
+    // an endgame on this board, seat 0 to move, with what more is given
+    fn endgame_on(lexicon: &str, rack: &[u8], board: &str, more: &str) -> u32 {
+        tiny_lexicon(lexicon);
+        do_endgame_new(&format!(
+            r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#
+        ))
+        .unwrap()
+    }
+
+    // an endgame warmed by another answers as a cold one does, whatever
+    // either's bag holds, on a board holding every tile of that one's or not;
+    // the source's table moves to it, and the source steps on cold. With tiles
+    // in the bag every move is a search of many endgames sharing the one
+    // table, this one's from the source
+    #[test]
+    fn a_warm_endgame_answers_as_a_cold_one_whatever_the_bag() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J, G];
+        let racks = [&rack[..], &others].concat();
+        let model = r#","model":"random_draws","exchanges":[0,0]"#;
+        let rack_of = |put: &[u8]| {
+            let mut left = rack.to_vec();
+            for tile in put {
+                if let Some(at) = left.iter().position(|held| held == tile) {
+                    left.remove(at);
+                }
+            }
+            left
+        };
+        // each a rack, the tiles put on the board, and with them how many
+        // tiles the bag holds
+        let positions = [
+            (rack.to_vec(), &[][..], 3),
+            (rack.to_vec(), &[G][..], 2),
+            (rack.to_vec(), &[G, J][..], 1),
+            (rack_of(&[S, B]), &[G, J, E, S, B][..], 0),
+            (rack_of(&[S, B, D]), &[G, J, E, S, B, H, D][..], 0),
+        ];
+        let lexicon = "tiny-end-warm-bag";
+        let new = |(rack, put, bag): &(Vec<u8>, &[u8], usize), warm: Option<u32>| {
+            let mut more = if *bag >= 2 {
+                model.into()
+            } else {
+                String::new()
+            };
+            if let Some(from) = warm {
+                more += &format!(r#","warm_from":{from}"#);
+            }
+            endgame_on(lexicon, rack, &late_board_with(&racks, put), &more)
+        };
+        let exact = |handle| {
+            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            assert_eq!(answer["exact"], true, "{answer}");
+            answer
+        };
+        // every source with every target, later or earlier
+        for source in &positions {
+            for target in &positions {
+                let cold = new(target, None);
+                let cold_answer = exact(cold);
+                let from = new(source, None);
+                let from_answer = exact(from);
+                let warm = new(target, Some(from));
+                assert!(ENDGAMES.lock().unwrap().live[&from].table.is_none());
+                let warm_answer = exact(warm);
+                let of = format!("bag {} from bag {}", target.2, source.2);
+                assert_eq!(warm_answer["bag"], target.2, "{of}");
+                for field in ["play", "value", "spread", "win", "exact"] {
+                    assert_eq!(warm_answer[field], cold_answer[field], "{of}: {field}");
+                }
+                // the source steps on cold, to its answer
+                let again = endgame_step(from, r#"{"ms":60000}"#);
+                for field in ["play", "value", "exact"] {
+                    assert_eq!(again[field], from_answer[field], "{of}: {field}");
+                }
+                for handle in [cold, from, warm] {
+                    do_endgame_free(handle).unwrap();
+                }
+            }
+        }
+    }
+
+    // a game stepped forward and back: an endgame at a turn, the next turn's
+    // warmed by it, and the first again warmed by that, each answering as a
+    // cold one does on fewer nodes, with the bag empty and with tiles in it
+    #[test]
+    fn a_warm_endgame_steps_forward_then_back() {
+        let lexicon = "tiny-end-warm-back";
+        let model = r#","model":"random_draws","exchanges":[0,0]"#;
+        let rack = [S, E, A, T, C, A, T];
+        let early = (
+            rack.to_vec(),
+            late_board(&[&rack[..], &[A, T, E, E]].concat()),
+            "",
+        );
+        // the mover's AT on row 0, a word no tile of the late board touches
+        let mut board = serde_json::from_str::<Vec<Vec<i8>>>(&early.1).unwrap();
+        board[0][0..2].copy_from_slice(&[A as i8, T as i8]);
+        let late = (
+            vec![S, E, C, A, T],
+            serde_json::to_string(&board).unwrap(),
+            "",
+        );
+        // with two in the bag, then the mover's CATS, one drawn, and the other
+        // side to move with one in the bag
+        let bag_rack = [S, B, D, F, G, H, I];
+        let bag_others = [E, S, B, D, F, G, H, I, J];
+        let bag_board = late_board(&[&bag_rack[..], &bag_others].concat());
+        let bag_early = (bag_rack.to_vec(), bag_board, model);
+        let mut board = serde_json::from_str::<Vec<Vec<i8>>>(&bag_early.1).unwrap();
+        board[2][9] = S as i8;
+        let bag_late = (
+            bag_others[..7].to_vec(),
+            serde_json::to_string(&board).unwrap(),
+            "",
+        );
+        for (t0, t1) in [(early, late), (bag_early, bag_late)] {
+            let answer = |(rack, board, more): &(Vec<u8>, String, &str), warm: Option<u32>| {
+                let warm = warm.map_or(String::new(), |from| format!(r#","warm_from":{from}"#));
+                let handle = endgame_on(lexicon, rack, board, &format!("{more}{warm}"));
+                let answer = endgame_step(handle, r#"{"ms":60000}"#);
+                assert_eq!(answer["exact"], true, "{answer}");
+                (handle, answer)
+            };
+            let (cold0, cold0_answer) = answer(&t0, None);
+            let (cold1, cold1_answer) = answer(&t1, None);
+            let (first, _) = answer(&t0, None);
+            let (next, next_answer) = answer(&t1, Some(first));
+            let (back, back_answer) = answer(&t0, Some(next));
+            for (warm, cold) in [(&next_answer, &cold1_answer), (&back_answer, &cold0_answer)] {
+                for field in ["play", "value", "spread", "win", "exact"] {
+                    assert_eq!(warm[field], cold[field], "{field}: {warm} {cold}");
+                }
+                assert!(
+                    warm["nodes"].as_u64().unwrap() < cold["nodes"].as_u64().unwrap(),
+                    "{warm} {cold}"
+                );
+            }
+            for handle in [cold0, cold1, first, next, back] {
+                do_endgame_free(handle).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_warm_endgame_takes_the_table_rather_than_a_copy_alone() {
+        alone("tests::a_warm_endgame_takes_the_table_rather_than_a_copy");
+    }
+
+    // the table a source reserved (8 MiB, far more than an endgame's other
+    // state) moves to the endgame it warms: the page holds no second one as
+    // that one is made, nor as it steps, with the bag empty or not
+    #[test]
+    #[ignore = "run alone by a_warm_endgame_takes_the_table_rather_than_a_copy_alone"]
+    fn a_warm_endgame_takes_the_table_rather_than_a_copy() {
+        let lexicon = "tiny-end-warm-held";
+        for (rack, others, model) in [
+            (
+                &[S, B, D, F, G, H, I][..],
+                &[E, S, B, D, F, G, H, I, J][..],
+                r#","model":"random_draws","exchanges":[0,0]"#,
+            ),
+            (&[S, E, A, T][..], &[A, T, E][..], ""),
+        ] {
+            let more = format!(r#"{model},"reserve_mb":8"#);
+            let from = endgame_of(lexicon, rack, others, &more).unwrap();
+            let before = held_bytes();
+            endgame_step(from, r#"{"ms":60000}"#);
+            let source = held_bytes();
+            assert!(source - before >= 8 << 20, "{model}: {before} {source}");
+            let more = format!(r#"{model},"warm_from":{from}"#);
+            let warm = endgame_of(lexicon, rack, others, &more).unwrap();
+            let made = held_bytes();
+            assert!(made < source + (1 << 20), "{model}: {source} {made}");
+            let answer = endgame_step(warm, r#"{"ms":60000}"#);
+            assert_eq!(answer["exact"], true, "{answer}");
+            let stepped = held_bytes();
+            assert!(stepped < source + (1 << 20), "{model}: {source} {stepped}");
+            for handle in [from, warm] {
+                do_endgame_free(handle).unwrap();
+            }
         }
     }
 
