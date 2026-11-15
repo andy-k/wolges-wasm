@@ -415,10 +415,10 @@ pub fn analyze(req_str: String) -> Result<String, JsValue> {
 
     use_wasm_cache!(kwg, CACHED_KWG, &req.lexicon);
 
-    do_analyze(req, &kwg)
+    Ok(do_analyze(req, &kwg)?)
 }
 
-fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
+fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
     use_wasm_cache!(klv, CACHED_KLV, &req.leave);
     use_wasm_cache!(game_config, CACHED_GAME_CONFIG, &req.rules);
 
@@ -455,6 +455,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
         klv: &klv.klv,
     };
 
+    let mut refused = false;
     {
         let mut seen_moves = fash::MyHashSet::default();
         let mut alpha_buf = Vec::new();
@@ -470,6 +471,10 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
                 alpha_buf.clear();
                 alpha_buf.extend_from_slice(word);
                 alpha_buf.sort_unstable();
+                if seen_moves.try_reserve(1).is_err() {
+                    refused = true;
+                    return false;
+                }
                 seen_moves.insert((
                     equity.raw(),
                     movegen::Play::Place {
@@ -508,12 +513,19 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
         }
     }
 
-    let result = plays
-        .iter()
-        .map(|x| x.into())
-        .collect::<Vec<kibitzer::JsonPlayWithEquity>>();
+    if refused || move_generator.out_of_memory() {
+        return_js_error!(OUT_OF_MEMORY.to_string());
+    }
+    let mut result = Vec::<kibitzer::JsonPlayWithEquity>::new();
+    if result.try_reserve_exact(plays.len()).is_err() {
+        return_js_error!(OUT_OF_MEMORY.to_string());
+    }
+    result.extend(plays.iter().map(|x| x.into()));
 
-    Ok(serde_json::to_string(&result).map_err(err_to_str)?)
+    match try_json(&result)? {
+        Some(json) => Ok(json),
+        None => Err(OUT_OF_MEMORY.into()),
+    }
 }
 
 #[wasm_bindgen]
@@ -1255,6 +1267,7 @@ struct Sim {
     parts: u64,
     iterations: u64,
     candidates: Vec<SimCandidate>,
+    out_of_memory: bool,
 }
 
 // the sims made, by handle; a handle is never used twice
@@ -1411,10 +1424,22 @@ impl Sim {
         let mut plies = Vec::new();
         let mut stepped = 0;
         while stepped < max
+            && !self.out_of_memory
             && self.candidates.iter().any(|c| c.state == SimState::Running)
             && !out_of_time()
         {
             let iteration = self.iterations + 1;
+            let room = |held: &mut Vec<f64>, first_iter: u64| {
+                let more = ((iteration - first_iter) as usize + 1).saturating_sub(held.len());
+                held.try_reserve(more).is_ok()
+            };
+            if !(self.candidates.iter_mut())
+                .filter(|c| c.state == SimState::Running)
+                .all(|c| room(&mut c.wins, c.first_iter) && room(&mut c.equities, c.first_iter))
+            {
+                self.out_of_memory = true;
+                break;
+            }
             self.simmer.restore_prepared(&self.pristine);
             self.simmer.reseed(iteration_seed(
                 self.seed,
@@ -1497,6 +1522,7 @@ impl Sim {
         });
         SimReport {
             iterations: self.iterations,
+            out_of_memory: self.out_of_memory,
             stepped,
             candidates: (self.candidates.iter())
                 .map(|c| SimCandidateReport {
@@ -1711,6 +1737,8 @@ struct SimReport {
     iterations: u64,
     stepped: u64,
     candidates: Vec<SimCandidateReport>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    out_of_memory: bool,
 }
 
 // a new sim's handle
@@ -1904,6 +1932,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         parts: req.parts,
         iterations: 0,
         candidates: Vec::new(),
+        out_of_memory: false,
     };
 
     let mut sims = SIMS.lock().map_err(err_to_str)?;
@@ -8301,5 +8330,105 @@ mod tests {
         let answer =
             serde_json::from_str::<serde_json::Value>(&try_json(&found).unwrap().unwrap()).unwrap();
         assert_eq!(answer["count"], u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    fn a_sim_refused_its_iterations_growth_answers_out_of_memory_alone() {
+        alone("tests::a_sim_refused_its_iterations_growth_answers_out_of_memory");
+    }
+
+    #[test]
+    #[ignore = "run alone by a_sim_refused_its_iterations_growth_answers_out_of_memory_alone"]
+    fn a_sim_refused_its_iterations_growth_answers_out_of_memory() {
+        let sim = cat_sim("tiny-sim-oom");
+        let step = |iterations: usize| {
+            let answer = do_sim_step(
+                sim,
+                &format!(r#"{{"iterations":{iterations},"prune":false}}"#),
+                || 0.0,
+            );
+            serde_json::from_str::<serde_json::Value>(&answer.unwrap()).unwrap()
+        };
+        let held = || {
+            let sims = SIMS.lock().unwrap();
+            let c = &sims.live[&sim].candidates[0];
+            (c.wins.len(), c.wins.capacity())
+        };
+        loop {
+            step(1);
+            let (len, capacity) = held();
+            if len == capacity && capacity * std::mem::size_of::<f64>() >= 1 << 14 {
+                break;
+            }
+        }
+        let (len, capacity) = held();
+        let before = step(0);
+        // read once the count is back
+        let refused = refusing_from((capacity + 1) * std::mem::size_of::<f64>(), || {
+            do_sim_step(sim, r#"{"iterations":1,"prune":false}"#, || 0.0)
+        });
+        let refused = serde_json::from_str::<serde_json::Value>(&refused.unwrap()).unwrap();
+        assert_eq!(refused["out_of_memory"], true);
+        assert_eq!(refused["stepped"], 0);
+        assert_eq!(refused["iterations"], before["iterations"]);
+        assert_eq!(held(), (len, capacity));
+        let after = step(1);
+        assert_eq!(after["out_of_memory"], true);
+        assert_eq!(after["stepped"], 0);
+        assert!(before.get("out_of_memory").is_none());
+        do_sim_free(sim).unwrap();
+    }
+
+    #[test]
+    fn an_analyze_refused_its_growth_answers_out_of_memory_alone() {
+        alone("tests::an_analyze_refused_its_growth_answers_out_of_memory");
+    }
+
+    #[test]
+    #[ignore = "run alone by an_analyze_refused_its_growth_answers_out_of_memory_alone"]
+    fn an_analyze_refused_its_growth_answers_out_of_memory() {
+        for (lexicon, rules, jumbled) in [
+            ("alloc-analyze", "CrosswordGame", false),
+            ("alloc-analyze-jumbled", "WordSmog", true),
+        ] {
+            many_lexicon(lexicon, jumbled);
+            let ask = || {
+                let req = serde_json::from_str::<AnalyzeRequest>(&format!(
+                    r#"{{"rack":[{A},{C},{E},{S},{T},0,0],"board":{},"count":{},"lexicon":"{lexicon}","leave":"noleave","rules":"{rules}"}}"#,
+                    cat_board(),
+                    usize::MAX,
+                ))
+                .unwrap();
+                let kwg = CACHED_KWG.read().unwrap()[lexicon].clone();
+                do_analyze(req, &kwg)
+            };
+            let plays = serde_json::from_str::<serde_json::Value>(&ask().unwrap()).unwrap();
+            assert!(plays.as_array().unwrap().len() > 1, "{rules}");
+            let mut from = 1 << 30;
+            let refused = loop {
+                match refusing_from(from, ask) {
+                    Ok(_) => from /= 2,
+                    refused => break refused,
+                }
+                assert!(from > 0, "{rules}");
+            };
+            assert_eq!(refused, Err(OUT_OF_MEMORY.to_string()), "{rules}");
+        }
+    }
+
+    #[test]
+    fn an_endgame_reserving_more_than_the_page_holds_still_answers() {
+        for mb in [usize::MAX, isize::MAX as usize >> 20] {
+            let handle = endgame_of(
+                "tiny-end-reserve",
+                &[S, E, A, T],
+                &[A, T, E],
+                &format!(r#","reserve_mb":{mb}"#),
+            )
+            .unwrap();
+            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            assert_eq!(answer["exact"], true, "{mb}");
+            do_endgame_free(handle).unwrap();
+        }
     }
 }
