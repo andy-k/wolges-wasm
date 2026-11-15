@@ -316,6 +316,7 @@ pub fn precache_kwg(
     let value = js_bytes(value)?;
     let graph = Kwg::from_reader::<kwg::Node22>(value.length() as usize, js_pieces(&value))
         .map_err(err_to_str)?;
+    forget_late_kwg(&key)?;
     CACHED_KWG
         .write()
         .map_err(err_to_str)?
@@ -331,6 +332,7 @@ pub fn precache_kbwg(
     let value = js_bytes(value)?;
     let graph = Kwg::from_reader::<kwg::Node24>(value.length() as usize, js_pieces(&value))
         .map_err(err_to_str)?;
+    forget_late_kwg(&key)?;
     CACHED_KWG
         .write()
         .map_err(err_to_str)?
@@ -388,6 +390,7 @@ fn cache_klv(key: String, table: CachedKlv) -> Result<(), String> {
 // failure is loud.
 #[wasm_bindgen]
 pub fn evict_kwg(key: String) -> Result<bool, JsValue> {
+    forget_late_kwg(&key)?;
     Ok(CACHED_KWG
         .write()
         .map_err(err_to_str)?
@@ -1847,6 +1850,25 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         }
     }
 
+    let blanks_on_board = (game_state.board_tiles.iter())
+        .filter(|&&tile| tile & 0x80 != 0)
+        .count();
+    let kwg = if move_picker::late_graph_pays(
+        game_state.bag.len(),
+        blanks_on_board < game_config.alphabet().freq(0) as usize,
+        u64::MAX,
+        1,
+    ) {
+        late_kwg(
+            &req.lexicon,
+            &req.rules,
+            &game_config,
+            &game_state.board_tiles,
+            &kwg.kwg,
+        )?
+    } else {
+        kwg
+    };
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
@@ -3991,50 +4013,12 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     };
     let (game_config, kwg, arm_tables, table) = match warm {
         Some(warm) => warm,
-        None => {
-            // the lexicon's words the board can still take, whatever the racks, made
-            // into the endgame's own graph, as wolges's endgame command prunes its own:
-            // the same answers, a far smaller graph to generate on
-            let mut words = fash::MyHashSet::<bites::Bites>::default();
-            movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-                .map_err(err_to_str)?
-                .gen_remaining_words(
-                    &movegen::BoardSnapshot {
-                        board_tiles: &kibitzer.board_tiles,
-                        game_config: &game_config,
-                        kwg: &kwg.kwg,
-                        anagrams: None,
-                        rack_lengths: None,
-                        klv: &Klv::empty().map_err(err_to_str)?,
-                    },
-                    |word: &[u8]| {
-                        words.insert(word.into());
-                    },
-                );
-            let mut words = words.into_iter().collect::<Vec<_>>();
-            words.sort_unstable();
-            let bytes = match game_config.game_rules() {
-                game_config::GameRules::Classic => build::build_big(
-                    build::BuildContent::Gaddawg,
-                    build::BuildLayout::Wolges,
-                    build::BuildOrder::Sorted,
-                    &words,
-                ),
-                game_config::GameRules::Jumbled => build::build_big(
-                    build::BuildContent::DawgOnly,
-                    build::BuildLayout::Wolges,
-                    build::BuildOrder::Sorted,
-                    &build::make_alphagrams(&words),
-                ),
-            }
-            .map_err(err_to_str)?;
-            (
-                std::sync::Arc::clone(&game_config),
-                std::sync::Arc::new(Kwg::from_bytes_alloc(&bytes).map_err(err_to_str)?),
-                std::sync::Arc::new(anagrams::ArmTables::None),
-                None,
-            )
-        }
+        None => (
+            std::sync::Arc::clone(&game_config),
+            std::sync::Arc::new(pruned_kwg(&game_config, &kibitzer.board_tiles, &kwg.kwg)?),
+            std::sync::Arc::new(anagrams::ArmTables::None),
+            None,
+        ),
     };
     // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
     // shifted would wrap to none)
@@ -4201,6 +4185,84 @@ fn do_endgame_free(handle: u32) -> Result<(), String> {
         .remove(&handle)
         .map(|_| ())
         .ok_or_else(|| no_endgame(handle))
+}
+
+// a lexicon's graph pruned for a sim, with the rules and the board it was
+// pruned for
+struct HeldLateKwg {
+    rules: String,
+    board_tiles: Box<[u8]>,
+    kwg: std::sync::Arc<CachedKwg>,
+}
+
+// the graph each lexicon was last pruned to for a sim. The lexicon loaded
+// again or evicted takes its graph along
+static CACHED_LATE_KWG: std::sync::LazyLock<WasmCache<HeldLateKwg>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn forget_late_kwg(lexicon: &str) -> Result<(), String> {
+    CACHED_LATE_KWG.write().map_err(err_to_str)?.remove(lexicon);
+    Ok(())
+}
+
+// the lexicon's graph pruned for the board: the one held when it was pruned
+// for these rules and this very board, else pruned anew from the lexicon's own
+// and held in its place (as wolges's sims keep theirs). A board with tiles
+// added is pruned anew too: the tiles may be a phoney left standing, beside
+// which a valid move makes a word the graph held dropped
+fn late_kwg(
+    lexicon: &str,
+    rules: &str,
+    game_config: &game_config::GameConfig,
+    board_tiles: &[u8],
+    kwg: &Kwg,
+) -> Result<std::sync::Arc<CachedKwg>, String> {
+    let mut cached = CACHED_LATE_KWG.write().map_err(err_to_str)?;
+    if let Some(held) = cached.get(lexicon)
+        && held.rules == rules
+        && held.board_tiles[..] == board_tiles[..]
+    {
+        return Ok(held.kwg.clone());
+    }
+    // the graph held goes before the next is made, never two at once
+    cached.remove(lexicon);
+    let pruned = std::sync::Arc::new(CachedKwg::new(pruned_kwg(game_config, board_tiles, kwg)?));
+    cached.insert(
+        lexicon.into(),
+        HeldLateKwg {
+            rules: rules.into(),
+            board_tiles: board_tiles.into(),
+            kwg: pruned.clone(),
+        }
+        .into(),
+    );
+    Ok(pruned)
+}
+
+// the lexicon's words the board can still take, whatever the racks, made into
+// a graph of their own, as wolges's endgame command prunes its own: the same
+// answers, a far smaller graph to generate on
+fn pruned_kwg(
+    game_config: &game_config::GameConfig,
+    board_tiles: &[u8],
+    kwg: &Kwg,
+) -> Result<Kwg, String> {
+    let mut words = Vec::<bites::Bites>::new();
+    movegen::KurniaMoveGenerator::<u32, false, false>::try_new(game_config)
+        .map_err(err_to_str)?
+        .gen_remaining_words(
+            &movegen::BoardSnapshot {
+                board_tiles,
+                game_config,
+                kwg,
+                anagrams: None,
+                rack_lengths: None,
+                klv: &Klv::empty().map_err(err_to_str)?,
+            },
+            |word: &[u8]| words.push(word.into()),
+        );
+    Kwg::from_bytes_alloc(&build::build_for_game(game_config, &words).map_err(err_to_str)?)
+        .map_err(err_to_str)
 }
 
 #[cfg(test)]
@@ -5402,6 +5464,143 @@ mod tests {
         let answer = step(sim, r#"{"iterations":2,"prune":false}"#);
         assert_eq!(answer["stepped"], 2);
         do_sim_free(sim).unwrap();
+    }
+
+    #[test]
+    fn a_sim_with_a_full_bag_rolls_out_on_the_whole_lexicon() {
+        let sim = sim_of("tiny-sim-whole", &cat_board(), "");
+        let Tables { kwg, .. } = tables("tiny-sim-whole", "noleave", "CrosswordGame").unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &SIMS.lock().unwrap().live[&sim].kwg,
+            &kwg
+        ));
+        do_sim_free(sim).unwrap();
+    }
+
+    #[test]
+    fn a_sim_rolls_out_on_the_words_its_board_can_still_take() {
+        tiny_lexicon("tiny-sim-pruned");
+        let Tables {
+            game_config, kwg, ..
+        } = tables("tiny-sim-pruned", "noleave", "CrosswordGame").unwrap();
+        let board = all_but_seat_board(&game_config);
+        let mut kibitzer = kibitzer::Kibitzer::new();
+        kibitzer
+            .prepare(&game_config, &[S, E, A, T], &board)
+            .unwrap();
+        let board_tiles = &kibitzer.board_tiles;
+        let mut remaining = Vec::<bites::Bites>::new();
+        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+            .unwrap()
+            .gen_remaining_words(
+                &movegen::BoardSnapshot {
+                    board_tiles,
+                    game_config: &game_config,
+                    kwg: &kwg.kwg,
+                    anagrams: None,
+                    rack_lengths: None,
+                    klv: &Klv::empty().unwrap(),
+                },
+                |word: &[u8]| remaining.push(word.into()),
+            );
+        let has_word = |graph: &Kwg, word: &[u8]| {
+            let mut p = 0;
+            for &tile in word {
+                p = graph.seek(p, tile);
+                if p < 0 {
+                    return false;
+                }
+            }
+            kwg::Node::accepts(&graph[p])
+        };
+        let sim = sim_of(
+            "tiny-sim-pruned",
+            &serde_json::to_string(&board).unwrap(),
+            "",
+        );
+        do_sim_add(sim, &format!("[{PASS}]")).unwrap();
+        let answer = step(sim, r#"{"iterations":2,"prune":false}"#);
+        assert_eq!(answer["stepped"], 2);
+        assert_eq!(answer["candidates"].as_array().unwrap().len(), 1);
+        let sims = SIMS.lock().unwrap();
+        let graph = &sims.live[&sim].kwg.kwg;
+        let words = [
+            &[A, T][..],
+            &[C, A, T],
+            &[C, A, T, S],
+            &[E, A, T],
+            &[S, E, A, T],
+            &[S, E, T],
+        ];
+        for word in words {
+            assert!(has_word(&kwg.kwg, word));
+            assert_eq!(
+                has_word(graph, word),
+                remaining.iter().any(|w| w[..] == *word),
+                "{word:?}"
+            );
+        }
+        assert!(words.iter().any(|&word| !has_word(graph, word)));
+        drop(sims);
+        do_sim_free(sim).unwrap();
+    }
+
+    // every tile but SEAT's laid square by square from the top left, C first
+    // and the blanks as A, so that a sim's bag is empty and its graph pruned
+    fn all_but_seat_board(game_config: &game_config::GameConfig) -> Vec<Vec<i8>> {
+        let alphabet = game_config.alphabet();
+        let mut left = (0..alphabet.len())
+            .map(|tile| alphabet.freq(tile))
+            .collect::<Vec<_>>();
+        for tile in [S, E, A, T] {
+            left[tile as usize] -= 1;
+        }
+        let mut board = vec![vec![0i8; 15]; 15];
+        let mut squares = board.iter_mut().flatten();
+        let tiles = std::iter::once(C).chain((1..alphabet.len()).filter(|&tile| tile != C));
+        for tile in tiles {
+            for _ in 0..left[tile as usize] {
+                *squares.next().unwrap() = tile as i8;
+            }
+        }
+        for _ in 0..left[0] {
+            *squares.next().unwrap() = -(A as i8);
+        }
+        board
+    }
+
+    #[test]
+    fn a_sim_on_a_board_with_tiles_added_prunes_its_graph_anew() {
+        tiny_lexicon("tiny-sim-kept");
+        let Tables { game_config, .. } =
+            tables("tiny-sim-kept", "noleave", "CrosswordGame").unwrap();
+        let less_one = |board: &[Vec<i8>]| {
+            let mut board = board.to_vec();
+            *(board.iter_mut().flatten())
+                .rfind(|tile| **tile != 0)
+                .unwrap() = 0;
+            board
+        };
+        let more = all_but_seat_board(&game_config);
+        let fewer = less_one(&more);
+        let run = |lexicon: &str, board: &[Vec<i8>]| {
+            let sim = sim_of(lexicon, &serde_json::to_string(board).unwrap(), "");
+            do_sim_add(sim, &format!("[{PASS}]")).unwrap();
+            let answer = step(sim, r#"{"iterations":2,"prune":false}"#);
+            assert_eq!(answer["stepped"], 2);
+            let kwg = SIMS.lock().unwrap().live[&sim].kwg.clone();
+            do_sim_free(sim).unwrap();
+            (answer, kwg)
+        };
+        let (_, first) = run("tiny-sim-kept", &fewer);
+        let (kept_answer, kept) = run("tiny-sim-kept", &more);
+        let (anew_answer, anew) = run("tiny-sim-anew", &more);
+        assert!(!std::sync::Arc::ptr_eq(&first, &kept));
+        assert!(!std::sync::Arc::ptr_eq(&kept, &anew));
+        assert_eq!(kept_answer, anew_answer);
+        // a board without a tile of the one held is pruned for anew
+        let (_, again) = run("tiny-sim-kept", &less_one(&fewer));
+        assert!(!std::sync::Arc::ptr_eq(&kept, &again));
     }
 
     // the tiles known to be on the opponent's rack are on it every iteration
