@@ -1070,7 +1070,6 @@ struct SimNewRequest {
     turn: u8,
     zero_turns: u16,
     pass_turns: u16,
-    rack_sizes: Option<Vec<u8>>,
     #[serde(default)]
     known: Vec<u8>,
     #[serde(deserialize_with = "nullable")]
@@ -1796,44 +1795,22 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
-    // by default the seat to move holds its rack, and the others are dealt in
-    // turn from the tiles unseen, a full rack each while enough are left
-    let rack_sizes = req.rack_sizes.unwrap_or_else(|| {
-        let mut left = kibitzer
-            .available_tally
-            .iter()
-            .map(|&count| count as usize)
-            .sum::<usize>();
-        (0..num_players)
-            .map(|i| {
-                if i == turn {
-                    req.rack.len() as u8
-                } else {
-                    let dealt = rack_size.min(left);
-                    left -= dealt;
-                    dealt as u8
-                }
-            })
-            .collect()
-    });
-    if rack_sizes.len() != num_players {
-        return Err(format!(
-            "rack_sizes: length must be {num_players}, found {}",
-            rack_sizes.len()
-        ));
-    }
-    if rack_sizes.iter().any(|&n| n as usize > rack_size) {
-        return Err(format!(
-            "rack_sizes: each must be <= {rack_size}, found {rack_sizes:?}"
-        ));
-    }
-    if rack_sizes[turn] as usize != req.rack.len() {
-        return Err(format!(
-            "rack_sizes[turn={turn}]={}, but rack length is {}",
-            rack_sizes[turn],
-            req.rack.len()
-        ));
-    }
+    // the seat to move holds its rack, and the others are dealt in turn from
+    // the tiles unseen, a full rack each while enough are left
+    let mut left = (kibitzer.available_tally.iter())
+        .map(|&count| count as usize)
+        .sum::<usize>();
+    let rack_sizes = (0..num_players)
+        .map(|i| {
+            if i == turn {
+                req.rack.len()
+            } else {
+                let dealt = rack_size.min(left);
+                left -= dealt;
+                dealt
+            }
+        })
+        .collect::<Vec<_>>();
     // the tiles known to be on the opponent's rack, or the leaves it may hold:
     // each iteration puts them there first (a leave chosen by its weight) and
     // deals the rest of it from the tiles unseen
@@ -1841,7 +1818,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let (known, inferred) = match opponent_leaves(
         (req.known, req.kept, req.inferred),
         num_players,
-        rack_sizes[opponent] as usize,
+        rack_sizes[opponent],
         &kibitzer.available_tally,
     )? {
         OpponentLeaves::Listed(known) => (known, None),
@@ -1863,18 +1840,12 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
             .zip(kibitzer.available_tally.iter())
             .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
     );
-    let unseen = game_state.bag.len();
     for i in 0..num_players {
         game_state.players[i].score = scores[i];
         if i != turn {
             game_state
                 .bag
-                .replenish(&mut game_state.players[i].rack, rack_sizes[i] as usize, i);
-        }
-        if game_state.players[i].rack.len() != rack_sizes[i] as usize {
-            return Err(format!(
-                "rack_sizes: cannot deal {rack_sizes:?} from the {unseen} tiles unseen"
-            ));
+                .replenish(&mut game_state.players[i].rack, rack_sizes[i], i);
         }
     }
 
@@ -2073,14 +2044,14 @@ fn opponent_leaves(
 
 // threats: what the opponent may play next, by score alone (no leave is read).
 // A board, lexicon and rules as analyze takes them; the tiles unseen as unseen
-// (a count each tile) or as the rack of the one who watches, not both;
-// opp_rack_size (a rack's tiles, or all unseen when fewer); what the opponent
-// holds as sim_new takes it (one of known, kept (or leaves) and inferred; none:
-// a rack dealt from the tiles unseen); count, how many best plays to list (all
-// if not given); ms, a time to run, listing included (none: no limit;
-// threats_new ignores it); seed, for the racks drawn when ms runs out; square,
-// [row, col], to list only the plays placing a tile there. The tiles the
-// watcher would draw stay unseen, so a board with a play on it asks after it.
+// (a count each tile) or as the rack of the one who watches, not both; what
+// the opponent holds as sim_new takes it (one of known, kept (or leaves), and
+// inferred; none: a rack's tiles, or all unseen when fewer, dealt from the
+// tiles unseen); count, how many best plays to list (all if not given); ms, a
+// time to run, listing included (none: no limit; threats_new ignores it);
+// seed, for the racks drawn when ms runs out; square, [row, col], to list only
+// the plays placing a tile there. The tiles the watcher would draw stay
+// unseen, so a board with a play on it asks after it.
 #[derive(serde::Deserialize)]
 struct ThreatsRequest {
     #[serde(default)]
@@ -2090,7 +2061,6 @@ struct ThreatsRequest {
     lexicon: String,
     rules: String,
     unseen: Option<Vec<u8>>,
-    opp_rack_size: Option<usize>,
     #[serde(default)]
     known: Vec<u8>,
     #[serde(default, alias = "leaves")]
@@ -2713,16 +2683,7 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
     }
     let unseen = &kibitzer.available_tally;
     let num_unseen = unseen.iter().map(|&count| count as usize).sum::<usize>();
-    let opponent_rack = match req.opp_rack_size {
-        None => rack_size.min(num_unseen),
-        Some(size) if size <= rack_size && size <= num_unseen => size,
-        Some(size) => {
-            return Err(format!(
-                "opp_rack_size: max {} tiles, found {size} tiles",
-                rack_size.min(num_unseen)
-            ));
-        }
-    };
+    let opponent_rack = rack_size.min(num_unseen);
     let opponent = opponent_leaves(
         (req.known, req.kept, req.inferred),
         game_config.num_players() as usize,
@@ -5948,11 +5909,6 @@ mod tests {
                 format!(r#","kept":[{{"tiles":[0],"weight":1}}],"inferred":{again}"#),
                 "kept, inferred",
             ),
-            // an opponent of five tiles cannot hold a leave of six
-            (
-                format!(r#","rack_sizes":[4,5],"inferred":{again}"#),
-                "inferred: leave 0 has 6 tiles",
-            ),
         ] {
             let err = do_sim_new(&format!(
                 r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4{more}}}"#,
@@ -8210,30 +8166,6 @@ mod tests {
         assert_eq!(
             do_threats(&req("[9]"), || 0.0).unwrap_err(),
             "rack, unseen: give one or the other"
-        );
-    }
-
-    // an opponent holding six tiles, 6 of the 9 unseen: none is an S in C(7, 6)
-    // = 7 of C(9, 6) = 84 ways, so each play is held 11 times in 12, and no
-    // rack's tiles are there to bingo with. More than a rack is an error.
-    #[test]
-    fn threats_deal_the_opponent_the_tiles_it_holds() {
-        let unseen = [S, S, B, D, F, G, H, I, J];
-        let rack = [0, 0, I, I, I, I, I];
-        let six = threats_of(&unseen, &rack, r#","opp_rack_size":6"#);
-        for play in six["plays"].as_array().unwrap() {
-            assert_near(&play["chance"], 11.0 / 12.0);
-        }
-        assert!(six["bingo"].is_null());
-        tiny_lexicon("tiny-threats");
-        let req = format!(
-            r#"{{"rack":{},"board":{},"lexicon":"tiny-threats","rules":"CrosswordGame","opp_rack_size":8}}"#,
-            serde_json::to_string(&rack).unwrap(),
-            threats_board(&unseen, &rack),
-        );
-        assert_eq!(
-            do_threats(&req, || 0.0).unwrap_err(),
-            "opp_rack_size: max 7 tiles, found 8 tiles"
         );
     }
 
