@@ -140,6 +140,18 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
     ] {
         let gc = make();
         let jumbled_gc = gc.jumbled();
+        // each operation a request runs is checked here, once, so no request
+        // checks it again
+        for game_config in [&gc, &jumbled_gc] {
+            for op in [
+                game_config::Op::Generation,
+                game_config::Op::Inference,
+                game_config::Op::Sim,
+                game_config::Op::Endgame,
+            ] {
+                game_config.supports(op).map_err(err_to_str)?;
+            }
+        }
         let mut cached = CACHED_GAME_CONFIG.write().unwrap();
         cached.insert(classic.into(), gc.into());
         cached.insert(jumbled.into(), jumbled_gc.into());
