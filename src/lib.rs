@@ -2103,18 +2103,93 @@ struct ThreatSquare {
 // of the rest's from racks drawn among them. plays: the best first (those alike
 // in score in placement order).
 #[derive(serde::Serialize)]
-struct ThreatsAnswer {
+struct ThreatsAnswer<'a> {
     racks: usize,       // how many distinct racks it may hold
-    count: usize,       // how many plays it may make of the tiles unseen
+    count: u64,         // how many plays it may make of the tiles unseen
     expected_best: f64, // its best play's expected score (0 with no play)
     bingo: Option<f64>, // a whole rack's play's chance (null: a short rack)
     covered: f64,       // the chance the racks counted exactly hold
     samples: usize,     // how many racks were drawn
     list_ms: f64,       // listing every play's time, which ms cannot cut
     exact: bool,
-    plays: Vec<ThreatPlay>,
+    walked: f64,
+    plays: ThreatPlays<'a>,
     squares: Vec<Vec<Option<ThreatSquare>>>, // row by row; null where a tile is
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    out_of_memory: bool,
 }
+
+struct ThreatPlays<'a> {
+    kept: &'a [ThreatFound],
+    held: &'a [&'a ThreatFound],
+    through: Option<usize>,
+    cols: usize,
+    most: usize,
+    keys: &'a [Box<[u8]>],
+    holds: ThreatTotal<'a>,
+}
+
+impl serde::Serialize for ThreatPlays<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            (self.kept.iter())
+                .chain(self.held.iter().copied())
+                .filter(|play| {
+                    self.through.is_none_or(|through| {
+                        placed_squares((play.down, play.lane, play.idx, &play.word), self.cols)
+                            .any(|at| at == through)
+                    })
+                })
+                .take(self.most)
+                .map(|play| ThreatPlay {
+                    tiles: self.keys[play.id as usize].to_vec(),
+                    chance: self.holds.at(play.id as usize),
+                    play: (&movegen::Play::Place {
+                        down: play.down,
+                        lane: play.lane,
+                        idx: play.idx,
+                        word: play.word[..].into(),
+                        score: play.score,
+                    })
+                        .into(),
+                }),
+        )
+    }
+}
+
+fn try_boxed(bytes: &[u8]) -> Option<Box<[u8]>> {
+    let mut boxed = Vec::new();
+    boxed.try_reserve_exact(bytes.len()).ok()?;
+    boxed.extend_from_slice(bytes);
+    Some(boxed.into_boxed_slice())
+}
+
+struct TryWriter(Vec<u8>);
+
+impl std::io::Write for TryWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .try_reserve(buf.len())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn try_json(value: &impl serde::Serialize) -> Result<Option<String>, String> {
+    let mut writer = TryWriter(Vec::new());
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => String::from_utf8(writer.0).map(Some).map_err(err_to_str),
+        Err(e) if e.is_io() => Ok(None),
+        Err(e) => Err(err_to_str(e)),
+    }
+}
+
+const OUT_OF_MEMORY: &str = "out_of_memory";
 
 // the ways to choose k of n, as a float
 fn choose(n: usize, k: usize) -> f64 {
@@ -2165,20 +2240,213 @@ fn placed_squares(
         })
 }
 
-// a play the opponent may make, its tiles' multiset by its id, its word at word
-// in the buffer of every play's words
+// a play the opponent may make, its tiles' multiset by its id
+#[derive(Clone)]
 struct ThreatFound {
     down: bool,
     lane: i8,
     idx: i8,
-    word: std::ops::Range<u32>,
+    word: Box<[u8]>,
     score: i32,
     id: u32,
+}
+
+type ThreatRank<'a> = (std::cmp::Reverse<i32>, bool, i8, i8, &'a [u8]);
+
+impl ThreatFound {
+    fn rank(&self) -> ThreatRank<'_> {
+        (
+            std::cmp::Reverse(self.score),
+            self.down,
+            self.lane,
+            self.idx,
+            &self.word,
+        )
+    }
+}
+
+impl PartialEq for ThreatFound {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+
+impl Eq for ThreatFound {}
+
+impl PartialOrd for ThreatFound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ThreatFound {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+#[derive(Clone)]
+struct ThreatTop {
+    most: usize,
+    heap: std::collections::BinaryHeap<ThreatFound>,
+}
+
+impl ThreatTop {
+    fn new(most: usize) -> Self {
+        Self {
+            most,
+            heap: Default::default(),
+        }
+    }
+
+    fn offer(
+        &mut self,
+        (down, lane, idx, word): (bool, i8, i8, &[u8]),
+        score: i32,
+        id: u32,
+    ) -> bool {
+        let found = |word| ThreatFound {
+            down,
+            lane,
+            idx,
+            word,
+            score,
+            id,
+        };
+        if self.heap.len() < self.most {
+            if self.heap.try_reserve(1).is_err() {
+                return false;
+            }
+            let Some(word) = try_boxed(word) else {
+                return false;
+            };
+            self.heap.push(found(word));
+        } else if let Some(mut worst) = self.heap.peek_mut()
+            && (std::cmp::Reverse(score), down, lane, idx, word) < worst.rank()
+        {
+            let Some(word) = try_boxed(word) else {
+                return false;
+            };
+            *worst = found(word);
+        }
+        true
+    }
+
+    fn sorted(&self) -> Option<Vec<&ThreatFound>> {
+        let mut sorted = Vec::new();
+        sorted.try_reserve_exact(self.heap.len()).ok()?;
+        sorted.extend(self.heap.iter());
+        sorted.sort_unstable();
+        Some(sorted)
+    }
+}
+
+fn threat_key(word: &[u8], key: &mut Vec<u8>) {
+    key.clear();
+    key.extend(
+        (word.iter().filter(|&&tile| tile != 0))
+            .map(|&tile| if tile & 0x80 != 0 { 0 } else { tile }),
+    );
+    key.sort_unstable();
+}
+
+// a lane's best score by multiset and place along it
+#[derive(Default)]
+struct ThreatLane {
+    slot: Vec<u32>,
+    ids: Vec<u32>,
+    best: Vec<i32>,
+}
+
+impl ThreatLane {
+    // false on a refused growth
+    fn reach(&mut self, id: u32, along: usize, stride: usize, score: i32) -> bool {
+        let id = id as usize;
+        if self.slot.len() <= id {
+            if self.slot.try_reserve(id + 1 - self.slot.len()).is_err() {
+                return false;
+            }
+            self.slot.resize(id + 1, u32::MAX);
+        }
+        if self.slot[id] == u32::MAX {
+            if self.ids.try_reserve(1).is_err() || self.best.try_reserve(stride).is_err() {
+                return false;
+            }
+            self.slot[id] = self.ids.len() as u32;
+            self.ids.push(id as u32);
+            self.best.resize(self.best.len() + stride, i32::MIN);
+        }
+        let best = &mut self.best[self.slot[id] as usize * stride + along];
+        *best = (*best).max(score);
+        true
+    }
+
+    // none on a refused growth
+    fn drained(
+        &mut self,
+        at: impl Fn(usize) -> usize,
+        stride: usize,
+    ) -> Option<Vec<(u32, u16, i32)>> {
+        let reached = self.best.iter().filter(|&&score| score != i32::MIN).count();
+        let mut reach = Vec::new();
+        reach.try_reserve_exact(reached).ok()?;
+        for (&id, row) in self.ids.iter().zip(self.best.chunks(stride)) {
+            for (along, &score) in row.iter().enumerate() {
+                if score != i32::MIN {
+                    reach.push((id, at(along) as u16, score));
+                }
+            }
+            self.slot[id as usize] = u32::MAX;
+        }
+        self.ids.clear();
+        self.best.clear();
+        Some(reach)
+    }
+}
+
+enum ThreatPass<'f> {
+    Lanes(
+        (u128, u128),
+        std::ops::Range<u64>,
+        &'f mut movegen::PoolPart,
+    ),
+    Through(usize),
+    Top(
+        (u128, u128),
+        std::ops::Range<u64>,
+        &'f mut movegen::PoolFloor,
+    ),
+}
+
+// jumbled: the lanes walked twice, every play then the top count
+struct ThreatWalk {
+    lane: usize,
+    from: u64,
+    size: u64,
+    seen: u64,
+    top: ThreatTop,
+    floor: movegen::PoolFloor,
+    part: movegen::PoolPart,
+}
+
+impl ThreatWalk {
+    fn new(most: usize, lane: usize) -> Self {
+        Self {
+            lane,
+            from: 0,
+            size: 1,
+            seen: 0,
+            top: ThreatTop::new(most),
+            floor: Default::default(),
+            part: Default::default(),
+        }
+    }
 }
 
 // the sums over racks of what the opponent may hold: each multiset's chance,
 // each square's chance, expected best and reach, the best play's expected score
 // and the chance of a bingo
+#[derive(Default)]
 struct ThreatSums {
     holds: Vec<f64>,
     square_chance: Vec<f64>,
@@ -2188,32 +2456,41 @@ struct ThreatSums {
     bingo: f64,
 }
 
+fn try_zeros(len: usize) -> Option<Vec<f64>> {
+    let mut zeros = Vec::new();
+    zeros.try_reserve_exact(len).ok()?;
+    zeros.resize(len, 0.0);
+    Some(zeros)
+}
+
 impl ThreatSums {
-    fn new(multisets: usize, squares: usize) -> Self {
-        Self {
-            holds: vec![0.0; multisets],
-            square_chance: vec![0.0; squares],
-            square_expected: vec![0.0; squares],
-            square_reach: vec![0.0; squares],
+    // none on a refused growth
+    fn new(multisets: usize, squares: usize) -> Option<Self> {
+        Some(Self {
+            holds: try_zeros(multisets)?,
+            square_chance: try_zeros(squares)?,
+            square_expected: try_zeros(squares)?,
+            square_reach: try_zeros(squares)?,
             expected_best: 0.0,
             bingo: 0.0,
-        }
+        })
     }
+}
 
-    // these sums plus each times those
-    fn plus(mut self, those: &Self, each: f64) -> Self {
-        let add = |sums: &mut [f64], more: &[f64]| {
-            for (sum, more) in sums.iter_mut().zip(more) {
-                *sum += each * more;
-            }
-        };
-        add(&mut self.holds, &those.holds);
-        add(&mut self.square_chance, &those.square_chance);
-        add(&mut self.square_expected, &those.square_expected);
-        add(&mut self.square_reach, &those.square_reach);
-        self.expected_best += each * those.expected_best;
-        self.bingo += each * those.bingo;
-        self
+// a sum over the racks counted exactly plus each times one over the racks
+// drawn, read an entry at a time so that no table of them is made; an entry
+// past either's end adds nothing
+#[derive(Clone, Copy, Default)]
+struct ThreatTotal<'a> {
+    exact: &'a [f64],
+    drawn: &'a [f64],
+    each: f64,
+}
+
+impl ThreatTotal<'_> {
+    fn at(&self, i: usize) -> f64 {
+        let entry = |sums: &[f64]| sums.get(i).copied().unwrap_or(0.0);
+        entry(self.exact) + self.each * entry(self.drawn)
     }
 }
 
@@ -2222,7 +2499,7 @@ impl ThreatSums {
 struct ThreatTables<'a> {
     ids: &'a fash::MyHashMap<Box<[u8]>, u32>,
     best: &'a [i32],
-    reach: &'a [(u32, usize, i32)],
+    reach: &'a [(u16, i32)],
     reach_from: &'a [usize],
     square_best: &'a [i32],
     rack_size: usize,
@@ -2277,7 +2554,8 @@ impl ThreatWeigher {
             top = top.max(tables.best[id]);
             whole |= self.sub.len() == tables.rack_size;
             let reach = &tables.reach[tables.reach_from[id]..tables.reach_from[id + 1]];
-            for &(_, at, score) in reach {
+            for &(at, score) in reach {
+                let at = at as usize;
                 let (seen, square) = &mut self.rack_square[at];
                 if *seen != stamp {
                     *seen = stamp;
@@ -2310,12 +2588,23 @@ struct Threats {
     ids: fash::MyHashMap<Box<[u8]>, u32>,
     keys: Vec<Box<[u8]>>,
     best: Vec<i32>,
-    plays: Vec<ThreatFound>, // every play, the best first
-    words: Vec<u8>,          // every play's word, each at its play's word
-    count: usize,            // how many plays there are
+    kept: Vec<ThreatFound>,
+    walk: Option<ThreatWalk>,
+    lanes: usize,
+    all_listed: bool,
+    kept_most: usize,
+    lists: movegen::PoolLists,
+    count: u64, // how many plays there are
     count_asked: Option<usize>,
-    reach: Vec<(u32, usize, i32)>,
+    lane: ThreatLane,
+    lanes_reach: Vec<Vec<(u32, u16, i32)>>,
+    reach: Vec<(u16, i32)>,
+    out_of_memory: bool,
     reach_from: Vec<usize>,
+    // while reach is built, a lane at a step: the lanes counted or placed, and
+    // each id's next place once placing
+    reach_lanes: usize,
+    reach_next: Vec<usize>,
     square_best: Vec<i32>,
     board_tiles: Vec<u8>, // each square's tile, 0 for none
     cols: usize,
@@ -2328,8 +2617,11 @@ struct Threats {
     weigher: ThreatWeigher,
     rng: rand::rngs::ChaCha20Rng,
     list_ms: f64,
-    listed: f64,                     // when listing every play ended
     drawn: (ThreatSums, f64, usize), // the last weighing's draws, each's weight, their number
+    kwg: std::sync::Arc<CachedKwg>,
+    game_config: std::sync::Arc<game_config::GameConfig>,
+    pool: Vec<u8>,
+    move_generator: movegen::KurniaMoveGenerator<u32, false, false>,
 }
 
 // the threats made, by handle; a handle is never used twice
@@ -2347,7 +2639,7 @@ fn no_threats(handle: u32) -> String {
 }
 
 // what threats is asked, every play listed (ms not read)
-fn threats_made(req: ThreatsRequest, now: &impl Fn() -> f64) -> Result<Threats, String> {
+fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
     let kwg = (CACHED_KWG
         .read()
         .map_err(err_to_str)?
@@ -2426,6 +2718,7 @@ fn threats_made(req: ThreatsRequest, now: &impl Fn() -> f64) -> Result<Threats, 
     let mut rest = vec![0usize; unseen.len() + 1];
     let mut held = Vec::new();
     let mut rack = Vec::new();
+    let mut refused = false;
     for &(leave, weight) in &leaves {
         if weight == 0.0 {
             continue;
@@ -2447,134 +2740,76 @@ fn threats_made(req: ThreatsRequest, now: &impl Fn() -> f64) -> Result<Threats, 
             chance,
             &mut held,
             &mut |dealt, ways| {
+                if refused {
+                    return;
+                }
                 rack.clear();
                 rack.extend_from_slice(leave);
                 rack.extend_from_slice(dealt);
                 rack.sort_unstable();
-                *racks.entry(rack[..].into()).or_insert(0.0) += ways;
+                if let Some(chance) = racks.get_mut(&rack[..]) {
+                    *chance += ways;
+                    return;
+                }
+                match try_boxed(&rack) {
+                    Some(key) if racks.try_reserve(1).is_ok() => {
+                        racks.insert(key, ways);
+                    }
+                    _ => refused = true,
+                }
             },
         );
     }
+    let mut listed = Vec::new();
+    if refused || listed.try_reserve_exact(racks.len()).is_err() {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    listed.extend(racks);
     // the likeliest racks first, so a time cut weighs the most of them
-    let mut racks = racks.into_iter().collect::<Vec<_>>();
+    let mut racks = listed;
     racks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    // every play of the tiles unseen, its tiles' multiset given an id as it is
-    // first found, with each multiset's best score
-    let mut move_generator =
-        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-            .map_err(err_to_str)?;
-    let empty_klv = Klv::empty().map_err(err_to_str)?;
-    let board_snapshot = movegen::BoardSnapshot {
-        board_tiles: &kibitzer.board_tiles,
-        game_config: &game_config,
-        kwg: &kwg.kwg,
-        anagrams: None,
-        rack_lengths: None,
-        klv: &empty_klv,
-    };
+    let move_generator = movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+        .map_err(err_to_str)?;
     let pool = (0u8..)
         .zip(unseen.iter())
         .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize))
         .collect::<Vec<_>>();
-    let listing = now();
-    let mut ids = fash::MyHashMap::<Box<[u8]>, u32>::default();
-    let mut keys = Vec::<Box<[u8]>>::new();
-    let mut best = Vec::<i32>::new();
-    let mut plays = Vec::<ThreatFound>::new();
-    let mut words = Vec::<u8>::new();
-    if !pool.is_empty() {
-        let mut key = Vec::new();
-        move_generator.pool_plays(&board_snapshot, &pool, |down, lane, idx, word, score| {
-            key.clear();
-            key.extend(
-                word.iter().filter(|&&tile| tile != 0).map(
-                    |&tile| {
-                        if tile & 0x80 != 0 { 0 } else { tile }
-                    },
-                ),
-            );
-            key.sort_unstable();
-            let id = match ids.get(&key[..]) {
-                Some(&id) => {
-                    best[id as usize] = best[id as usize].max(score);
-                    id
-                }
-                None => {
-                    let id = keys.len() as u32;
-                    ids.insert(key[..].into(), id);
-                    keys.push(key[..].into());
-                    best.push(score);
-                    id
-                }
-            };
-            let from = words.len() as u32;
-            words.extend_from_slice(word);
-            plays.push(ThreatFound {
-                down,
-                lane,
-                idx,
-                word: from..words.len() as u32,
-                score,
-                id,
-            });
-        });
-    }
-    let listed = now();
-    let list_ms = listed - listing;
-
-    // each square's best score of a play placing a tile on it, and for each
-    // multiset each square a play of it places a tile on, with the best score
-    // of such a play
     let dim = game_config.board_layout().dim();
     let cols = dim.cols as usize;
-    let mut square_best = vec![i32::MIN; kibitzer.board_tiles.len()];
-    let mut reach = Vec::<(u32, usize, i32)>::new();
-    let word = |play: &ThreatFound| &words[play.word.start as usize..play.word.end as usize];
-    for play in &plays {
-        for at in placed_squares((play.down, play.lane, play.idx, word(play)), cols) {
-            square_best[at] = square_best[at].max(play.score);
-            reach.push((play.id, at, play.score));
-        }
-    }
-    reach.sort_unstable_by(|a, b| (a.0, a.1, b.2).cmp(&(b.0, b.1, a.2)));
-    reach.dedup_by_key(|&mut (id, at, _)| (id, at));
-    let mut reach_from = vec![0usize; keys.len() + 1];
-    for &(id, _, _) in &reach {
-        reach_from[id as usize + 1] += 1;
-    }
-    for id in 0..keys.len() {
-        reach_from[id + 1] += reach_from[id];
-    }
-
-    let count = plays.len();
-    plays.sort_unstable_by(|a, b| {
-        (b.score.cmp(&a.score))
-            .then_with(|| (a.down, a.lane, a.idx, word(a)).cmp(&(b.down, b.lane, b.idx, word(b))))
-    });
+    let squares = kibitzer.board_tiles.len();
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
     Ok(Threats {
-        exact_sums: ThreatSums::new(keys.len(), square_best.len()),
+        exact_sums: Default::default(),
         weigher: ThreatWeigher {
-            rack_square: vec![(usize::MAX, 0i32); square_best.len()],
+            rack_square: vec![(usize::MAX, 0i32); squares],
             touched: Vec::new(),
             distinct: Vec::new(),
             taken: Vec::new(),
             sub: Vec::new(),
             stamp: 0,
         },
-        ids,
-        keys,
-        best,
-        plays,
-        words,
-        count,
+        ids: Default::default(),
+        keys: Vec::new(),
+        best: Vec::new(),
+        kept: Vec::new(),
+        walk: None,
+        lanes: dim.rows as usize + cols,
+        all_listed: false,
+        kept_most: 0,
+        lists: Default::default(),
+        count: 0,
         count_asked: req.count,
-        reach,
-        reach_from,
-        square_best,
+        lane: Default::default(),
+        lanes_reach: Vec::new(),
+        reach: Vec::new(),
+        out_of_memory: false,
+        reach_from: Vec::new(),
+        reach_lanes: 0,
+        reach_next: Vec::new(),
+        square_best: vec![i32::MIN; squares],
         board_tiles: kibitzer.board_tiles,
         cols,
         rack_size,
@@ -2583,13 +2818,311 @@ fn threats_made(req: ThreatsRequest, now: &impl Fn() -> f64) -> Result<Threats, 
         counted: 0,
         covered: 0.0,
         rng: rand::rngs::ChaCha20Rng::seed_from_u64(seed),
-        list_ms,
-        listed,
-        drawn: (ThreatSums::new(0, 0), 0.0, 0), // none yet
+        list_ms: 0.0,
+        drawn: Default::default(),
+        kwg,
+        game_config,
+        pool,
+        move_generator,
     })
 }
 
 impl Threats {
+    fn jumbled(&self) -> bool {
+        matches!(
+            self.game_config.game_rules(),
+            game_config::GameRules::Jumbled
+        )
+    }
+
+    fn walk_passes(&self) -> usize {
+        if self.jumbled() {
+            2 * self.lanes
+        } else {
+            self.lanes
+        }
+    }
+
+    fn snapshot_walk(
+        &mut self,
+        pass: ThreatPass,
+        top: &mut ThreatTop,
+    ) -> Result<Option<u64>, String> {
+        if self.pool.is_empty() {
+            return Ok(Some(0));
+        }
+        let empty_klv = Klv::empty().map_err(err_to_str)?;
+        let board_snapshot = movegen::BoardSnapshot {
+            board_tiles: &self.board_tiles,
+            game_config: &self.game_config,
+            kwg: &self.kwg.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &empty_klv,
+        };
+        let cols = self.cols;
+        let jumbled = matches!(
+            self.game_config.game_rules(),
+            game_config::GameRules::Jumbled
+        );
+        let aggregate = !self.all_listed && matches!(pass, ThreatPass::Lanes(..));
+        let offer = !(jumbled && aggregate);
+        let ids = &mut self.ids;
+        let keys = &mut self.keys;
+        let best = &mut self.best;
+        let lane_reach = &mut self.lane;
+        let stride = self.cols.max(self.lanes - self.cols);
+        let square_best = &mut self.square_best;
+        let count = &mut self.count;
+        let most = top.most;
+        let mut key = Vec::new();
+        let mut held = true;
+        let found = |down: bool, lane: i8, idx: i8, word: &[u8], score: i32| {
+            if !held {
+                return;
+            }
+            threat_key(word, &mut key);
+            let id = match ids.get(&key[..]) {
+                Some(&id) => {
+                    if aggregate {
+                        best[id as usize] = best[id as usize].max(score);
+                    }
+                    id
+                }
+                None => {
+                    let id = keys.len() as u32;
+                    let (Some(id_key), Some(listed_key)) = (try_boxed(&key), try_boxed(&key))
+                    else {
+                        held = false;
+                        return;
+                    };
+                    if ids.try_reserve(1).is_err()
+                        || keys.try_reserve(1).is_err()
+                        || best.try_reserve(1).is_err()
+                    {
+                        held = false;
+                        return;
+                    }
+                    ids.insert(id_key, id);
+                    keys.push(listed_key);
+                    best.push(if aggregate { score } else { i32::MIN });
+                    id
+                }
+            };
+            if aggregate {
+                *count += 1;
+                for at in placed_squares((down, lane, idx, word), cols) {
+                    square_best[at] = square_best[at].max(score);
+                    let along = if down { at / cols } else { at % cols };
+                    if !lane_reach.reach(id, along, stride, score) {
+                        held = false;
+                        return;
+                    }
+                }
+            }
+            if offer {
+                held = top.offer((down, lane, idx, word), score, id);
+            }
+        };
+        let seen = match pass {
+            ThreatPass::Through(at) => {
+                self.move_generator.pool_plays_spans_through_top(
+                    &board_snapshot,
+                    &self.pool,
+                    ((at / cols) as i8, (at % cols) as i8),
+                    most,
+                    found,
+                );
+                0
+            }
+            // a window of n multisets walks at most n blank choices
+            ThreatPass::Lanes(lanes, window, part) if jumbled && aggregate => {
+                let budget = window.end - window.start;
+                self.move_generator.pool_plays_best_part(
+                    &board_snapshot,
+                    &self.pool,
+                    lanes,
+                    window,
+                    budget,
+                    (&mut self.lists, part),
+                    found,
+                )
+            }
+            ThreatPass::Lanes(lanes, window, _) => self.move_generator.pool_plays_window(
+                &board_snapshot,
+                &self.pool,
+                lanes,
+                window,
+                None,
+                found,
+            ),
+            ThreatPass::Top(lanes, window, floor) => self.move_generator.pool_plays_top_window(
+                &board_snapshot,
+                &self.pool,
+                lanes,
+                window,
+                most,
+                (&mut self.lists, floor),
+                found,
+            ),
+        };
+        Ok((held && !self.move_generator.out_of_memory()).then_some(seen))
+    }
+
+    fn walk_lanes(
+        &mut self,
+        deadline: Option<f64>,
+        now: &impl Fn() -> f64,
+    ) -> Result<Option<f64>, String> {
+        if self.walk.is_none() || self.out_of_memory {
+            return Ok(None);
+        }
+        let rows = self.lanes - self.cols;
+        let passes = self.walk_passes();
+        let from = now();
+        let mut at = from;
+        let mut walked = false;
+        while let Some(mut walk) = self.walk.take() {
+            if walked && deadline.is_some_and(|deadline| at >= deadline) {
+                self.walk = Some(walk);
+                break;
+            }
+            if walk.lane == passes {
+                if !self.all_listed {
+                    let keys = self.keys.len();
+                    if self.reach_next.is_empty() {
+                        if self.reach_from.is_empty() {
+                            if self.reach_from.try_reserve_exact(keys + 1).is_err() {
+                                self.out_of_memory = true;
+                                self.walk = Some(walk);
+                                break;
+                            }
+                            self.reach_from.resize(keys + 1, 0usize);
+                        }
+                        if let Some(lane) = self.lanes_reach.get(self.reach_lanes) {
+                            for &(id, _, _) in lane {
+                                self.reach_from[id as usize + 1] += 1;
+                            }
+                            self.reach_lanes += 1;
+                        } else {
+                            for id in 0..keys {
+                                self.reach_from[id + 1] += self.reach_from[id];
+                            }
+                            let mut reach = Vec::new();
+                            let (Ok(()), Ok(())) = (
+                                reach.try_reserve_exact(self.reach_from[keys]),
+                                self.reach_next.try_reserve_exact(keys + 1),
+                            ) else {
+                                self.out_of_memory = true;
+                                self.walk = Some(walk);
+                                break;
+                            };
+                            reach.resize(self.reach_from[keys], (0u16, 0i32));
+                            self.reach = reach;
+                            self.reach_next.extend_from_slice(&self.reach_from);
+                            self.reach_lanes = 0;
+                        }
+                    } else if let Some(lane) = self.lanes_reach.get_mut(self.reach_lanes) {
+                        for (id, along, score) in std::mem::take(lane) {
+                            self.reach[self.reach_next[id as usize]] = (along, score);
+                            self.reach_next[id as usize] += 1;
+                        }
+                        self.reach_lanes += 1;
+                    } else {
+                        let Some(exact_sums) = ThreatSums::new(keys, self.square_best.len()) else {
+                            self.out_of_memory = true;
+                            self.walk = Some(walk);
+                            break;
+                        };
+                        self.lanes_reach = Vec::new();
+                        self.reach_next = Vec::new();
+                        self.exact_sums = exact_sums;
+                        self.all_listed = true;
+                    }
+                    if !self.all_listed {
+                        walked = true;
+                        if deadline.is_some() {
+                            at = now();
+                        }
+                        self.walk = Some(walk);
+                        continue;
+                    }
+                }
+                self.kept_most = walk.top.most;
+                self.kept = walk.top.heap.into_sorted_vec();
+                break;
+            }
+            let lane = walk.lane % self.lanes;
+            let lanes = if lane < rows {
+                (1 << lane, 0)
+            } else {
+                (0, 1 << (lane - rows))
+            };
+            let size = if deadline.is_some() {
+                walk.size
+            } else {
+                u64::MAX
+            };
+            let to = walk.from.saturating_add(size);
+            let before = at;
+            let pass = if walk.lane < self.lanes {
+                ThreatPass::Lanes(lanes, walk.from..to, &mut walk.part)
+            } else {
+                ThreatPass::Top(lanes, walk.from..to, &mut walk.floor)
+            };
+            match self.snapshot_walk(pass, &mut walk.top)? {
+                Some(seen) => walk.seen = seen,
+                None => {
+                    self.out_of_memory = true;
+                    self.walk = Some(walk);
+                    break;
+                }
+            }
+            walked = true;
+            if let Some(deadline) = deadline {
+                at = now();
+                let fits = (deadline - at).max(0.0) / 8.0 / (at - before).max(f64::MIN_POSITIVE);
+                walk.size =
+                    ((walk.size as f64 * fits) as u64).clamp(1, walk.size.saturating_mul(2));
+            }
+            let stopped = walk.part.stopped_at();
+            if walk.seen <= to && stopped.is_none() {
+                if !self.all_listed && walk.lane < self.lanes {
+                    let cols = self.cols;
+                    let at = |along: usize| {
+                        if lane < rows {
+                            lane * cols + along
+                        } else {
+                            along * cols + (lane - rows)
+                        }
+                    };
+                    let stride = cols.max(rows);
+                    match self.lane.drained(at, stride) {
+                        Some(reached) if self.lanes_reach.try_reserve(1).is_ok() => {
+                            self.lanes_reach.push(reached);
+                        }
+                        _ => {
+                            self.out_of_memory = true;
+                            self.walk = Some(walk);
+                            break;
+                        }
+                    }
+                }
+                walk.lane += 1;
+                walk.from = 0;
+                walk.seen = 0;
+                walk.size = 1;
+                self.lists = Default::default();
+            } else {
+                walk.from = stopped.unwrap_or(to);
+            }
+            self.walk = Some(walk);
+        }
+        let to = if deadline.is_some() { at } else { now() };
+        self.list_ms += to - from;
+        Ok(Some(to))
+    }
+
     // the racks not yet counted counted exactly, the likeliest first, till half
     // (if given) passes, then racks drawn from those left (each as likely as
     // its chance) till deadline does; the answer, as ThreatsAnswer. Each rack
@@ -2611,113 +3144,199 @@ impl Threats {
             Some([row, col]) if row < rows && col < self.cols => Some(row * self.cols + col),
             Some([row, col]) => return Err(format!("square: [{row}, {col}] is off the board")),
         };
-        let tables = ThreatTables {
-            ids: &self.ids,
-            best: &self.best,
-            reach: &self.reach,
-            reach_from: &self.reach_from,
-            square_best: &self.square_best,
-            rack_size: self.rack_size,
+        let most = count.or(self.count_asked).unwrap_or(usize::MAX);
+        let whole = self.all_listed && !self.jumbled() && self.kept.len() as u64 == self.count;
+        if !self.all_listed && self.walk.is_none() {
+            self.walk = Some(ThreatWalk::new(most, 0));
+        }
+        if self.all_listed && self.jumbled() && self.kept_most < most {
+            match &mut self.walk {
+                Some(walk) if walk.top.most >= most => {}
+                walk => *walk = Some(ThreatWalk::new(most, self.lanes)),
+            }
+        }
+        if self.all_listed
+            && !self.jumbled()
+            && !whole
+            && self.kept.len() < most
+            && !self.out_of_memory
+        {
+            match &mut self.walk {
+                Some(walk) if walk.top.most >= most => {}
+                walk => *walk = Some(ThreatWalk::new(most, 0)),
+            }
+        }
+        let walked_to = if weigh {
+            self.walk_lanes(deadline, now)?
+        } else {
+            None
         };
-        let from = self.counted;
-        while weigh && self.counted < self.racks.len() {
-            let r = self.counted - from;
-            if r.is_multiple_of(16) && r > 0 && half.is_some_and(|half| now() >= half) {
+        let weigh =
+            weigh && walked_to.is_none_or(|to| deadline.is_none_or(|deadline| to < deadline));
+        let whole = self.all_listed && !self.jumbled() && self.kept.len() as u64 == self.count;
+        let mut refused = false;
+        if self.all_listed {
+            let tables = ThreatTables {
+                ids: &self.ids,
+                best: &self.best,
+                reach: &self.reach,
+                reach_from: &self.reach_from,
+                square_best: &self.square_best,
+                rack_size: self.rack_size,
+            };
+            let from = self.counted;
+            while weigh && self.counted < self.racks.len() {
+                let r = self.counted - from;
+                if r.is_multiple_of(16) && r > 0 && half.is_some_and(|half| now() >= half) {
+                    break;
+                }
+                let (rack, chance) = &self.racks[self.counted];
+                self.weigher
+                    .weigh(&tables, rack, *chance, &mut self.exact_sums);
+                self.covered += *chance;
+                self.counted += 1;
+            }
+            let exact = self.counted == self.racks.len();
+            let mut drawn_sums = ThreatSums::default();
+            let mut samples = 0usize;
+            let mut rest_chance = 0.0;
+            let mut upto = Vec::new();
+            if weigh && !exact {
+                match ThreatSums::new(self.keys.len(), self.square_best.len()) {
+                    Some(sums)
+                        if upto
+                            .try_reserve_exact(self.racks.len() - self.counted)
+                            .is_ok() =>
+                    {
+                        drawn_sums = sums;
+                        upto.extend((self.racks[self.counted..].iter()).map(|(_, chance)| {
+                            rest_chance += chance;
+                            rest_chance
+                        }));
+                    }
+                    _ => refused = true,
+                }
+                while rest_chance > 0.0
+                    && !(samples.is_multiple_of(16)
+                        && samples > 0
+                        && deadline.is_some_and(|deadline| now() >= deadline))
+                {
+                    let at = self.rng.random::<f64>() * rest_chance;
+                    let i = (upto.partition_point(|&upto| upto <= at)).min(upto.len() - 1);
+                    let rack = &self.racks[self.counted + i].0;
+                    self.weigher.weigh(&tables, rack, 1.0, &mut drawn_sums);
+                    samples += 1;
+                }
+            }
+            let each = if samples > 0 {
+                rest_chance / samples as f64
+            } else {
+                0.0
+            };
+            if weigh {
+                self.drawn = (drawn_sums, each, samples);
+            }
+        }
+        let exact = self.all_listed && self.counted == self.racks.len();
+        let passes = self.walk_passes() as f64;
+        let walked = match &self.walk {
+            // every lane walked, reach not yet built
+            Some(walk) if walk.lane == self.walk_passes() => 1.0 - 1e-9,
+            Some(walk) if walk.seen > 0 => {
+                (walk.lane as f64 + walk.from as f64 / walk.seen as f64) / passes
+            }
+            Some(walk) => walk.lane as f64 / passes,
+            None if !self.all_listed => 0.0,
+            None => 1.0,
+        };
+        let samples = if exact { 0 } else { self.drawn.2 };
+        let mut out_of_memory = self.out_of_memory || refused;
+        let mut page = ThreatTop::new(most);
+        if let Some(at) = through
+            && !whole
+            && self
+                .snapshot_walk(ThreatPass::Through(at), &mut page)?
+                .is_none()
+        {
+            out_of_memory = true;
+        }
+        let top = match through {
+            Some(_) if !whole => Some(&page),
+            _ if !self.all_listed => self.walk.as_ref().map(|walk| &walk.top),
+            _ => None,
+        };
+        let held = match top.map(ThreatTop::sorted) {
+            Some(Some(held)) => held,
+            Some(None) => {
+                out_of_memory = true;
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let kept = if top.is_none() { &self.kept[..] } else { &[] };
+        let (drawn_sums, each, _) = &self.drawn;
+        let total = |pick: fn(&ThreatSums) -> &[f64]| ThreatTotal {
+            exact: pick(&self.exact_sums),
+            drawn: pick(drawn_sums),
+            each: *each,
+        };
+        let square_chance = total(|sums| &sums.square_chance);
+        let square_expected = total(|sums| &sums.square_expected);
+        let square_reach = total(|sums| &sums.square_reach);
+        let rows = self.board_tiles.chunks(self.cols);
+        let mut squares = Vec::new();
+        let mut refused_squares = squares.try_reserve_exact(rows.len()).is_err();
+        for (row, from) in rows.zip((0..).step_by(self.cols)) {
+            let mut line = Vec::new();
+            if refused_squares || line.try_reserve_exact(row.len()).is_err() {
+                refused_squares = true;
                 break;
             }
-            let (rack, chance) = &self.racks[self.counted];
-            self.weigher
-                .weigh(&tables, rack, *chance, &mut self.exact_sums);
-            self.covered += *chance;
-            self.counted += 1;
-        }
-        let exact = self.counted == self.racks.len();
-        let mut drawn_sums = ThreatSums::new(self.keys.len(), self.square_best.len());
-        let mut samples = 0usize;
-        let mut rest_chance = 0.0;
-        if weigh && !exact {
-            let upto = (self.racks[self.counted..].iter())
-                .map(|(_, chance)| {
-                    rest_chance += chance;
-                    rest_chance
+            line.extend((row.iter().zip(from..)).map(|(&tile, at)| {
+                (tile == 0).then(|| ThreatSquare {
+                    best: equity::descale_score(self.square_best[at].max(0)),
+                    chance: square_chance.at(at),
+                    expected: square_expected.at(at) / equity::SCALE as f64,
+                    reach: square_reach.at(at),
                 })
-                .collect::<Vec<_>>();
-            while rest_chance > 0.0
-                && !(samples.is_multiple_of(16)
-                    && samples > 0
-                    && deadline.is_some_and(|deadline| now() >= deadline))
-            {
-                let at = self.rng.random::<f64>() * rest_chance;
-                let i = (upto.partition_point(|&upto| upto <= at)).min(upto.len() - 1);
-                let rack = &self.racks[self.counted + i].0;
-                self.weigher.weigh(&tables, rack, 1.0, &mut drawn_sums);
-                samples += 1;
-            }
+            }));
+            squares.push(line);
         }
-        let each = if samples > 0 {
-            rest_chance / samples as f64
-        } else {
-            0.0
-        };
-        if weigh {
-            self.drawn = (drawn_sums, each, samples);
+        if refused_squares {
+            squares = Vec::new();
+            out_of_memory = true;
         }
-        let (drawn_sums, each, samples) = &self.drawn;
-        let samples = if exact { 0 } else { *samples };
-        let sums = (ThreatSums::new(self.keys.len(), self.square_best.len()))
-            .plus(&self.exact_sums, 1.0)
-            .plus(drawn_sums, *each);
-        let word =
-            |play: &ThreatFound| &self.words[play.word.start as usize..play.word.end as usize];
-        let plays = (self.plays.iter())
-            .filter(|play| {
-                through.is_none_or(|through| {
-                    placed_squares((play.down, play.lane, play.idx, word(play)), self.cols)
-                        .any(|at| at == through)
-                })
-            })
-            .take(count.or(self.count_asked).unwrap_or(usize::MAX))
-            .map(|play| ThreatPlay {
-                tiles: self.keys[play.id as usize].to_vec(),
-                chance: sums.holds[play.id as usize],
-                play: (&movegen::Play::Place {
-                    down: play.down,
-                    lane: play.lane,
-                    idx: play.idx,
-                    word: word(play).into(),
-                    score: play.score,
-                })
-                    .into(),
-            })
-            .collect();
-        let squares = (self.board_tiles.chunks(self.cols))
-            .zip((0..).step_by(self.cols))
-            .map(|(row, from)| {
-                (row.iter().zip(from..))
-                    .map(|(&tile, at)| {
-                        (tile == 0).then(|| ThreatSquare {
-                            best: equity::descale_score(self.square_best[at].max(0)),
-                            chance: sums.square_chance[at],
-                            expected: sums.square_expected[at] / equity::SCALE as f64,
-                            reach: sums.square_reach[at],
-                        })
-                    })
-                    .collect()
-            })
-            .collect();
-        serde_json::to_string(&ThreatsAnswer {
+        let mut answer = ThreatsAnswer {
             racks: self.racks.len(),
             count: self.count,
-            expected_best: sums.expected_best / equity::SCALE as f64,
-            bingo: (self.opponent_rack == self.rack_size).then_some(sums.bingo),
+            expected_best: (self.exact_sums.expected_best + each * drawn_sums.expected_best)
+                / equity::SCALE as f64,
+            bingo: (self.opponent_rack == self.rack_size)
+                .then_some(self.exact_sums.bingo + each * drawn_sums.bingo),
             covered: if exact { 1.0 } else { self.covered },
             samples,
             list_ms: self.list_ms,
-            exact,
-            plays,
+            exact: exact && self.walk.is_none(),
+            walked,
+            plays: ThreatPlays {
+                kept,
+                held: &held,
+                through,
+                cols: self.cols,
+                most,
+                keys: &self.keys,
+                holds: total(|sums| &sums.holds),
+            },
             squares,
-        })
-        .map_err(err_to_str)
+            out_of_memory,
+        };
+        if let Some(json) = try_json(&answer)? {
+            return Ok(json);
+        }
+        answer.plays.kept = &[];
+        answer.plays.held = &[];
+        answer.out_of_memory = true;
+        serde_json::to_string(&answer).map_err(err_to_str)
     }
 }
 
@@ -2741,8 +3360,12 @@ fn do_threats(req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
     let req = serde_json::from_str::<ThreatsRequest>(req_str).map_err(err_to_str)?;
     let deadline = threats_deadline(req.ms, &now)?;
     let square = req.square;
-    let mut threats = threats_made(req, &now)?;
-    let listed = threats.listed;
+    let mut threats = threats_made(req)?;
+    threats.walk = Some(ThreatWalk::new(
+        threats.count_asked.unwrap_or(usize::MAX),
+        0,
+    ));
+    let listed = threats.walk_lanes(None, &now)?.unwrap_or_else(&now);
     let half = deadline.map(|deadline| listed + (deadline - listed).max(0.0) / 2.0);
     threats.step(half, deadline, true, (None, square), &now)
 }
@@ -2751,12 +3374,12 @@ fn do_threats(req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
 // listed now, its racks left to threats_step; its handle
 #[wasm_bindgen]
 pub fn threats_new(req_str: String) -> Result<u32, JsValue> {
-    Ok(do_threats_new(&req_str, step_clock)?)
+    Ok(do_threats_new(&req_str)?)
 }
 
-fn do_threats_new(req_str: &str, now: impl Fn() -> f64) -> Result<u32, String> {
+fn do_threats_new(req_str: &str) -> Result<u32, String> {
     let req = serde_json::from_str::<ThreatsRequest>(req_str).map_err(err_to_str)?;
-    let threats = threats_made(req, &now)?;
+    let threats = threats_made(req)?;
     let mut made = THREATS.lock().map_err(err_to_str)?;
     let handle = made.made.checked_add(1).ok_or("too many threats made")?;
     made.made = handle;
@@ -3060,9 +3683,12 @@ static HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::ne
 struct Counting;
 
 // every allocation counted onto the bytes held as it is made and off as it is
-// freed
+// freed; refused when the count would overflow
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if held_bytes().checked_add(layout.size()).is_none() {
+            return std::ptr::null_mut();
+        }
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
             HELD.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
@@ -3071,6 +3697,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if held_bytes().checked_add(layout.size()).is_none() {
+            return std::ptr::null_mut();
+        }
         let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !p.is_null() {
             HELD.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
@@ -3084,6 +3713,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if held_bytes().checked_add(new_size).is_none() {
+            return std::ptr::null_mut();
+        }
         let q = unsafe { std::alloc::System.realloc(p, layout, new_size) };
         if !q.is_null() {
             HELD.fetch_add(new_size, std::sync::atomic::Ordering::Relaxed);
@@ -7430,11 +8062,12 @@ mod tests {
             clock.set(time + 1.0);
             time
         };
-        let handle = do_threats_new(&req, now).unwrap();
+        let handle = do_threats_new(&req).unwrap();
         let step = |ms: &str| {
             let answer = do_threats_step(handle, &format!(r#"{{{ms}}}"#), now).unwrap();
             serde_json::from_str::<serde_json::Value>(&answer).unwrap()
         };
+        while step(r#""ms":1"#)["walked"] != 1.0 {}
         let first = step(r#""ms":1"#);
         assert_eq!(first["exact"], false);
         assert_near(&first["covered"], 23.0 / 36.0);
@@ -7475,7 +8108,7 @@ mod tests {
             serde_json::to_string(&rack).unwrap(),
             threats_board(&unseen, &rack),
         );
-        let handle = do_threats_new(&req, || 0.0).unwrap();
+        let handle = do_threats_new(&req).unwrap();
         let step = |more: &str| {
             let answer = do_threats_step(handle, &format!("{{{more}}}"), || 0.0).unwrap();
             serde_json::from_str::<serde_json::Value>(&answer).unwrap()
@@ -7507,5 +8140,166 @@ mod tests {
             "square: [15, 0] is off the board"
         );
         do_threats_free(handle).unwrap();
+    }
+
+    // f run with the count of bytes held raised so that a request of more than
+    // bytes would overflow it, and so is refused
+    fn refusing_from<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+        let more = usize::MAX - held_bytes() - bytes;
+        HELD.fetch_add(more, std::sync::atomic::Ordering::Relaxed);
+        let answer = f();
+        HELD.fetch_sub(more, std::sync::atomic::Ordering::Relaxed);
+        answer
+    }
+
+    // the ignored test name run alone, in a process of its own: raising the
+    // count refuses every thread's growth, so no other test may run beside it
+    fn alone(name: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--ignored", "--test-threads", "1"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{name}");
+    }
+
+    fn many_lexicon(name: &str, jumbled: bool) {
+        do_this_on_startup().unwrap();
+        let letters = [A, C, E, S, T];
+        let mut words = vec![Vec::new()];
+        let mut from = 0;
+        for _ in 0..4 {
+            let to = words.len();
+            for i in from..to {
+                for &letter in &letters {
+                    let mut word = words[i].clone();
+                    word.push(letter);
+                    words.push(word);
+                }
+            }
+            from = to;
+        }
+        let mut words = (words.into_iter())
+            .filter(|word| word.len() >= 2)
+            .map(|word| word[..].into())
+            .collect::<Vec<bites::Bites>>();
+        words.sort_unstable();
+        let bytes = if jumbled {
+            build::build(
+                build::BuildContent::DawgOnly,
+                build::BuildLayout::Wolges,
+                build::BuildOrder::Sorted,
+                &build::make_alphagrams(&words),
+            )
+        } else {
+            build::build(
+                build::BuildContent::Gaddawg,
+                build::BuildLayout::Wolges,
+                build::BuildOrder::Sorted,
+                &words,
+            )
+        }
+        .unwrap();
+        let graph = Kwg::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
+            piece.copy_from_slice(&bytes[at..at + piece.len()])
+        })
+        .unwrap();
+        CACHED_KWG
+            .write()
+            .unwrap()
+            .insert(name.into(), CachedKwg::new(graph).into());
+    }
+
+    fn many_threats() -> String {
+        many_lexicon("alloc-threats", false);
+        let mut unseen = [0u8; 27];
+        for tile in [A, C, E, S, T] {
+            unseen[tile as usize] = 3;
+        }
+        format!(
+            r#"{{"rack":[],"board":{},"lexicon":"alloc-threats","rules":"CrosswordGame","unseen":{}}}"#,
+            cat_board(),
+            serde_json::to_string(&unseen).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_threats_walk_refused_its_growth_answers_out_of_memory_alone() {
+        alone("tests::a_threats_walk_refused_its_growth_answers_out_of_memory");
+    }
+
+    #[test]
+    #[ignore = "run alone by a_threats_walk_refused_its_growth_answers_out_of_memory_alone"]
+    fn a_threats_walk_refused_its_growth_answers_out_of_memory() {
+        let req = many_threats();
+        let step = |handle: u32, more: &str| {
+            let answer = do_threats_step(handle, &format!("{{{more}}}"), || 0.0).unwrap();
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap()
+        };
+        // a refused step's answer is read once the count is back
+        let raw = |handle: u32, more: &str| {
+            do_threats_step(handle, &format!("{{{more}}}"), || 0.0).unwrap()
+        };
+        let read = |answer: String| serde_json::from_str::<serde_json::Value>(&answer).unwrap();
+        let whole = do_threats_new(&req).unwrap();
+        let walked = step(whole, r#""count":1"#);
+        assert_eq!(walked["exact"], true);
+        assert!(walked.get("out_of_memory").is_none());
+        assert!(walked["count"].as_u64().unwrap() > 1);
+        // refused from 1 GiB, then from half as much again till the walk is
+        let mut from = 1 << 30;
+        let (short, refused) = loop {
+            let short = do_threats_new(&req).unwrap();
+            let refused = read(refusing_from(from, || raw(short, r#""count":1"#)));
+            if refused["out_of_memory"] == true {
+                break (short, refused);
+            }
+            do_threats_free(short).unwrap();
+            from /= 2;
+            assert!(from > 0, "{refused}");
+        };
+        assert_eq!(refused["exact"], false);
+        let again = step(short, "");
+        assert_eq!(again["out_of_memory"], true);
+        assert_eq!(again["walked"], refused["walked"]);
+        do_threats_free(short).unwrap();
+        let listed = step(whole, "");
+        let count = listed["count"].as_u64().unwrap();
+        assert_eq!(listed["plays"].as_array().unwrap().len() as u64, count);
+        let bytes = listed.to_string().len() / 2;
+        let refused = read(refusing_from(bytes, || raw(whole, "")));
+        assert_eq!(refused["out_of_memory"], true);
+        assert!(refused["plays"].as_array().unwrap().is_empty());
+        assert_eq!(refused["squares"], listed["squares"]);
+        assert_eq!(step(whole, ""), listed);
+        do_threats_free(whole).unwrap();
+    }
+
+    #[test]
+    fn a_threats_count_is_more_than_32_bits() {
+        let found = ThreatsAnswer {
+            racks: 0,
+            count: u64::from(u32::MAX) + 1,
+            expected_best: 0.0,
+            bingo: None,
+            covered: 0.0,
+            samples: 0,
+            list_ms: 0.0,
+            exact: false,
+            walked: 0.0,
+            plays: ThreatPlays {
+                kept: &[],
+                held: &[],
+                through: None,
+                cols: 15,
+                most: 0,
+                keys: &[],
+                holds: Default::default(),
+            },
+            squares: Vec::new(),
+            out_of_memory: false,
+        };
+        let answer =
+            serde_json::from_str::<serde_json::Value>(&try_json(&found).unwrap().unwrap()).unwrap();
+        assert_eq!(answer["count"], u64::from(u32::MAX) + 1);
     }
 }
