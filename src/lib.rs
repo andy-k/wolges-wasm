@@ -3836,21 +3836,77 @@ struct EndgameNewRequest {
 // endgame_step: at most this many milliseconds; 0 reads the last answer. With
 // an empty bag, first_moves_ms asks for every first move's value too, on the
 // table the steps kept, in at most that many milliseconds more. With two tiles
-// or more in the bag, draws_of asks for one candidate's draws (its index in the
-// answer's candidates). brief asks for the answer's state alone: no candidates,
-// draws, tiles or line
+// or more in the bag, draws_of asks for the draws of the candidate it names
+// (DrawsOf). brief asks for the answer's state alone: no candidates, draws,
+// tiles or line. candidates_range [from, to] gives only the candidates from
+// the first to before the second (each past the last read as the last) and
+// candidates_total, how many there are in all, and the candidate draws_of
+// names, when it is not among them, as drawn; the search is the same
 #[derive(serde::Deserialize)]
 struct EndgameStepRequest {
     ms: Option<f64>,
     #[serde(default)]
     first_moves_ms: Option<f64>,
     #[serde(default)]
-    draws_of: Option<usize>,
+    draws_of: Option<DrawsOf>,
     // with draws_of, its rows from the first given to before the second
     #[serde(default)]
     draws_range: Option<[usize; 2]>,
     #[serde(default)]
+    candidates_range: Option<[usize; 2]>,
+    #[serde(default)]
     brief: bool,
+}
+
+// the candidate draws_of names, by one of these
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum DrawsOf {
+    // its index in the answer's candidates
+    Index(usize),
+}
+
+// endgame_step's answer with only some of its candidates, the count of all,
+// and the candidate draws_of names when it is not among them
+#[derive(serde::Serialize)]
+struct EndgamePage<'a> {
+    #[serde(flatten)]
+    answer: &'a EndgameAnswer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidates_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drawn: Option<EndgameDrawn>,
+}
+
+// a candidate with its draws, outside the candidates a page lists, and its
+// index in them all
+#[derive(serde::Serialize)]
+struct EndgameDrawn {
+    index: usize,
+    #[serde(flatten)]
+    candidate: EndgameCandidate,
+}
+
+// an answer as JSON with only the candidates it holds in the range, the list
+// kept whole
+fn page_json(answer: &mut EndgameAnswer, range: [usize; 2]) -> Result<String, String> {
+    let mut all = answer.candidates.take();
+    let total = all.as_ref().map(Vec::len);
+    let [from, to] = range.map(|at| at.min(total.unwrap_or(0)));
+    let to = to.max(from);
+    let after = all.as_mut().map(|all| all.split_off(to));
+    answer.candidates = all.as_mut().map(|all| all.split_off(from));
+    let json = serde_json::to_string(&EndgamePage {
+        answer,
+        candidates_total: total,
+        drawn: None,
+    });
+    if let (Some(all), Some(shown), Some(after)) = (&mut all, answer.candidates.take(), after) {
+        all.extend(shown);
+        all.extend(after);
+    }
+    answer.candidates = all;
+    json.map_err(err_to_str)
 }
 
 // endgame_step's answer when brief: its fields of the state, as they are
@@ -4177,6 +4233,49 @@ impl Endgame {
         let json = serde_json::to_string(&self.answer);
         self.answer.candidates = kept;
         json.map_err(err_to_str)
+    }
+
+    // the answer as JSON with only its candidates in the range, and how many
+    // there are in all (as answer_json lists them); the one with the draws
+    // given comes as drawn when it is not in the range
+    fn answer_page(
+        &mut self,
+        range: [usize; 2],
+        draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
+    ) -> Result<String, String> {
+        let Some(progress) = self.peg_bag.as_ref() else {
+            return page_json(&mut self.answer, range);
+        };
+        let total = progress.answer_total();
+        let [from, to] = range.map(|at| at.min(total));
+        let places = from..to.max(from);
+        let (inside, outside) = match draws {
+            Some(draws) if places.contains(&draws.0) => (Some(draws), None),
+            draws => (None, draws),
+        };
+        let drawn = outside.and_then(|draws| {
+            let index = draws.0;
+            let candidate = self
+                .listed(index..index.saturating_add(1), Some(draws))
+                .pop()?;
+            Some(EndgameDrawn { index, candidate })
+        });
+        let listed = self.listed(places, inside);
+        let kept = self.answer.candidates.replace(listed);
+        let json = serde_json::to_string(&EndgamePage {
+            answer: &self.answer,
+            candidates_total: Some(total),
+            drawn,
+        });
+        self.answer.candidates = kept;
+        json.map_err(err_to_str)
+    }
+
+    // the place in the answer's candidates of the one draws_of names
+    fn place_of(&self, draws_of: DrawsOf) -> Result<usize, String> {
+        match draws_of {
+            DrawsOf::Index(i) => Ok(i),
+        }
     }
 
     // one solve of at most ms on the clock, on the table earlier steps kept
@@ -4782,6 +4881,9 @@ fn do_endgame_step(
         if req.draws_of.is_some() {
             return Err("brief: no draws come with it, so not with draws_of".into());
         }
+        if req.candidates_range.is_some() {
+            return Err("brief: no candidates come with it, so not with candidates_range".into());
+        }
         let a = &endgame.answer;
         let brief = EndgameBrief {
             bag: a.bag,
@@ -4801,12 +4903,16 @@ fn do_endgame_step(
         };
         return serde_json::to_string(&brief).map_err(err_to_str);
     }
-    let Some(i) = req.draws_of else {
+    let Some(draws_of) = req.draws_of else {
         if req.draws_range.is_some() {
             return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
         }
+        if let Some(range) = req.candidates_range {
+            return endgame.answer_page(range, None);
+        }
         return endgame.answer_json(None);
     };
+    let i = endgame.place_of(draws_of)?;
     let listed = endgame.peg_bag.as_ref().map(|progress| {
         let total = progress.answer_total();
         (progress.answer_moves(i..i.saturating_add(1)).pop(), total)
@@ -4830,6 +4936,9 @@ fn do_endgame_step(
         Err(missing) => return Err(format!("draws_of: no rows, {missing:?}")),
     };
     let draws = bag_draws(&rows.hypotheses, &rows.wins, &rows.draws, lead);
+    if let Some(range) = req.candidates_range {
+        return endgame.answer_page(range, Some((i, draws, total)));
+    }
     endgame.answer_json(Some((i, draws, total)))
 }
 
@@ -7091,6 +7200,78 @@ mod tests {
             (answer["win"].as_f64().unwrap() - won).abs() < 1e-6,
             "{answer}"
         );
+        do_endgame_free(handle).unwrap();
+    }
+
+    // a range of the candidates reads the whole answer's from the first to
+    // before the second, the rest of it the same, with the count of all; a
+    // draws_of within the range comes with it; brief takes no range
+    #[test]
+    fn a_range_of_candidates_reads_that_slice_of_the_whole() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
+        let more = r#","model":"random_draws","exchanges":[0,0]"#;
+        let handle = endgame_of("tiny-end-pages", &rack, &others, more).unwrap();
+        let whole = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(whole["exact"], true, "{whole}");
+        let all = whole["candidates"].as_array().unwrap();
+        let n = all.len();
+        assert!(n >= 3, "{whole}");
+        for [from, to] in [
+            [0, n],
+            [0, 1],
+            [1, 3],
+            [n - 1, n + 5],
+            [n + 2, n + 9],
+            [2, 1],
+        ] {
+            let page = endgame_step(
+                handle,
+                &format!(r#"{{"ms":0,"candidates_range":[{from},{to}]}}"#),
+            );
+            let (from, to) = (from.min(n), to.min(n).max(from.min(n)));
+            assert_eq!(page["candidates"].as_array().unwrap()[..], all[from..to]);
+            assert_eq!(page["candidates_total"], n);
+            let mut rest = page.as_object().unwrap().clone();
+            rest.remove("candidates");
+            rest.remove("candidates_total");
+            let mut whole_rest = whole.as_object().unwrap().clone();
+            whole_rest.remove("candidates");
+            assert_eq!(rest, whole_rest);
+        }
+        let one = endgame_step(handle, r#"{"ms":0,"draws_of":1}"#);
+        let paged = endgame_step(handle, r#"{"ms":0,"draws_of":1,"candidates_range":[1,2]}"#);
+        assert_eq!(paged["candidates"][0], one["candidates"][1]);
+        assert!(paged["candidates"][0]["draws"].is_array(), "{paged}");
+        assert!(paged.get("drawn").is_none(), "{paged}");
+        // a draws_of outside the range comes as drawn, with its index
+        let first = endgame_step(handle, r#"{"ms":0,"draws_of":0}"#);
+        let outside = endgame_step(handle, r#"{"ms":0,"draws_of":0,"candidates_range":[1,2]}"#);
+        let mut drawn = outside["drawn"].clone();
+        assert_eq!(
+            drawn.as_object_mut().unwrap().remove("index"),
+            Some(0.into())
+        );
+        assert_eq!(drawn, first["candidates"][0]);
+        assert!(drawn["draws"].is_array(), "{outside}");
+        assert_eq!(outside["candidates"][0], all[1]);
+        // an empty range lists none, the one draws_of names still drawn
+        let none = endgame_step(
+            handle,
+            r#"{"ms":0,"draws_of":1,"draws_range":[0,1],"candidates_range":[0,0]}"#,
+        );
+        assert_eq!(none["candidates"], serde_json::json!([]));
+        assert_eq!(none["candidates_total"], n);
+        assert_eq!(none["drawn"]["index"], 1);
+        assert_eq!(none["drawn"]["draws"].as_array().unwrap().len(), 1);
+        assert!(
+            none["drawn"]["draws_total"].as_u64().unwrap() >= 1,
+            "{none}"
+        );
+        // the whole answer as it was, after the pages
+        assert_eq!(endgame_step(handle, r#"{"ms":0}"#), whole);
+        let brief = r#"{"ms":0,"brief":true,"candidates_range":[0,1]}"#;
+        assert!(do_endgame_step(handle, brief, frozen, held_bytes).is_err());
         do_endgame_free(handle).unwrap();
     }
 
