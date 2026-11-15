@@ -1137,9 +1137,10 @@ impl SimPlay {
 // or both, whichever ends first; iterations 0 reads the sim without stepping
 // it. Whether to prune, said on every step; to prune, every prune_every
 // iterations each running candidate behind the leader by prune_z standard
-// errors, on the iterations both ran, is pruned, a chance to win within
-// prune_decided (0 to 0.5) of 0 or 1 having its game decided. And a play each
-// candidate is compared with, on the iterations both ran.
+// errors split over the candidates still running, on the iterations both ran,
+// is pruned, a chance to win within prune_decided (0 to 0.5) of 0 or 1 having
+// its game decided. And a play each candidate is compared with, on the
+// iterations both ran.
 #[derive(serde::Deserialize)]
 struct SimStepRequest {
     iterations: Option<u64>,
@@ -1590,6 +1591,10 @@ fn prune_behind(candidates: &mut [SimCandidate], z: f64, decided: f64) {
     let Some(lead) = leader(candidates, decided) else {
         return;
     };
+    let running = (candidates.iter())
+        .filter(|c| c.state == SimState::Running)
+        .count();
+    let z = move_picker::z_among(z, running);
     let behind = (candidates.iter())
         .map(|c| {
             let (mine, leads) = if by_equity(c.win.mean(), lead.win.mean(), decided) {
@@ -5630,6 +5635,54 @@ mod tests {
         do_sim_change(sim, &format!("[{CATS},{PASS}]"), SimChange::Pause).unwrap();
         assert_eq!(step(sim, r#"{"iterations":5,"prune":false}"#)["stepped"], 0);
         do_sim_free(sim).unwrap();
+    }
+
+    fn best_pruned_share(k: usize, budget: u64, decisions: u64) -> f64 {
+        use rand::SeedableRng;
+        let z = move_picker::paired_z(budget);
+        let mut rng = wolges::simmer::DefaultRng::seed_from_u64(k as u64);
+        let mut normal = || {
+            let u: f64 = 1.0 - rand::RngExt::random::<f64>(&mut rng);
+            let v: f64 = rand::RngExt::random::<f64>(&mut rng);
+            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+        };
+        let mut best_pruned = 0u64;
+        for _ in 0..decisions {
+            let mut candidates = (0..k).map(|_| rolled(&[], &[])).collect::<Vec<_>>();
+            for iter in 1..=budget {
+                let shared = normal();
+                for candidate in candidates.iter_mut() {
+                    let value = if candidate.state == SimState::Running {
+                        shared + normal()
+                    } else {
+                        f64::NAN
+                    };
+                    candidate.wins.push(value);
+                    candidate.equities.push(value);
+                    if !value.is_nan() {
+                        candidate.win.update(value);
+                        candidate.equity.update(value);
+                    }
+                }
+                if iter % move_picker::PRUNE_CADENCE == 0 {
+                    prune_behind(&mut candidates, z, 0.0);
+                }
+            }
+            if candidates[0].state == SimState::Pruned {
+                best_pruned += 1;
+            }
+        }
+        best_pruned as f64 / decisions as f64
+    }
+
+    #[test]
+    fn prune_behind_prunes_the_first_of_k_tied_at_most_one_time_in_twenty() {
+        let decisions = 400;
+        let bound = 0.05 + 3.0 * (0.05 * 0.95 / decisions as f64).sqrt();
+        for k in [2, 4, 8, 16] {
+            let share = best_pruned_share(k, 256, decisions);
+            assert!(share <= bound, "{k}: {share}");
+        }
     }
 
     // a running candidate whose rollouts, from the first iteration, had these
