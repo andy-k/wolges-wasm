@@ -479,7 +479,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, JsValue> {
                 ))
             }
         };
-        move_generator.gen_moves_filtered_lean(
+        move_generator.gen_moves_filtered_lean_walked::<movegen::OncePerScore, _, _>(
             &movegen::GenMovesParams {
                 board_snapshot,
                 rack: &req.rack,
@@ -3188,6 +3188,8 @@ struct EndgameBrief<'a> {
     part: Option<[usize; 2]>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_of_memory_in: Option<&'static str>,
 }
 
 // a ply of an endgame's line: the play, and its mover's gain on the other from
@@ -3311,6 +3313,8 @@ struct EndgameAnswer {
     // search has no room to go on
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_of_memory_in: Option<&'static str>,
 }
 
 // an endgame a caller steps and frees: its rules and its own word graph, of the
@@ -3546,6 +3550,7 @@ impl Endgame {
             EndgameAnswer {
                 part: (n > 1).then_some([k, n]),
                 out_of_memory: peg.out_of_memory,
+                out_of_memory_in: None,
                 bag: self.bag,
                 steps,
                 nodes,
@@ -3584,6 +3589,7 @@ impl Endgame {
             EndgameAnswer {
                 part: None,
                 out_of_memory: peg.out_of_memory,
+                out_of_memory_in: None,
                 bag: 1,
                 steps,
                 nodes,
@@ -3663,6 +3669,7 @@ impl Endgame {
             EndgameAnswer {
                 part: None,
                 out_of_memory: solved.out_of_memory,
+                out_of_memory_in: solved.out_of_memory_in_moves.then_some("moves"),
                 bag: 0,
                 steps,
                 nodes: self.nodes,
@@ -4054,6 +4061,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         answer: EndgameAnswer {
             part: req.part.filter(|&[_, n]| n > 1),
             out_of_memory: false,
+            out_of_memory_in: None,
             bag,
             steps: 0,
             nodes: 0,
@@ -4139,6 +4147,7 @@ fn do_endgame_step(
             moves: a.moves,
             part: a.part,
             out_of_memory: a.out_of_memory,
+            out_of_memory_in: a.out_of_memory_in,
         };
         return serde_json::to_string(&brief).map_err(err_to_str);
     }
@@ -6547,6 +6556,7 @@ mod tests {
         let answer = |exact: bool, depth: i8, value: f64| EndgameAnswer {
             part: None,
             out_of_memory: false,
+            out_of_memory_in: None,
             bag: 0,
             steps: 1,
             nodes: 0,
