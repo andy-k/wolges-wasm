@@ -3307,8 +3307,8 @@ struct EndgameAnswer {
     // the part of the search it is, k of n (endgame_new's part)
     #[serde(skip_serializing_if = "Option::is_none")]
     part: Option<[usize; 2]>,
-    // the step stopped short of exact holding max_memory_mb or more: the search
-    // has no room to go on (left out when not so)
+    // max_memory_mb stopped the step short of exact, or refused it room: the
+    // search has no room to go on
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
 }
@@ -3545,7 +3545,7 @@ impl Endgame {
             let (k, n) = progress.part_of();
             EndgameAnswer {
                 part: (n > 1).then_some([k, n]),
-                out_of_memory: false,
+                out_of_memory: peg.out_of_memory,
                 bag: self.bag,
                 steps,
                 nodes,
@@ -3583,7 +3583,7 @@ impl Endgame {
             let (endgames, nodes) = progress.searched();
             EndgameAnswer {
                 part: None,
-                out_of_memory: false,
+                out_of_memory: peg.out_of_memory,
                 bag: 1,
                 steps,
                 nodes,
@@ -3662,7 +3662,7 @@ impl Endgame {
             let value = solved.value.map(points);
             EndgameAnswer {
                 part: None,
-                out_of_memory: false,
+                out_of_memory: solved.out_of_memory,
                 bag: 0,
                 steps,
                 nodes: self.nodes,
@@ -4120,8 +4120,6 @@ fn do_endgame_step(
         }
         Some(ms) => endgame.value_first_moves(ms, clock, memory)?,
     }
-    endgame.answer.out_of_memory =
-        !endgame.answer.exact && endgame.max_memory.is_some_and(|bytes| memory() >= bytes);
     if req.brief {
         if req.draws_of.is_some() {
             return Err("brief: no draws come with it, so not with draws_of".into());
