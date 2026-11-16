@@ -1630,13 +1630,12 @@ impl Sim {
         Ok(stepped)
     }
 
-    fn report(&self, stepped: u64, against: Option<&HeldPlay>) -> SimReport {
+    fn report(&self, stepped: u64, against: Option<&HeldPlay>) -> SimReport<'_> {
         let weight = self.simmer.win_prob_weightage();
         let other = against.and_then(|held| self.candidates.iter().find(|c| held.is(c)));
         let other_objectives = other.map(|other| objectives(other, weight));
         // every ply of the sim's is reported, one no rollout has reached yet as
         // an empty one; a sim to the game's end, every ply a rollout reached
-        let unreached = SimPly::default();
         let listed = self.plies.unwrap_or_else(|| {
             (self.candidates.iter())
                 .map(|c| c.plies.len())
@@ -1647,49 +1646,78 @@ impl Sim {
             iterations: self.iterations,
             out_of_memory: self.out_of_memory,
             stepped,
-            candidates: (self.candidates.iter())
-                .map(|c| SimCandidateReport {
-                    play: kibitzer::JsonPlayWithEquity {
-                        equity: c.static_equity,
-                        play: (&c.play).into(),
-                    },
-                    challenged_off: c.challenged_off,
-                    state: c.state.name(),
-                    n: c.objective.count() as u64,
-                    win: (&c.win).into(),
-                    equity: (&c.equity).into(),
-                    spread: (&c.spread).into(),
-                    leaves: (&c.leaves).into(),
-                    objective: (&c.objective).into(),
-                    plies: (0..listed)
-                        .map(|i| c.plies.get(i).unwrap_or(&unreached))
-                        .map(|ply| SimPlyReport {
-                            n: ply.score.count() as u64,
-                            score: (&ply.score).into(),
-                            bingo: ply.bingo.mean(),
-                        })
-                        .collect(),
-                    against: other.zip(other_objectives.as_deref()).map(
-                        |(other, other_objectives)| {
-                            let less = |mine: &[f64], others: &[f64]| -> SimCountedStat {
-                                (&move_picker::paired_difference(
-                                    mine,
-                                    c.first_iter,
-                                    others,
-                                    other.first_iter,
-                                ))
-                                    .into()
-                            };
-                            SimAgainst {
-                                win: less(&c.wins, &other.wins),
-                                equity: less(&c.equities, &other.equities),
-                                objective: less(&objectives(c, weight), other_objectives),
-                            }
-                        },
-                    ),
-                })
-                .collect(),
+            candidates: SimCandidatesJson {
+                candidates: &self.candidates,
+                listed,
+                weight,
+                other: other.zip(other_objectives),
+            },
         }
+    }
+}
+
+// a sim's candidates as SimCandidateReport writes each, each written from where
+// the sim holds it; other: the candidate compared against, with its objectives
+struct SimCandidatesJson<'a> {
+    candidates: &'a [SimCandidate],
+    listed: usize,
+    weight: f64,
+    other: Option<(&'a SimCandidate, Vec<f64>)>,
+}
+
+impl serde::Serialize for SimCandidatesJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.candidates.iter().map(|c| SimCandidateReport {
+            play: kibitzer::JsonPlayRefWithEquity {
+                equity: c.static_equity,
+                play: (&c.play).into(),
+            },
+            challenged_off: c.challenged_off,
+            state: c.state.name(),
+            n: c.objective.count() as u64,
+            win: (&c.win).into(),
+            equity: (&c.equity).into(),
+            spread: (&c.spread).into(),
+            leaves: (&c.leaves).into(),
+            objective: (&c.objective).into(),
+            plies: SimPliesJson {
+                plies: &c.plies,
+                listed: self.listed,
+            },
+            against: (self.other.as_ref()).map(|(other, other_objectives)| {
+                let less = |mine: &[f64], others: &[f64]| -> SimCountedStat {
+                    (&move_picker::paired_difference(mine, c.first_iter, others, other.first_iter))
+                        .into()
+                };
+                SimAgainst {
+                    win: less(&c.wins, &other.wins),
+                    equity: less(&c.equities, &other.equities),
+                    objective: less(&objectives(c, self.weight), other_objectives),
+                }
+            }),
+        }))
+    }
+}
+
+// a candidate's first listed plies as SimPlyReport writes each, one no rollout
+// has reached yet as an empty one
+struct SimPliesJson<'a> {
+    plies: &'a [SimPly],
+    listed: usize,
+}
+
+impl serde::Serialize for SimPliesJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let unreached = SimPly::default();
+        serializer.collect_seq(
+            (0..self.listed)
+                .map(|i| self.plies.get(i).unwrap_or(&unreached))
+                .map(|ply| SimPlyReport {
+                    n: ply.score.count() as u64,
+                    score: (&ply.score).into(),
+                    bingo: ply.bingo.mean(),
+                }),
+        )
     }
 }
 
@@ -1837,8 +1865,8 @@ struct SimAgainst {
 // less the opponent's), objective, and plies (the first the opponent's reply);
 // with a play to compare against, itself less that play
 #[derive(serde::Serialize)]
-struct SimCandidateReport {
-    play: kibitzer::JsonPlayWithEquity,
+struct SimCandidateReport<'a> {
+    play: kibitzer::JsonPlayRefWithEquity<'a>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     challenged_off: bool,
     state: &'static str,
@@ -1848,7 +1876,7 @@ struct SimCandidateReport {
     spread: SimStat,
     leaves: SimStat,
     objective: SimStat,
-    plies: Vec<SimPlyReport>,
+    plies: SimPliesJson<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     against: Option<SimAgainst>,
 }
@@ -1856,10 +1884,10 @@ struct SimCandidateReport {
 // sim_step's answer: the sim's iterations in all and in this step, and its
 // candidates in the order they joined
 #[derive(serde::Serialize)]
-struct SimReport {
+struct SimReport<'a> {
     iterations: u64,
     stepped: u64,
-    candidates: Vec<SimCandidateReport>,
+    candidates: SimCandidatesJson<'a>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
 }
