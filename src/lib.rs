@@ -5619,7 +5619,9 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     rack.sort_unstable();
     let peg_bag = match bag_search {
         Some((model, exchanges)) => {
-            let progress = endgame::PegBagProgress::new(
+            // the position's splits, taken only where the cap has room for
+            // them
+            let progress = endgame::PegBagProgress::new_within(
                 endgame::PegBagPosition {
                     mover: req.turn,
                     board: kibitzer.board_tiles.clone(),
@@ -5634,8 +5636,10 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                     part: req.part.map_or((0, 1), |[k, n]| (k, n)),
                     estimates: req.estimates,
                 },
+                limit.as_ref(),
             )
-            .map_err(err_to_str)?;
+            .map_err(err_to_str)?
+            .ok_or(OUT_OF_MEMORY)?;
             Some(progress)
         }
         None if req.estimates => {
@@ -8965,9 +8969,9 @@ mod tests {
 
     // an endgame made under a cap prunes its graph within it: with the
     // program holding all but a byte of the cap the prune has no room, and the
-    // endgame takes its lexicon's own graph instead; holding nothing, it takes
-    // the pruned one. Either way, in an empty bag's search and in a
-    // pre-endgame's, its answer is the one with no cap
+    // endgame takes its lexicon's own graph instead (a pre-endgame, whose own
+    // splits have no room either, is out of memory); holding nothing, it takes
+    // the pruned one. Either way its answer is the one with no cap
     #[test]
     fn an_endgame_whose_prune_has_no_room_solves_on_its_lexicon() {
         let cases = [
@@ -8993,7 +8997,14 @@ mod tests {
             do_endgame_free(free).unwrap();
             for (held, on_lexicon) in [((1 << 20) - 1, true), (0, false)] {
                 FAKE_HELD.with(|fake| fake.set(held));
-                let capped = do_endgame_new(&req(r#","max_memory_mb":1"#), fake_held).unwrap();
+                let capped = do_endgame_new(&req(r#","max_memory_mb":1"#), fake_held);
+                // a pre-endgame's own splits (the position, not the prune)
+                // have no room either: out of memory
+                if on_lexicon && !model.is_empty() {
+                    assert_eq!(capped, Err(OUT_OF_MEMORY.to_string()), "{model}");
+                    continue;
+                }
+                let capped = capped.unwrap();
                 let graph = matches!(
                     *ENDGAMES.lock().unwrap().live[&capped].kwg,
                     EndgameGraph::Lexicon(..)
