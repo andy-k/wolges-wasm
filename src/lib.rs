@@ -1376,6 +1376,10 @@ struct Sim {
     iterations: u64,
     candidates: Vec<SimCandidate>,
     out_of_memory: bool,
+    // a step's scratch, kept from step to step: each running candidate's
+    // rollout, and the plies the rollouts played
+    rows: Vec<(f64, i32, f64, i32, i32, usize)>,
+    played: Vec<simmer::PlyPlayed>,
 }
 
 // the sims made, by handle; a handle is never used twice
@@ -1528,8 +1532,6 @@ impl Sim {
         mut out_of_time: impl FnMut() -> bool,
     ) -> Result<u64, String> {
         let rack_size = self.game_config.rack_size();
-        let mut rows = Vec::new();
-        let mut plies = Vec::new();
         let mut stepped = 0;
         while stepped < max
             && !self.out_of_memory
@@ -1554,8 +1556,8 @@ impl Sim {
                 (self.part + 1).wrapping_add(self.parts.wrapping_mul(iteration - 1)),
             ));
             self.simmer.prepare_iteration();
-            rows.clear();
-            plies.clear();
+            self.rows.clear();
+            self.played.clear();
             for candidate in &self.candidates {
                 if candidate.state != SimState::Running {
                     continue;
@@ -1570,10 +1572,11 @@ impl Sim {
                 )?;
                 let played = self.simmer.plies_played();
                 let num_plies = self.plies.map_or(played.len(), |p| played.len().min(p));
-                plies.extend_from_slice(&played[..num_plies]);
-                rows.push((objective, spread, win, points, leaves, num_plies));
+                self.played.extend_from_slice(&played[..num_plies]);
+                self.rows
+                    .push((objective, spread, win, points, leaves, num_plies));
             }
-            let mut row = rows.iter();
+            let mut row = self.rows.iter();
             let mut at = 0;
             for candidate in &mut self.candidates {
                 if candidate.state != SimState::Running {
@@ -1597,7 +1600,11 @@ impl Sim {
                 if candidate.plies.len() < num_plies {
                     candidate.plies.resize_with(num_plies, SimPly::default);
                 }
-                for (ply, played) in candidate.plies.iter_mut().zip(&plies[at..at + num_plies]) {
+                for (ply, played) in candidate
+                    .plies
+                    .iter_mut()
+                    .zip(&self.played[at..at + num_plies])
+                {
                     ply.score.update(simmer::spread_points(played.score));
                     ply.bingo
                         .update(if played.tiles == rack_size { 1.0 } else { 0.0 });
@@ -2010,6 +2017,8 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         iterations: 0,
         candidates: Vec::new(),
         out_of_memory: false,
+        rows: Vec::new(),
+        played: Vec::new(),
     };
 
     let mut sims = SIMS.lock().map_err(err_to_str)?;
