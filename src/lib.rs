@@ -1444,6 +1444,55 @@ fn do_infer_import(bytes: &[u8]) -> Result<u32, String> {
     Ok(handle)
 }
 
+// prune_pays: rules, a board as endgame_new takes one, and how many searches
+// the page will run on a graph pruned for it (1 or more)
+#[derive(serde::Deserialize)]
+struct PrunePaysRequest {
+    rules: String,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    uses: u64,
+}
+
+// whether pruning the lexicon's graph for this board pays, as wolges's sims
+// decide it: the bag the tiles off the board leave once every seat holds a
+// full rack, whether a blank is off the board, and the uses as the decisions
+// that share the graph, each of no limit on its iterations as a sim's
+#[wasm_bindgen]
+pub fn prune_pays(req_str: String) -> Result<bool, JsValue> {
+    Ok(do_prune_pays(&req_str)?)
+}
+
+fn do_prune_pays(req_str: &str) -> Result<bool, String> {
+    let req = serde_json::from_str::<PrunePaysRequest>(req_str).map_err(err_to_str)?;
+    if req.uses == 0 {
+        return Err("uses: 1 or more".into());
+    }
+    let game_config = (CACHED_GAME_CONFIG
+        .read()
+        .map_err(err_to_str)?
+        .get(&req.rules)
+        .cloned())
+    .ok_or("missing game_config")?;
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &[], &req.board_tiles)
+        .map_err(err_to_str)?;
+    let off_board = (kibitzer.available_tally.iter())
+        .map(|&count| count as usize)
+        .sum::<usize>();
+    let racks = game_config.num_players() as usize * game_config.rack_size() as usize;
+    let blanks_on_board = (kibitzer.board_tiles.iter())
+        .filter(|&&tile| tile & 0x80 != 0)
+        .count();
+    Ok(move_picker::late_graph_pays(
+        off_board.saturating_sub(racks),
+        blanks_on_board < game_config.alphabet().freq(0) as usize,
+        u64::MAX,
+        req.uses as usize,
+    ))
+}
+
 // sim_new: a position (rack, board, lexicon, leave, rules, each seat's score in
 // points, the seat to move, and the scoreless turns and the passes in a row so
 // far; each seat's rack size, by default the mover's rack with full racks for
@@ -8601,6 +8650,41 @@ mod tests {
         ] {
             assert!(err.contains("freed"), "{err}");
         }
+    }
+
+    // prune_pays for one use answers as sim_new chooses, on an early board
+    // (its own graph), one of a bag of about 15, and a late one (both a graph
+    // pruned for it); none is refused
+    #[test]
+    fn prune_pays_for_one_use_as_a_sim_chooses() {
+        const N: u8 = 14; // english tiles, in the alphabet's order
+        const O: u8 = 15; // english tiles, in the alphabet's order
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let racks = rack.iter().chain(&others).copied().collect::<Vec<_>>();
+        let mid = (racks.iter().copied())
+            .chain([E, E, E, E, E, A, A, A, A, N])
+            .chain([I; 6])
+            .chain([O; 6])
+            .collect::<Vec<_>>();
+        for (board, late) in [
+            (cat_board(), false),
+            (late_board(&mid), true),
+            (late_board(&racks), true),
+        ] {
+            let sim = sim_of("tiny-prune-pays", &board, "");
+            let own = CACHED_KWG.read().unwrap()["tiny-prune-pays"].clone();
+            let pruned = !std::sync::Arc::ptr_eq(&SIMS.lock().unwrap().live[&sim].kwg, &own);
+            do_sim_free(sim).unwrap();
+            let req = |uses: u64| {
+                do_prune_pays(&format!(
+                    r#"{{"rules":"CrosswordGame","board":{board},"uses":{uses}}}"#
+                ))
+            };
+            assert_eq!(pruned, late);
+            assert_eq!(req(1), Ok(late));
+            assert!(req(0).is_err());
+        }
+        forget_late_kwg("tiny-prune-pays").unwrap();
     }
 
     // build_kbwg's bytes, precached as a kbwg and given with pruned: true,
