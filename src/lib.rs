@@ -4745,6 +4745,15 @@ macro_rules! step_solver {
 }
 
 impl Endgame {
+    // the table's bytes a first step reserves: under a cap, no more than half
+    // the room it leaves, as a growing table holds its old buckets beside the
+    // new ones, so the reserving never passes it
+    fn reserve_in(&self, memory: fn() -> usize) -> usize {
+        self.max_memory.map_or(self.reserve, |bytes| {
+            self.reserve.min(bytes.saturating_sub(memory()) / 2)
+        })
+    }
+
     // a valued move's rows, of the splits from..to, valued again on the table
     // earlier steps kept as the steps valued them, under the memory cap; or
     // why some are missing
@@ -4906,7 +4915,7 @@ impl Endgame {
                 }
             }
             None if self.reserve != 0 => {
-                solver.reserve_table(self.reserve);
+                solver.reserve_table(self.reserve_in(memory));
             }
             None => {}
         }
@@ -5113,7 +5122,7 @@ impl Endgame {
                 }
             }
             None if self.reserve != 0 => {
-                solver.reserve_table(self.reserve);
+                solver.reserve_table(self.reserve_in(memory));
             }
             None => {}
         }
