@@ -4063,6 +4063,8 @@ struct Endgame {
     max_memory: Option<usize>,
     reserve: usize, // the table's bytes a first step reserves, 0 for none
     table: Option<endgame::KeptTable>,
+    // the solver earlier steps kept, taken apart from what it borrows
+    solver: Option<endgame::KeptSolver<kwg::Node24, u32, false, false>>,
     peg: Option<endgame::PegProgress>,
     finished: Option<(i8, equity::Equity)>, // an empty bag's deepest pass done, its value
     nodes: u64,                             // the nodes an empty bag's steps searched
@@ -4115,6 +4117,29 @@ fn points(equity: equity::Equity) -> f64 {
     equity.raw() as f64 / equity::SCALE as f64
 }
 
+// a step's solver: the one earlier steps kept, else one made
+macro_rules! step_solver {
+    ($endgame: expr) => {
+        match $endgame.solver.take() {
+            Some(kept) => endgame::EndgameSolver::with_kept(
+                &$endgame.game_config,
+                $endgame.kwg.kwg(),
+                &$endgame.arm_tables,
+                $endgame.kwg.run_letters(),
+                kept,
+            ),
+            None => endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
+                &$endgame.game_config,
+                $endgame.kwg.kwg(),
+                &$endgame.arm_tables,
+                $endgame.kwg.run_letters(),
+                movegen::KurniaMoveGenerator::try_new(&$endgame.game_config).map_err(err_to_str)?,
+            ),
+        }
+        .map_err(err_to_str)?
+    };
+}
+
 impl Endgame {
     // a valued move's rows, of the splits from..to, valued again on the table
     // earlier steps kept as the steps valued them, under the memory cap; or
@@ -4129,15 +4154,7 @@ impl Endgame {
         let Some(progress) = self.peg_bag.as_mut() else {
             return Err("draws_of: only with two or more in the bag".into());
         };
-        let mut solver =
-            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
-                &self.game_config,
-                self.kwg.kwg(),
-                &self.arm_tables,
-                self.kwg.run_letters(),
-                movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
-            )
-            .map_err(err_to_str)?;
+        let mut solver = step_solver!(self);
         if let Some(table) = self.table.take()
             && solver.give_table(table).is_err()
         {
@@ -4156,6 +4173,7 @@ impl Endgame {
         };
         let found = solver.peg_bag_rows(progress, play, rows, &limits);
         self.table = Some(solver.take_table());
+        self.solver = Some(solver.into_kept());
         found.map_err(err_to_str)
     }
 
@@ -4276,15 +4294,7 @@ impl Endgame {
         clock: endgame::Clock,
         memory: fn() -> usize,
     ) -> Result<(), String> {
-        let mut solver =
-            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
-                &self.game_config,
-                self.kwg.kwg(),
-                &self.arm_tables,
-                self.kwg.run_letters(),
-                movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
-            )
-            .map_err(err_to_str)?;
+        let mut solver = step_solver!(self);
         match self.table.take() {
             Some(table) => {
                 if solver.give_table(table).is_err() {
@@ -4317,6 +4327,7 @@ impl Endgame {
                 Ok(peg) => peg,
                 Err(e) => {
                     self.table = Some(solver.take_table());
+                    self.solver = Some(solver.into_kept());
                     return Err(e);
                 }
             };
@@ -4356,6 +4367,7 @@ impl Endgame {
                 Ok(peg) => peg,
                 Err(e) => {
                     self.table = Some(solver.take_table());
+                    self.solver = Some(solver.into_kept());
                     return Err(e);
                 }
             };
@@ -4435,6 +4447,7 @@ impl Endgame {
                 Ok(solved) => solved,
                 Err(e) => {
                     self.table = Some(solver.take_table());
+                    self.solver = Some(solver.into_kept());
                     return Err(err_to_str(e));
                 }
             };
@@ -4473,6 +4486,7 @@ impl Endgame {
             }
         };
         self.table = Some(solver.take_table());
+        self.solver = Some(solver.into_kept());
         self.answer.take(answer, self.in_bag);
         Ok(())
     }
@@ -4487,15 +4501,7 @@ impl Endgame {
         clock: endgame::Clock,
         memory: fn() -> usize,
     ) -> Result<(), String> {
-        let mut solver =
-            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
-                &self.game_config,
-                self.kwg.kwg(),
-                &self.arm_tables,
-                self.kwg.run_letters(),
-                movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
-            )
-            .map_err(err_to_str)?;
+        let mut solver = step_solver!(self);
         match self.table.take() {
             Some(table) => {
                 if solver.give_table(table).is_err() {
@@ -4533,6 +4539,7 @@ impl Endgame {
         let valued = solver.value_first_moves(self.turn, &limits);
         self.nodes += solver.searched();
         self.table = Some(solver.take_table());
+        self.solver = Some(solver.into_kept());
         let valued = valued.map_err(err_to_str)?;
         self.answer.candidates = Some(
             (valued.iter())
@@ -4798,6 +4805,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         max_memory,
         reserve,
         table,
+        solver: None,
         peg,
         finished: None,
         nodes: 0,
