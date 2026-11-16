@@ -6104,6 +6104,97 @@ fn pruned_graph_within(
     Ok(Some(graph))
 }
 
+// build_kbwg: the board's prune of the lexicon's graph (precached whole), as
+// kbwg bytes (precache_kbwg takes them): the words endgame_new and sim_new
+// prune to, made into the same graph. With max_memory_mb (MiB) the prune is
+// taken within it, as theirs is, and refused (out_of_memory) where it has not
+// room. An endgame or sim given the bytes so precached, with pruned: true,
+// takes them as its graph and prunes nothing again
+#[derive(serde::Deserialize)]
+struct BuildKbwgRequest {
+    lexicon: String,
+    rules: String,
+    #[serde(rename = "board")]
+    board_tiles: Vec<Vec<i8>>,
+    #[serde(default)]
+    max_memory_mb: Option<usize>,
+}
+
+#[wasm_bindgen]
+pub fn build_kbwg(req_str: String) -> Result<Vec<u8>, JsValue> {
+    Ok(do_build_kbwg(&req_str, page_memory)?)
+}
+
+fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String> {
+    let req = serde_json::from_str::<BuildKbwgRequest>(req_str).map_err(err_to_str)?;
+    let kwg = (CACHED_KWG.read().map_err(err_to_str)?)
+        .get(&req.lexicon)
+        .cloned()
+        .ok_or("missing kwg")?;
+    let game_config = (CACHED_GAME_CONFIG.read().map_err(err_to_str)?)
+        .get(&req.rules)
+        .cloned()
+        .ok_or("missing game_config")?;
+    if !kwg.fits_alphabet(game_config.alphabet().len()) {
+        return Err(format!(
+            "lexicon: has tiles the {:?} rules do not have",
+            req.rules
+        ));
+    }
+    let limit = match req.max_memory_mb {
+        Some(0) => return Err("max_memory_mb: at least 1, found 0".into()),
+        mb => mb.map(|mb| endgame::MemoryLimit {
+            bytes: mb.saturating_mul(1 << 20),
+            held: memory,
+        }),
+    };
+    let mut kibitzer = kibitzer::Kibitzer::new();
+    kibitzer
+        .prepare(&game_config, &[], &req.board_tiles)
+        .map_err(err_to_str)?;
+    let memory = limit.as_ref();
+    let mut words = Vec::<bites::Bites>::new();
+    let mut refused = false;
+    let mut generator = game_config.lend()?;
+    let pruned = generator.gen_remaining_words_within(
+        &movegen::BoardSnapshot {
+            board_tiles: &kibitzer.board_tiles,
+            game_config: &game_config,
+            kwg: &kwg.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &game_config.no_leaves,
+        },
+        memory,
+        |word: &[u8]| {
+            // a word too long to be held in its Bites takes its tiles' bytes
+            // too
+            refused = refused
+                || endgame::room_in(memory, &mut words, 1).is_err()
+                || (word.len() >= std::mem::size_of::<bites::Bites>()
+                    && memory.is_some_and(|memory| !memory.has_room(word.len())));
+            if !refused {
+                words.push(word.into());
+            }
+        },
+    );
+    generator.let_go_of_prune();
+    drop(generator);
+    if pruned.is_err() || refused {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    let mut builder = build::Builder::default();
+    let bytes = match builder.build_for_game_within(&game_config, &words, memory) {
+        Ok(bytes) => bytes,
+        Err(e) if e.is::<endgame::Refused>() => return Err(OUT_OF_MEMORY.into()),
+        Err(e) => return Err(err_to_str(e)),
+    };
+    let mut out = Vec::new();
+    endgame::room_in(memory, &mut out, bytes.len()).map_err(|_| OUT_OF_MEMORY)?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
 // pruned_kwg's graph, made in graph's nodes. The words and the builder live
 // only as long as the prune, and the lent generator lets go of what it pruned
 // with, so nothing build-sized outlives the request
