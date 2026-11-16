@@ -1707,7 +1707,6 @@ impl Sim {
     fn report(&self, stepped: u64, against: Option<&HeldPlay>) -> SimReport<'_> {
         let weight = self.simmer.win_prob_weightage();
         let other = against.and_then(|held| self.candidates.iter().find(|c| held.is(c)));
-        let other_objectives = other.map(|other| objectives(other, weight));
         // every ply of the sim's is reported, one no rollout has reached yet as
         // an empty one; a sim to the game's end, every ply a rollout reached
         let listed = self.plies.unwrap_or_else(|| {
@@ -1724,19 +1723,19 @@ impl Sim {
                 candidates: &self.candidates,
                 listed,
                 weight,
-                other: other.zip(other_objectives),
+                other,
             },
         }
     }
 }
 
 // a sim's candidates as SimCandidateReport writes each, each written from where
-// the sim holds it; other: the candidate compared against, with its objectives
+// the sim holds it; other: the candidate compared against
 struct SimCandidatesJson<'a> {
     candidates: &'a [SimCandidate],
     listed: usize,
     weight: f64,
-    other: Option<(&'a SimCandidate, Vec<f64>)>,
+    other: Option<&'a SimCandidate>,
 }
 
 impl serde::Serialize for SimCandidatesJson<'_> {
@@ -1758,7 +1757,7 @@ impl serde::Serialize for SimCandidatesJson<'_> {
                 plies: &c.plies,
                 listed: self.listed,
             },
-            against: (self.other.as_ref()).map(|(other, other_objectives)| {
+            against: self.other.map(|other| {
                 let less = |mine: &[f64], others: &[f64]| -> SimCountedStat {
                     (&move_picker::paired_difference(mine, c.first_iter, others, other.first_iter))
                         .into()
@@ -1766,7 +1765,11 @@ impl serde::Serialize for SimCandidatesJson<'_> {
                 SimAgainst {
                     win: less(&c.wins, &other.wins),
                     equity: less(&c.equities, &other.equities),
-                    objective: less(&objectives(c, self.weight), other_objectives),
+                    objective: (&move_picker::paired_difference_of(
+                        objectives(c, self.weight),
+                        objectives(other, self.weight),
+                    ))
+                        .into(),
                 }
             }),
         }))
@@ -1869,12 +1872,13 @@ fn prune_behind(candidates: &mut [SimCandidate], z: f64, decided: f64) {
 
 // a candidate's objective on each iteration from its first, as its rollout made
 // it: its equity plus its chance to win at the sim's weight (NaN where it sat
-// one out)
-fn objectives(candidate: &SimCandidate, weight: f64) -> Vec<f64> {
-    (candidate.equities.iter())
-        .zip(&candidate.wins)
-        .map(|(&equity, &win)| equity + win * weight)
-        .collect()
+// one out), read one at a time as move_picker::paired_difference_of reads it
+fn objectives(candidate: &SimCandidate, weight: f64) -> (impl Fn(usize) -> f64 + '_, usize, u64) {
+    (
+        move |i| candidate.equities[i] + candidate.wins[i] * weight,
+        candidate.equities.len().min(candidate.wins.len()),
+        candidate.first_iter,
+    )
 }
 
 // a statistic's mean and sample variance (0 under two samples), with the
