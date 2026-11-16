@@ -7801,38 +7801,86 @@ mod tests {
         board
     }
 
+    // a sim's late graph is held for the very board it was pruned for, and a
+    // board with tiles added since is pruned for anew from the lexicon's own:
+    // the tiles added may be a phoney left standing, beside which a valid move
+    // makes a word the graph held dropped
     #[test]
     fn a_sim_on_a_board_with_tiles_added_prunes_its_graph_anew() {
-        tiny_lexicon("tiny-sim-kept");
-        let Tables { game_config, .. } =
-            tables("tiny-sim-kept", "noleave", "CrosswordGame").unwrap();
-        let less_one = |board: &[Vec<i8>]| {
-            let mut board = board.to_vec();
-            *(board.iter_mut().flatten())
-                .rfind(|tile| **tile != 0)
-                .unwrap() = 0;
-            board
+        const D: u8 = 4;
+        const O: u8 = 15;
+        const Q: u8 = 17;
+        do_this_on_startup().unwrap();
+        let mut words = [&[C, A, T][..], &[C, O, D]]
+            .iter()
+            .map(|&word| word.into())
+            .collect::<Vec<bites::Bites>>();
+        words.sort_unstable();
+        let bytes = build::build(
+            build::BuildContent::Gaddawg,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &words,
+        )
+        .unwrap();
+        let graph = Kwg::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
+            piece.copy_from_slice(&bytes[at..at + piece.len()])
+        })
+        .unwrap();
+        CACHED_KWG
+            .write()
+            .unwrap()
+            .insert("tiny-sim-kept".into(), CachedKwg::new(graph).into());
+        let Tables {
+            game_config, kwg, ..
+        } = tables("tiny-sim-kept", "noleave", "CrosswordGame").unwrap();
+        let fields = |graph: &Kwg| {
+            (graph.0.iter())
+                .map(|node| {
+                    use kwg::Node;
+                    (node.tile(), node.accepts(), node.is_end(), node.arc_index())
+                })
+                .collect::<Vec<_>>()
         };
-        let more = all_but_seat_board(&game_config);
-        let fewer = less_one(&more);
-        let run = |lexicon: &str, board: &[Vec<i8>]| {
-            let sim = sim_of(lexicon, &serde_json::to_string(board).unwrap(), "");
-            do_sim_add(sim, &format!("[{PASS}]")).unwrap();
-            let answer = step(sim, r#"{"iterations":2,"prune":false}"#);
-            assert_eq!(answer["stepped"], 2);
-            let kwg = SIMS.lock().unwrap().live[&sim].kwg.clone();
-            do_sim_free(sim).unwrap();
-            (answer, kwg)
+        let anew =
+            |board_tiles: &[u8]| fields(&pruned_kwg(&game_config, board_tiles, &kwg).unwrap());
+        // CAT across row 7 from column 5 and a Q under its A, the other C and
+        // both blanks far off; then an O under its C, a phoney (OQ no word),
+        // beside which D makes COD down, a word the board before could not take
+        let cols = game_config.board_layout().dim().cols as usize;
+        let mut fewer = vec![0u8; game_config.board_layout().dim().rows as usize * cols];
+        for (at, tile) in [
+            (7 * cols + 5, C),
+            (7 * cols + 6, A),
+            (7 * cols + 7, T),
+            (8 * cols + 6, Q),
+            (14 * cols, C),
+            (14 * cols + 2, 0x81),
+            (14 * cols + 4, 0x81),
+        ] {
+            fewer[at] = tile;
+        }
+        let mut more = fewer.clone();
+        more[8 * cols + 5] = O;
+        assert!(anew(&fewer) != anew(&more));
+        let late = |board_tiles: &[u8]| {
+            late_kwg(
+                "tiny-sim-kept",
+                "CrosswordGame",
+                &game_config,
+                board_tiles,
+                &kwg,
+            )
+            .unwrap()
         };
-        let (_, first) = run("tiny-sim-kept", &fewer);
-        let (kept_answer, kept) = run("tiny-sim-kept", &more);
-        let (anew_answer, anew) = run("tiny-sim-anew", &more);
-        assert!(!std::sync::Arc::ptr_eq(&first, &kept));
-        assert!(!std::sync::Arc::ptr_eq(&kept, &anew));
-        assert_eq!(kept_answer, anew_answer);
-        // a board without a tile of the one held is pruned for anew
-        let (_, again) = run("tiny-sim-kept", &less_one(&fewer));
-        assert!(!std::sync::Arc::ptr_eq(&kept, &again));
+        forget_late_kwg("tiny-sim-kept").unwrap();
+        let first = late(&fewer);
+        let again = late(&fewer);
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        drop((first, again));
+        let added = late(&more);
+        assert!(fields(&added.kwg) == anew(&more));
+        forget_late_kwg("tiny-sim-kept").unwrap();
     }
 
     // the tiles known to be on the opponent's rack are on it every iteration
@@ -9483,6 +9531,74 @@ mod tests {
             assert!(step.get(field).is_some(), "{field}: {step}");
         }
         do_endgame_free(handle).unwrap();
+    }
+
+    // an endgame warmed by one on a board without a phoney played since answers
+    // as a cold one does: CAT, a Q under its A, and an O put under its C (OQ no
+    // word) leave COD to play down from C, a word no valid move could make on
+    // the board before the O
+    #[test]
+    fn a_warm_endgame_after_a_phoney_answers_as_a_cold_one() {
+        const D: u8 = 4;
+        const O: u8 = 15;
+        const Q: u8 = 17;
+        let lexicon = "tiny-end-warm-phoney";
+        do_this_on_startup().unwrap();
+        let mut words = [&[C, A, T][..], &[C, O, D]]
+            .iter()
+            .map(|&word| word.into())
+            .collect::<Vec<bites::Bites>>();
+        words.sort_unstable();
+        let bytes = build::build(
+            build::BuildContent::Gaddawg,
+            build::BuildLayout::Wolges,
+            build::BuildOrder::Sorted,
+            &words,
+        )
+        .unwrap();
+        let graph = Kwg::from_reader::<kwg::Node22>(bytes.len(), |at, piece| {
+            piece.copy_from_slice(&bytes[at..at + piece.len()])
+        })
+        .unwrap();
+        CACHED_KWG
+            .write()
+            .unwrap()
+            .insert(lexicon.into(), CachedKwg::new(graph).into());
+        let board_with = |put: &[(usize, usize, u8)]| {
+            let mut board =
+                serde_json::from_str::<Vec<Vec<i8>>>(&late_board(&[D, O, E, Q])).unwrap();
+            for &(row, col, tile) in put {
+                board[row][col] = tile as i8;
+            }
+            serde_json::to_string(&board).unwrap()
+        };
+        let endgame_on = |board: &str, others: &[u8], more: &str| {
+            let _ = others;
+            do_endgame_new(
+                &format!(
+                    r#"{{"rack":[{D}],"board":{board},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#
+                ),
+                none_held,
+            )
+            .unwrap()
+        };
+        let before = board_with(&[(3, 7, Q)]);
+        let after = board_with(&[(3, 7, Q), (3, 6, O)]);
+        let source = endgame_on(&before, &[O, E], "");
+        endgame_step(source, r#"{"ms":60000}"#);
+        let cold = endgame_on(&after, &[E], "");
+        let cold_answer = endgame_step(cold, r#"{"ms":60000}"#);
+        let warm = endgame_on(&after, &[E], &format!(r#","warm_from":{source}"#));
+        let warm_answer = endgame_step(warm, r#"{"ms":60000}"#);
+        for field in ["play", "value", "spread"] {
+            assert_eq!(
+                warm_answer[field], cold_answer[field],
+                "{field}: warm {warm_answer} cold {cold_answer}"
+            );
+        }
+        for handle in [source, cold, warm] {
+            do_endgame_free(handle).unwrap();
+        }
     }
 
     // a what-if warmed by an endgame before it answers as a cold one does, on
