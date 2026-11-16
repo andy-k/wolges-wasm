@@ -220,6 +220,8 @@ pub enum ScoredPlay {
 struct CachedKwg {
     kwg: Kwg,
     max_tile: Option<u8>,
+    // a lexicon's, for the graphs pruned from it
+    pruner: std::sync::Mutex<Pruner>,
 }
 
 impl CachedKwg {
@@ -228,6 +230,7 @@ impl CachedKwg {
         Self {
             kwg: graph,
             max_tile,
+            pruner: Default::default(),
         }
     }
 
@@ -1969,7 +1972,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
             &req.rules,
             &game_config,
             &game_state.board_tiles,
-            &kwg.kwg,
+            &kwg,
         )?
     } else {
         kwg
@@ -4851,7 +4854,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     };
     // a graph pruned here, with its run letters
     let pruned = |game_config: &CachedRules| -> Result<_, String> {
-        let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg.kwg)?;
+        let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg)?;
         Ok(std::sync::Arc::new(kwg::RunGraph::new(pruned)))
     };
     let (game_config, kwg, arm_tables, table) = match warm {
@@ -5092,7 +5095,7 @@ fn late_kwg(
     rules: &str,
     game_config: &CachedRules,
     board_tiles: &[u8],
-    kwg: &Kwg,
+    kwg: &CachedKwg,
 ) -> Result<std::sync::Arc<CachedKwg>, String> {
     let mut cached = CACHED_LATE_KWG.write().map_err(err_to_str)?;
     if let Some(held) = cached.get(lexicon)
@@ -5101,7 +5104,25 @@ fn late_kwg(
     {
         return Ok(held.kwg.clone());
     }
-    // the graph held goes before the next is made, never two at once
+    // the graph held is pruned again in place when nothing else holds it
+    if let Some(held) = cached.get_mut(lexicon).and_then(std::sync::Arc::get_mut)
+        && let Some(pruned) = std::sync::Arc::get_mut(&mut held.kwg)
+    {
+        if let Err(e) = prune_into(game_config, board_tiles, kwg, &mut pruned.kwg) {
+            cached.remove(lexicon);
+            return Err(e);
+        }
+        pruned.max_tile = pruned.kwg.0.iter().map(kwg::Node::tile).max();
+        held.rules.clear();
+        held.rules.push_str(rules);
+        if held.board_tiles.len() == board_tiles.len() {
+            held.board_tiles.copy_from_slice(board_tiles);
+        } else {
+            held.board_tiles = board_tiles.into();
+        }
+        return Ok(held.kwg.clone());
+    }
+    // else the graph held goes before the next is made, never two at once
     cached.remove(lexicon);
     let pruned = std::sync::Arc::new(CachedKwg::new(pruned_kwg(game_config, board_tiles, kwg)?));
     cached.insert(
@@ -5116,23 +5137,64 @@ fn late_kwg(
     Ok(pruned)
 }
 
+// what a lexicon's graphs are pruned with, kept from prune to prune: an empty
+// leave table, the words, and the builder (the generator is the rules' own,
+// lent, CachedRules::lend)
+#[derive(Default)]
+struct Pruner {
+    empty_klv: Option<Klv>,
+    words: Vec<bites::Bites>,
+    builder: build::Builder,
+}
+
 // the lexicon's words the board can still take, whatever the racks, made into
 // a graph of their own, as wolges's endgame command prunes its own: the same
 // answers, a far smaller graph to generate on
-fn pruned_kwg(game_config: &CachedRules, board_tiles: &[u8], kwg: &Kwg) -> Result<Kwg, String> {
-    let mut words = Vec::<bites::Bites>::new();
+fn pruned_kwg(
+    game_config: &CachedRules,
+    board_tiles: &[u8],
+    lexicon: &CachedKwg,
+) -> Result<Kwg, String> {
+    let mut graph = kwg::Kwg(Vec::new());
+    prune_into(game_config, board_tiles, lexicon, &mut graph)?;
+    Ok(graph)
+}
+
+// pruned_kwg's graph, made in graph's nodes, with the lexicon's pruner
+fn prune_into(
+    game_config: &CachedRules,
+    board_tiles: &[u8],
+    lexicon: &CachedKwg,
+    graph: &mut Kwg,
+) -> Result<(), String> {
+    let mut pruner = lexicon.pruner.lock().map_err(err_to_str)?;
+    let Pruner {
+        empty_klv,
+        words,
+        builder,
+    } = &mut *pruner;
+    let empty_klv = match empty_klv {
+        Some(klv) => klv,
+        None => empty_klv.insert(Klv::empty().map_err(err_to_str)?),
+    };
+    words.clear();
     game_config.lend()?.gen_remaining_words(
         &movegen::BoardSnapshot {
             board_tiles,
             game_config,
-            kwg,
+            kwg: &lexicon.kwg,
             anagrams: None,
             rack_lengths: None,
-            klv: &Klv::empty().map_err(err_to_str)?,
+            klv: empty_klv,
         },
         |word: &[u8]| words.push(word.into()),
     );
-    Kwg::from_bytes_alloc(&build::build_for_game(game_config, &words).map_err(err_to_str)?)
+    graph
+        .refill_from_bytes(
+            builder
+                .build_for_game(game_config, words)
+                .map_err(err_to_str)?,
+        )
         .map_err(err_to_str)
 }
 
@@ -6341,6 +6403,76 @@ mod tests {
             &kwg
         ));
         do_sim_free(sim).unwrap();
+    }
+
+    #[test]
+    fn a_graph_pruned_in_kept_nodes_is_the_graph_pruned_anew() {
+        tiny_lexicon("tiny-pruned-again");
+        let Tables {
+            game_config, kwg, ..
+        } = tables("tiny-pruned-again", "noleave", "CrosswordGame").unwrap();
+        let fields = |graph: &Kwg| {
+            (graph.0.iter())
+                .map(|node| {
+                    use kwg::Node;
+                    (node.tile(), node.accepts(), node.is_end(), node.arc_index())
+                })
+                .collect::<Vec<_>>()
+        };
+        // each graph pruned with nothing kept
+        let anew = |board_tiles: &[u8]| {
+            let mut words = Vec::<bites::Bites>::new();
+            movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
+                .unwrap()
+                .gen_remaining_words(
+                    &movegen::BoardSnapshot {
+                        board_tiles,
+                        game_config: &game_config,
+                        kwg: &kwg.kwg,
+                        anagrams: None,
+                        rack_lengths: None,
+                        klv: &Klv::empty().unwrap(),
+                    },
+                    |word: &[u8]| words.push(word.into()),
+                );
+            fields(
+                &Kwg::from_bytes_alloc(&build::build_for_game(&game_config, &words).unwrap())
+                    .unwrap(),
+            )
+        };
+        let dim = game_config.board_layout().dim();
+        let board_with = |row: usize, word: &[u8]| {
+            let mut board_tiles = vec![0u8; dim.rows as usize * dim.cols as usize];
+            let at = row * dim.cols as usize + 5;
+            board_tiles[at..at + word.len()].copy_from_slice(word);
+            board_tiles
+        };
+        let boards = [
+            board_with(7, &[C, A, T]),
+            board_with(3, &[A, T]),
+            vec![0u8; dim.rows as usize * dim.cols as usize],
+            board_with(7, &[C, A, T, S]),
+        ];
+        // late graphs, each pruned again in the one held, on boards that do
+        // not only add tiles to the board before
+        forget_late_kwg("tiny-pruned-again").unwrap();
+        for board_tiles in &boards {
+            let late = late_kwg(
+                "tiny-pruned-again",
+                "CrosswordGame",
+                &game_config,
+                board_tiles,
+                &kwg,
+            )
+            .unwrap();
+            assert!(fields(&late.kwg) == anew(board_tiles));
+        }
+        forget_late_kwg("tiny-pruned-again").unwrap();
+        // graphs pruned one after another by the lexicon's pruner
+        for board_tiles in &boards {
+            let graph = pruned_kwg(&game_config, board_tiles, &kwg).unwrap();
+            assert!(fields(&graph) == anew(board_tiles));
+        }
     }
 
     #[test]
