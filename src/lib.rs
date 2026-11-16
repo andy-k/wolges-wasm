@@ -5144,18 +5144,40 @@ impl Endgame {
         found.map_err(err_to_str)
     }
 
-    // with two or more in the bag, the answer's candidates at the places
-    // given, best first, from the search; the one at the place draws names
-    // takes those draws, of so many rows
+    // with tiles in the bag, the answer's candidates at the places given, best
+    // first, from the search; with two or more, the one at the place draws
+    // names takes those draws, of so many rows
     fn listed(
         &self,
         places: std::ops::Range<usize>,
         draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
     ) -> Vec<EndgameCandidate> {
-        let Some(progress) = self.peg_bag.as_ref() else {
-            return Vec::new();
-        };
         let lead = points(equity::Equity::new(self.lead));
+        let Some(progress) = self.peg_bag.as_ref() else {
+            let Some(progress) = self.peg.as_ref() else {
+                return Vec::new();
+            };
+            return (progress.answer_moves(places).iter())
+                .map(|valued| EndgameCandidate {
+                    play: peg_play(&valued.play),
+                    win: valued.win_pct as f64,
+                    value: points(valued.expected_margin) - lead,
+                    tiles: Some(
+                        (valued.hypotheses.iter())
+                            .map(|&(tile, count, margin)| EndgameBagTile {
+                                tile,
+                                count,
+                                value: points(margin) - lead,
+                            })
+                            .collect(),
+                    ),
+                    draws: None,
+                    deals: None,
+                    draws_total: None,
+                    exact: valued.exact,
+                })
+                .collect();
+        };
         let (_, deals) = progress.splits();
         let from = places.start;
         let mut listed = (progress.answer_moves(places).iter())
@@ -5179,13 +5201,13 @@ impl Endgame {
         listed
     }
 
-    // the answer as JSON, its candidates listed from the search with two or
-    // more in the bag (listed)
+    // the answer as JSON, its candidates listed from the search with tiles in
+    // the bag (listed)
     fn answer_json(
         &mut self,
         draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
     ) -> Result<String, String> {
-        if self.peg_bag.is_none() {
+        if self.peg_bag.is_none() && self.peg.is_none() {
             return serde_json::to_string(&self.answer).map_err(err_to_str);
         }
         let listed = self.listed(0..usize::MAX, draws);
@@ -5203,10 +5225,11 @@ impl Endgame {
         range: [usize; 2],
         draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
     ) -> Result<String, String> {
-        let Some(progress) = self.peg_bag.as_ref() else {
-            return page_json(&mut self.answer, range);
+        let total = match (&self.peg_bag, &self.peg) {
+            (Some(progress), _) => progress.answer_total(),
+            (None, Some(progress)) => progress.answer_total(),
+            (None, None) => return page_json(&mut self.answer, range),
         };
-        let total = progress.answer_total();
         let [from, to] = range.map(|at| at.min(total));
         let places = from..to.max(from);
         let (inside, outside) = match draws {
@@ -5326,7 +5349,7 @@ impl Endgame {
             }
         } else if let Some(progress) = self.peg.as_mut() {
             solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
-            let peg = solver.resume_peg_one_in_bag(progress, &limits);
+            let peg = solver.resume_peg_one_in_bag_best(progress, &limits, 1);
             let peg = peg
                 .map_err(err_to_str)
                 .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
@@ -5367,28 +5390,8 @@ impl Endgame {
                         })
                         .collect(),
                 ),
-                candidates: Some(
-                    (peg.moves.iter())
-                        .map(|valued| EndgameCandidate {
-                            play: peg_play(&valued.play),
-                            win: valued.win_pct as f64,
-                            value: points(valued.expected_margin) - lead,
-                            tiles: Some(
-                                (valued.hypotheses.iter())
-                                    .map(|&(tile, count, margin)| EndgameBagTile {
-                                        tile,
-                                        count,
-                                        value: points(margin) - lead,
-                                    })
-                                    .collect(),
-                            ),
-                            draws: None,
-                            deals: None,
-                            draws_total: None,
-                            exact: valued.exact,
-                        })
-                        .collect(),
-                ),
+                // listed from the search as a read asks (listed)
+                candidates: Some(Vec::new()),
                 endgames: Some(endgames),
                 moves: progress.moves().map(|(valued, of)| [valued, of]),
             }
