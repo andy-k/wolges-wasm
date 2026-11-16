@@ -2323,7 +2323,8 @@ struct ThreatsAnswer<'a> {
 
 struct ThreatPlays<'a> {
     kept: &'a [ThreatFound],
-    held: &'a [&'a ThreatFound],
+    held: &'a [ThreatFound],
+    order: &'a [u32], // held's plays, best first
     through: Option<usize>,
     cols: usize,
     most: usize,
@@ -2335,7 +2336,7 @@ impl serde::Serialize for ThreatPlays<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(
             (self.kept.iter())
-                .chain(self.held.iter().copied())
+                .chain(self.order.iter().map(|&at| &self.held[at as usize]))
                 .filter(|play| {
                     self.through.is_none_or(|through| {
                         placed_squares((play.down, play.lane, play.idx, &play.word), self.cols)
@@ -2422,6 +2423,12 @@ impl Interned {
     fn get(&self, id: usize) -> &[u8] {
         let start = id.checked_sub(1).map_or(0, |before| self.ends[before]);
         &self.bytes[start..self.ends[id]]
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.ends.clear();
+        self.slots.fill(0);
     }
 
     // the slot holding key's number, or the empty one it would take
@@ -2626,20 +2633,16 @@ impl Ord for ThreatFound {
     }
 }
 
+// the top most plays offered, and plays let go, whose words' room the next
+// ones offered take over
 #[derive(Clone)]
 struct ThreatTop {
     most: usize,
     heap: std::collections::BinaryHeap<ThreatFound>,
+    spare: Vec<ThreatFound>,
 }
 
 impl ThreatTop {
-    fn new(most: usize) -> Self {
-        Self {
-            most,
-            heap: Default::default(),
-        }
-    }
-
     fn offer(
         &mut self,
         (down, lane, idx, word): (bool, i8, i8, &[u8]),
@@ -2647,19 +2650,25 @@ impl ThreatTop {
         id: u32,
     ) -> bool {
         if self.heap.len() < self.most {
-            let mut held = Vec::new();
-            if self.heap.try_reserve(1).is_err() || held.try_reserve_exact(word.len()).is_err() {
+            if self.heap.try_reserve(1).is_err() {
                 return false;
             }
-            held.extend_from_slice(word);
-            self.heap.push(ThreatFound {
+            let mut found = self.spare.pop().unwrap_or_else(|| ThreatFound {
                 down,
                 lane,
                 idx,
-                word: held,
+                word: Vec::new(),
                 score,
                 id,
             });
+            found.word.clear();
+            if found.word.try_reserve(word.len()).is_err() {
+                return false;
+            }
+            found.word.extend_from_slice(word);
+            (found.down, found.lane, found.idx) = (down, lane, idx);
+            (found.score, found.id) = (score, id);
+            self.heap.push(found);
         } else if let Some(mut worst) = self.heap.peek_mut()
             && (std::cmp::Reverse(score), down, lane, idx, word) < worst.rank()
         {
@@ -2676,12 +2685,14 @@ impl ThreatTop {
         true
     }
 
-    fn sorted(&self) -> Option<Vec<&ThreatFound>> {
-        let mut sorted = Vec::new();
-        sorted.try_reserve_exact(self.heap.len()).ok()?;
-        sorted.extend(self.heap.iter());
-        sorted.sort_unstable();
-        Some(sorted)
+    // the heap's plays' places in it, best first; none on a refused growth
+    fn sorted_into(&self, order: &mut Vec<u32>) -> Option<()> {
+        order.clear();
+        order.try_reserve(self.heap.len()).ok()?;
+        order.extend(0..self.heap.len() as u32);
+        let found = self.heap.as_slice();
+        order.sort_unstable_by(|&a, &b| found[a as usize].cmp(&found[b as usize]));
+        Some(())
     }
 }
 
@@ -2723,6 +2734,12 @@ impl ThreatLane {
         let best = &mut self.best[self.slot[id] as usize * stride + along];
         *best = (*best).max(score);
         true
+    }
+
+    fn clear(&mut self) {
+        self.slot.clear();
+        self.ids.clear();
+        self.best.clear();
     }
 
     // none on a refused growth
@@ -2774,13 +2791,13 @@ struct ThreatWalk {
 }
 
 impl ThreatWalk {
-    fn new(most: usize, lane: usize) -> Self {
+    fn new(top: ThreatTop, lane: usize) -> Self {
         Self {
             lane,
             from: 0,
             size: 1,
             seen: 0,
-            top: ThreatTop::new(most),
+            top,
             floor: Default::default(),
             part: Default::default(),
         }
@@ -2800,24 +2817,31 @@ struct ThreatSums {
     bingo: f64,
 }
 
-fn try_zeros(len: usize) -> Option<Vec<f64>> {
-    let mut zeros = Vec::new();
+fn try_zeros(zeros: &mut Vec<f64>, len: usize) -> Option<()> {
+    zeros.clear();
     zeros.try_reserve_exact(len).ok()?;
     zeros.resize(len, 0.0);
-    Some(zeros)
+    Some(())
 }
 
 impl ThreatSums {
-    // none on a refused growth
-    fn new(multisets: usize, squares: usize) -> Option<Self> {
-        Some(Self {
-            holds: try_zeros(multisets)?,
-            square_chance: try_zeros(squares)?,
-            square_expected: try_zeros(squares)?,
-            square_reach: try_zeros(squares)?,
-            expected_best: 0.0,
-            bingo: 0.0,
-        })
+    // the sums of nothing, of no multisets or squares, as default makes them
+    fn empty(&mut self) {
+        self.holds.clear();
+        self.square_chance.clear();
+        self.square_expected.clear();
+        self.square_reach.clear();
+        (self.expected_best, self.bingo) = (0.0, 0.0);
+    }
+
+    // the sums of nothing, of these many multisets and squares, in the room
+    // held; none on a refused growth
+    fn refill(&mut self, multisets: usize, squares: usize) -> Option<()> {
+        (self.expected_best, self.bingo) = (0.0, 0.0);
+        try_zeros(&mut self.holds, multisets)?;
+        try_zeros(&mut self.square_chance, squares)?;
+        try_zeros(&mut self.square_expected, squares)?;
+        try_zeros(&mut self.square_reach, squares)
     }
 }
 
@@ -2851,6 +2875,7 @@ struct ThreatTables<'a> {
 
 // a rack's weighing, its scratch kept from rack to rack: each square's best
 // score through it for the rack stamped
+#[derive(Default)]
 struct ThreatWeigher {
     rack_square: Vec<(usize, i32)>,
     touched: Vec<usize>,
@@ -2930,8 +2955,14 @@ impl ThreatWeigher {
 // sums and what an answer reads
 struct Threats {
     keys: Interned, // each multiset's tiles, by its id
+    key: Vec<u8>,   // a walk's scratch: a play's multiset
     best: Vec<i32>,
     kept: Vec<ThreatFound>,
+    // plays let go, their words' room for the next top's, and an empty list
+    // with room for a top's heap
+    found: Vec<ThreatFound>,
+    found_list: Vec<ThreatFound>,
+    order: Vec<u32>, // an answer's top plays, best first
     walk: Option<ThreatWalk>,
     lanes: usize,
     all_listed: bool,
@@ -2962,10 +2993,54 @@ struct Threats {
     rng: rand::rngs::ChaCha20Rng,
     list_ms: f64,
     drawn: (ThreatSums, f64, usize), // the last weighing's draws, each's weight, their number
+    spare_sums: ThreatSums,          // room for the next weighing's draws
+    upto: Vec<f64>,                  // the racks left, their chances summed
     kwg: std::sync::Arc<CachedKwg>,
     game_config: std::sync::Arc<CachedRules>,
     pool: Vec<u8>,
     move_generator: Lent<std::sync::Arc<CachedRules>>,
+}
+
+// a threats question's buffers as it is made: they live with the question
+// alone, reused from step to step, and are let go with it (a one-shot threats
+// as it returns), so that no rules hold a large question's memory for good
+#[derive(Default)]
+struct ThreatsRoom {
+    available_tally: Vec<u8>,
+    board_tiles: Vec<u8>,
+    deal: ThreatDeal,
+    racks: Vec<(u32, f64)>,
+    rack_tiles: Interned,
+    pool: Vec<u8>,
+    keys: Interned,
+    key: Vec<u8>,
+    best: Vec<i32>,
+    found: Vec<ThreatFound>,
+    found_list: Vec<ThreatFound>,
+    order: Vec<u32>,
+    lists: movegen::PoolLists,
+    lane: ThreatLane,
+    lanes_reach: Vec<Vec<(u32, u16, i32)>>,
+    reach: Vec<(u16, i32)>,
+    reach_from: Vec<usize>,
+    reach_next: Vec<usize>,
+    square_best: Vec<i32>,
+    exact_sums: ThreatSums,
+    drawn_sums: ThreatSums,
+    spare_sums: ThreatSums,
+    upto: Vec<f64>,
+    weigher: ThreatWeigher,
+}
+
+// dealing the racks' scratch: each tile's count left, the tiles from each tile
+// on, the tiles dealt, a rack, and each rack's chance by its number
+#[derive(Default)]
+struct ThreatDeal {
+    left: Vec<u8>,
+    rest: Vec<usize>,
+    held: Vec<u8>,
+    rack: Vec<u8>,
+    chances: Vec<f64>,
 }
 
 // the threats made, by handle; a handle is never used twice
@@ -2996,6 +3071,15 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
         .get(&req.rules)
         .cloned())
     .ok_or("missing game_config")?;
+    threats_with(req, kwg, game_config)
+}
+
+// threats_made's question, of these tables
+fn threats_with(
+    req: ThreatsRequest,
+    kwg: std::sync::Arc<CachedKwg>,
+    game_config: std::sync::Arc<CachedRules>,
+) -> Result<Threats, String> {
     if !kwg.fits_alphabet(game_config.alphabet().len()) {
         return Err(format!(
             "lexicon: has tiles the {:?} rules do not have",
@@ -3009,7 +3093,24 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
             req.rack.len()
         ));
     }
-    let mut kibitzer = kibitzer::Kibitzer::new();
+    let mut room = ThreatsRoom::default();
+    let mut kibitzer = kibitzer::Kibitzer {
+        available_tally: std::mem::take(&mut room.available_tally),
+        board_tiles: std::mem::take(&mut room.board_tiles),
+    };
+    threats_in_room(req, kwg, game_config, &mut kibitzer, &mut room)
+}
+
+// threats_made's question, made in the room it took, whose buffers it only
+// borrows till every check has passed
+fn threats_in_room(
+    req: ThreatsRequest,
+    kwg: std::sync::Arc<CachedKwg>,
+    game_config: std::sync::Arc<CachedRules>,
+    kibitzer: &mut kibitzer::Kibitzer,
+    room: &mut ThreatsRoom,
+) -> Result<Threats, String> {
+    let rack_size = game_config.rack_size() as usize;
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
@@ -3035,27 +3136,38 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
         opponent_rack,
         unseen,
     )?;
+    // each leave the opponent may keep, with its weight, read where it is held
     let leaves = match &opponent {
-        OpponentLeaves::Listed(listed) if listed.is_empty() => vec![(&[][..], 1.0)],
-        OpponentLeaves::Listed(listed) => (listed.iter())
-            .map(|(tiles, weight)| (&tiles[..], *weight))
-            .collect(),
-        OpponentLeaves::Inferred(packed) => (0..packed.len())
-            .map(|i| (packed.leave(i), packed.weight(i)))
-            .collect::<Vec<_>>(),
+        OpponentLeaves::Listed(listed) if listed.is_empty() => 1,
+        OpponentLeaves::Listed(listed) => listed.len(),
+        OpponentLeaves::Inferred(packed) => packed.len(),
     };
-    let total = leaves.iter().map(|&(_, weight)| weight).sum::<f64>();
+    let leave = |i: usize| match &opponent {
+        OpponentLeaves::Listed(listed) if listed.is_empty() => (&[][..], 1.0),
+        OpponentLeaves::Listed(listed) => (&listed[i].0[..], listed[i].1),
+        OpponentLeaves::Inferred(packed) => (packed.leave(i), packed.weight(i)),
+    };
+    let total = (0..leaves).map(|i| leave(i).1).sum::<f64>();
 
     // the racks the opponent may hold, each its chance: a leave's chance, and
     // the rest of the rack dealt from the tiles unseen but the leave's
-    let mut rack_tiles = Interned::default();
-    let mut chances = Vec::new();
-    let mut left = vec![0u8; unseen.len()];
-    let mut rest = vec![0usize; unseen.len() + 1];
-    let mut held = Vec::new();
-    let mut rack = Vec::new();
+    let rack_tiles = &mut room.rack_tiles;
+    rack_tiles.clear();
+    let ThreatDeal {
+        left,
+        rest,
+        held,
+        rack,
+        chances,
+    } = &mut room.deal;
+    chances.clear();
+    left.clear();
+    left.resize(unseen.len(), 0u8);
+    rest.clear();
+    rest.resize(unseen.len() + 1, 0usize);
+    held.clear();
     let mut refused = false;
-    for &(leave, weight) in &leaves {
+    for (leave, weight) in (0..leaves).map(leave) {
         if weight == 0.0 {
             continue;
         }
@@ -3068,38 +3180,31 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
         }
         let more = opponent_rack - leave.len();
         let chance = weight / total / choose(rest[0], more);
-        deal(
-            &left,
-            &rest,
-            0,
-            more,
-            chance,
-            &mut held,
-            &mut |dealt, ways| {
-                if refused {
-                    return;
-                }
-                rack.clear();
-                rack.extend_from_slice(leave);
-                rack.extend_from_slice(dealt);
-                rack.sort_unstable();
-                if chances.try_reserve(1).is_err() {
-                    refused = true;
-                    return;
-                }
-                match rack_tiles.add(&rack) {
-                    Some((id, false)) => chances[id as usize] += ways,
-                    Some((_, true)) => chances.push(ways),
-                    None => refused = true,
-                }
-            },
-        );
+        deal(left, rest, 0, more, chance, held, &mut |dealt, ways| {
+            if refused {
+                return;
+            }
+            rack.clear();
+            rack.extend_from_slice(leave);
+            rack.extend_from_slice(dealt);
+            rack.sort_unstable();
+            if chances.try_reserve(1).is_err() {
+                refused = true;
+                return;
+            }
+            match rack_tiles.add(rack) {
+                Some((id, false)) => chances[id as usize] += ways,
+                Some((_, true)) => chances.push(ways),
+                None => refused = true,
+            }
+        });
     }
-    let mut racks = Vec::new();
+    let racks = &mut room.racks;
+    racks.clear();
     if refused || racks.try_reserve_exact(chances.len()).is_err() {
         return Err(OUT_OF_MEMORY.into());
     }
-    racks.extend((0..).zip(chances));
+    racks.extend((0..).zip(chances.iter().copied()));
     // the likeliest racks first, so a time cut weighs the most of them
     racks.sort_unstable_by(|a, b| {
         (b.1.total_cmp(&a.1)).then_with(|| {
@@ -3110,63 +3215,129 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
     });
 
     let move_generator = CachedRules::lend_held(&game_config)?;
-    let pool = (0u8..)
-        .zip(unseen.iter())
-        .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize))
-        .collect::<Vec<_>>();
+    let pool = &mut room.pool;
+    pool.clear();
+    pool.extend(
+        (0u8..)
+            .zip(unseen.iter())
+            .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
+    );
     let dim = game_config.board_layout().dim();
     let cols = dim.cols as usize;
     let squares = kibitzer.board_tiles.len();
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
+    // every check passed: the room's buffers are the question's, the others
+    // emptied as a new question's are made
+    let room = std::mem::take(room);
+    let mut weigher = room.weigher;
+    weigher.rack_square.clear();
+    weigher.rack_square.resize(squares, (usize::MAX, 0i32));
+    weigher.stamp = 0;
+    let mut square_best = room.square_best;
+    square_best.clear();
+    square_best.resize(squares, i32::MIN);
+    let (mut exact_sums, mut drawn_sums) = (room.exact_sums, room.drawn_sums);
+    exact_sums.empty();
+    drawn_sums.empty();
+    let (mut keys, mut lists, mut lane) = (room.keys, room.lists, room.lane);
+    keys.clear();
+    lists.clear();
+    lane.clear();
+    let mut emptied = [room.reach_from, room.reach_next];
+    for list in &mut emptied {
+        list.clear();
+    }
+    let [reach_from, reach_next] = emptied;
+    let (mut lanes_reach, mut reach, mut best) = (room.lanes_reach, room.reach, room.best);
+    lanes_reach.clear();
+    reach.clear();
+    best.clear();
     Ok(Threats {
-        exact_sums: Default::default(),
-        weigher: ThreatWeigher {
-            rack_square: vec![(usize::MAX, 0i32); squares],
-            touched: Vec::new(),
-            distinct: Vec::new(),
-            taken: Vec::new(),
-            sub: Vec::new(),
-            stamp: 0,
-        },
-        keys: Default::default(),
-        best: Vec::new(),
+        exact_sums,
+        weigher,
+        keys,
+        key: room.key,
+        best,
         kept: Vec::new(),
+        found: room.found,
+        found_list: room.found_list,
+        order: room.order,
         walk: None,
         lanes: dim.rows as usize + cols,
         all_listed: false,
         kept_most: 0,
-        lists: Default::default(),
+        lists,
         count: 0,
         count_asked: req.count,
-        lane: Default::default(),
-        lanes_reach: Vec::new(),
-        reach: Vec::new(),
+        lane,
+        lanes_reach,
+        reach,
         out_of_memory: false,
-        reach_from: Vec::new(),
+        reach_from,
         reach_lanes: 0,
-        reach_next: Vec::new(),
-        square_best: vec![i32::MIN; squares],
-        board_tiles: kibitzer.board_tiles,
+        reach_next,
+        square_best,
+        board_tiles: std::mem::take(&mut kibitzer.board_tiles),
         cols,
         rack_size,
         opponent_rack,
-        racks,
-        rack_tiles,
+        racks: room.racks,
+        rack_tiles: room.rack_tiles,
         counted: 0,
         covered: 0.0,
         rng: rand::rngs::ChaCha20Rng::seed_from_u64(seed),
         list_ms: 0.0,
-        drawn: Default::default(),
+        drawn: (drawn_sums, 0.0, 0),
+        spare_sums: room.spare_sums,
+        upto: room.upto,
         kwg,
         game_config,
-        pool,
+        pool: room.pool,
         move_generator,
     })
 }
 
 impl Threats {
+    // a top of most plays, taking over the room of plays let go
+    fn top(&mut self, most: usize) -> ThreatTop {
+        ThreatTop {
+            most,
+            heap: std::mem::take(&mut self.found_list).into(),
+            spare: std::mem::take(&mut self.found),
+        }
+    }
+
+    // a top let go, its plays' room kept for the next top
+    fn retire_top(&mut self, top: ThreatTop) {
+        self.retire_list(top.heap.into_vec());
+        self.retire_list(top.spare);
+    }
+
+    // plays let go, their room kept in found (let go with them where found's
+    // growth is refused), and the larger empty list kept for a top's heap
+    fn retire_list(&mut self, mut list: Vec<ThreatFound>) {
+        if list.capacity() > self.found.capacity() {
+            std::mem::swap(&mut list, &mut self.found);
+        }
+        if self.found.try_reserve(list.len()).is_ok() {
+            self.found.append(&mut list);
+        }
+        list.clear();
+        if list.capacity() > self.found_list.capacity() {
+            self.found_list = list;
+        }
+    }
+
+    // a walk from lane on, its top of most plays
+    fn new_walk(&mut self, most: usize, lane: usize) {
+        let walk = ThreatWalk::new(self.top(most), lane);
+        if let Some(old) = self.walk.replace(walk) {
+            self.retire_top(old.top);
+        }
+    }
+
     fn jumbled(&self) -> bool {
         matches!(
             self.game_config.game_rules(),
@@ -3212,18 +3383,18 @@ impl Threats {
         let square_best = &mut self.square_best;
         let count = &mut self.count;
         let most = top.most;
-        let mut key = Vec::new();
+        let key = &mut self.key;
         let mut held = true;
         let found = |down: bool, lane: i8, idx: i8, word: &[u8], score: i32| {
             if !held {
                 return;
             }
-            threat_key(word, &mut key);
+            threat_key(word, key);
             if best.try_reserve(1).is_err() {
                 held = false;
                 return;
             }
-            let id = match keys.add(&key) {
+            let id = match keys.add(key) {
                 Some((id, false)) => {
                     if aggregate {
                         best[id as usize] = best[id as usize].max(score);
@@ -3341,17 +3512,16 @@ impl Threats {
                             for id in 0..keys {
                                 self.reach_from[id + 1] += self.reach_from[id];
                             }
-                            let mut reach = Vec::new();
+                            self.reach.clear();
                             let (Ok(()), Ok(())) = (
-                                reach.try_reserve_exact(self.reach_from[keys]),
+                                self.reach.try_reserve_exact(self.reach_from[keys]),
                                 self.reach_next.try_reserve_exact(keys + 1),
                             ) else {
                                 self.out_of_memory = true;
                                 self.walk = Some(walk);
                                 break;
                             };
-                            reach.resize(self.reach_from[keys], (0u16, 0i32));
-                            self.reach = reach;
+                            self.reach.resize(self.reach_from[keys], (0u16, 0i32));
                             self.reach_next.extend_from_slice(&self.reach_from);
                             self.reach_lanes = 0;
                         }
@@ -3362,15 +3532,16 @@ impl Threats {
                         }
                         self.reach_lanes += 1;
                     } else {
-                        let Some(exact_sums) = ThreatSums::new(keys, self.square_best.len()) else {
+                        let squares = self.square_best.len();
+                        if self.exact_sums.refill(keys, squares).is_none() {
+                            self.exact_sums.empty();
                             self.out_of_memory = true;
                             self.walk = Some(walk);
                             break;
-                        };
+                        }
                         // placed, the lanes' reach is let go
                         self.lanes_reach = Vec::new();
                         self.reach_next = Vec::new();
-                        self.exact_sums = exact_sums;
                         self.all_listed = true;
                     }
                     if !self.all_listed {
@@ -3383,7 +3554,9 @@ impl Threats {
                     }
                 }
                 self.kept_most = walk.top.most;
-                self.kept = walk.top.heap.into_sorted_vec();
+                let kept = std::mem::replace(&mut self.kept, walk.top.heap.into_sorted_vec());
+                self.retire_list(kept);
+                self.retire_list(walk.top.spare);
                 break;
             }
             let lane = walk.lane % self.lanes;
@@ -3482,25 +3655,22 @@ impl Threats {
         };
         let most = count.or(self.count_asked).unwrap_or(usize::MAX);
         let whole = self.all_listed && !self.jumbled() && self.kept.len() as u64 == self.count;
+        let walks_most =
+            |walk: &Option<ThreatWalk>| walk.as_ref().is_some_and(|walk| walk.top.most >= most);
         if !self.all_listed && self.walk.is_none() {
-            self.walk = Some(ThreatWalk::new(most, 0));
+            self.new_walk(most, 0);
         }
-        if self.all_listed && self.jumbled() && self.kept_most < most {
-            match &mut self.walk {
-                Some(walk) if walk.top.most >= most => {}
-                walk => *walk = Some(ThreatWalk::new(most, self.lanes)),
-            }
+        if self.all_listed && self.jumbled() && self.kept_most < most && !walks_most(&self.walk) {
+            self.new_walk(most, self.lanes);
         }
         if self.all_listed
             && !self.jumbled()
             && !whole
             && self.kept.len() < most
             && !self.out_of_memory
+            && !walks_most(&self.walk)
         {
-            match &mut self.walk {
-                Some(walk) if walk.top.most >= most => {}
-                walk => *walk = Some(ThreatWalk::new(most, 0)),
-            }
+            self.new_walk(most, 0);
         }
         let walked_to = if weigh {
             self.walk_lanes(deadline, now)?
@@ -3534,24 +3704,27 @@ impl Threats {
                 self.counted += 1;
             }
             let exact = self.counted == self.racks.len();
-            let mut drawn_sums = ThreatSums::default();
+            let mut drawn_sums = std::mem::take(&mut self.spare_sums);
+            drawn_sums.empty();
             let mut samples = 0usize;
             let mut rest_chance = 0.0;
-            let mut upto = Vec::new();
+            let mut upto = std::mem::take(&mut self.upto);
+            upto.clear();
             if weigh && !exact {
-                match ThreatSums::new(self.keys.len(), self.square_best.len()) {
-                    Some(sums)
-                        if upto
-                            .try_reserve_exact(self.racks.len() - self.counted)
-                            .is_ok() =>
-                    {
-                        drawn_sums = sums;
-                        upto.extend((self.racks[self.counted..].iter()).map(|(_, chance)| {
-                            rest_chance += chance;
-                            rest_chance
-                        }));
-                    }
-                    _ => refused = true,
+                let filled = drawn_sums
+                    .refill(self.keys.len(), self.square_best.len())
+                    .is_some()
+                    && upto
+                        .try_reserve_exact(self.racks.len() - self.counted)
+                        .is_ok();
+                if filled {
+                    upto.extend((self.racks[self.counted..].iter()).map(|(_, chance)| {
+                        rest_chance += chance;
+                        rest_chance
+                    }));
+                } else {
+                    drawn_sums.empty();
+                    refused = true;
                 }
                 while rest_chance > 0.0
                     && !(samples.is_multiple_of(16)
@@ -3571,8 +3744,11 @@ impl Threats {
                 0.0
             };
             if weigh {
-                self.drawn = (drawn_sums, each, samples);
+                std::mem::swap(&mut self.drawn.0, &mut drawn_sums);
+                (self.drawn.1, self.drawn.2) = (each, samples);
             }
+            self.spare_sums = drawn_sums;
+            self.upto = upto;
         }
         let exact = self.all_listed && self.counted == self.racks.len();
         let passes = self.walk_passes() as f64;
@@ -3588,7 +3764,7 @@ impl Threats {
         };
         let samples = if exact { 0 } else { self.drawn.2 };
         let mut out_of_memory = self.out_of_memory || refused;
-        let mut page = ThreatTop::new(most);
+        let mut page = self.top(most);
         if let Some(at) = through
             && !whole
             && self
@@ -3602,14 +3778,13 @@ impl Threats {
             _ if !self.all_listed => self.walk.as_ref().map(|walk| &walk.top),
             _ => None,
         };
-        let held = match top.map(ThreatTop::sorted) {
-            Some(Some(held)) => held,
-            Some(None) => {
-                out_of_memory = true;
-                Vec::new()
-            }
-            None => Vec::new(),
-        };
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        if top.is_some_and(|top| top.sorted_into(&mut order).is_none()) {
+            order.clear();
+            out_of_memory = true;
+        }
+        let held = top.map_or(&[][..], |top| top.heap.as_slice());
         let kept = if top.is_none() { &self.kept[..] } else { &[] };
         let (drawn_sums, each, _) = &self.drawn;
         let total = |pick: fn(&ThreatSums) -> &[f64]| ThreatTotal {
@@ -3639,7 +3814,8 @@ impl Threats {
             walked,
             plays: ThreatPlays {
                 kept,
-                held: &held,
+                held,
+                order: &order,
                 through,
                 cols: self.cols,
                 most,
@@ -3649,15 +3825,18 @@ impl Threats {
             squares,
             out_of_memory,
         };
-        match try_json_kept(&self.game_config, &answer)? {
-            Some(json) => Ok(json),
+        let json = match try_json_kept(&self.game_config, &answer)? {
+            Some(json) => json,
             None => {
                 answer.plays.kept = &[];
-                answer.plays.held = &[];
+                answer.plays.order = &[];
                 answer.out_of_memory = true;
-                json_in_kept_room(&self.game_config, &answer)
+                json_in_kept_room(&self.game_config, &answer)?
             }
-        }
+        };
+        self.order = order;
+        self.retire_top(page);
+        Ok(json)
     }
 }
 
@@ -3682,10 +3861,7 @@ fn do_threats(req_str: &str, now: impl Fn() -> f64) -> Result<String, String> {
     let deadline = threats_deadline(req.ms, &now)?;
     let square = req.square;
     let mut threats = threats_made(req)?;
-    threats.walk = Some(ThreatWalk::new(
-        threats.count_asked.unwrap_or(usize::MAX),
-        0,
-    ));
+    threats.new_walk(threats.count_asked.unwrap_or(usize::MAX), 0);
     let listed = threats.walk_lanes(None, &now)?.unwrap_or_else(&now);
     let half = deadline.map(|deadline| listed + (deadline - listed).max(0.0) / 2.0);
     threats.step(half, deadline, true, (None, square), &now)
@@ -9241,6 +9417,7 @@ mod tests {
             plays: ThreatPlays {
                 kept: &[],
                 held: &[],
+                order: &[],
                 through: None,
                 cols: 15,
                 most: 0,
