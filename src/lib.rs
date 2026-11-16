@@ -5296,8 +5296,8 @@ impl Endgame {
                     win: valued.win_pct as f64,
                     value: points(valued.expected_margin) - lead,
                     tiles: Some(
-                        (valued.hypotheses.iter())
-                            .map(|&(tile, count, margin)| EndgameBagTile {
+                        (progress.hypotheses(Some(valued.row)))
+                            .map(|(tile, count, margin)| EndgameBagTile {
                                 tile,
                                 count,
                                 value: points(margin) - lead,
@@ -5497,7 +5497,7 @@ impl Endgame {
             // the search's margins are the leads the game ends with; none yet
             // when a limit stopped it before a pass valued every tile, as
             // before a step
-            let valued = !peg.hypotheses.is_empty();
+            let valued = !progress.hypotheses(peg.row).is_empty();
             let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
             EndgameAnswer {
@@ -5515,8 +5515,8 @@ impl Endgame {
                 line: None,
                 win: valued.then_some(peg.win_pct as f64),
                 tiles: Some(
-                    (peg.hypotheses.iter())
-                        .map(|&(tile, count, margin)| EndgameBagTile {
+                    (progress.hypotheses(peg.row))
+                        .map(|(tile, count, margin)| EndgameBagTile {
                             tile,
                             count,
                             value: points(margin) - lead,
