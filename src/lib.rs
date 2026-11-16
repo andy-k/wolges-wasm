@@ -3131,9 +3131,9 @@ struct Threats {
     out_of_memory: bool,
     reach_from: Vec<usize>,
     // while reach is built, a lane at a step: the lanes counted or placed, and
-    // each id's next place once placing
+    // whether counting is done and placing begun
     reach_lanes: usize,
-    reach_next: Vec<usize>,
+    reach_placing: bool,
     square_best: Vec<i32>,
     board_tiles: Vec<u8>, // each square's tile, 0 for none
     cols: usize,
@@ -3178,7 +3178,6 @@ struct ThreatsRoom {
     lanes_reach: Vec<Vec<(u32, u16, i32)>>,
     reach: Vec<(u16, i32)>,
     reach_from: Vec<usize>,
-    reach_next: Vec<usize>,
     square_best: Vec<i32>,
     exact_sums: ThreatSums,
     drawn_sums: ThreatSums,
@@ -3400,11 +3399,8 @@ fn threats_in_room(
     keys.clear();
     lists.clear();
     lane.clear();
-    let mut emptied = [room.reach_from, room.reach_next];
-    for list in &mut emptied {
-        list.clear();
-    }
-    let [reach_from, reach_next] = emptied;
+    let mut reach_from = room.reach_from;
+    reach_from.clear();
     let (mut lanes_reach, mut reach, mut best) = (room.lanes_reach, room.reach, room.best);
     lanes_reach.clear();
     reach.clear();
@@ -3432,7 +3428,7 @@ fn threats_in_room(
         out_of_memory: false,
         reach_from,
         reach_lanes: 0,
-        reach_next,
+        reach_placing: false,
         square_best,
         board_tiles: std::mem::take(&mut kibitzer.board_tiles),
         cols,
@@ -3649,7 +3645,7 @@ impl Threats {
                     // are let go before the reach is built
                     self.lists = Default::default();
                     let keys = self.keys.len();
-                    if self.reach_next.is_empty() {
+                    if !self.reach_placing {
                         if self.reach_from.is_empty() {
                             if self.reach_from.try_reserve_exact(keys + 1).is_err() {
                                 self.out_of_memory = true;
@@ -3668,22 +3664,21 @@ impl Threats {
                                 self.reach_from[id + 1] += self.reach_from[id];
                             }
                             self.reach.clear();
-                            let (Ok(()), Ok(())) = (
-                                self.reach.try_reserve_exact(self.reach_from[keys]),
-                                self.reach_next.try_reserve_exact(keys + 1),
-                            ) else {
+                            if self.reach.try_reserve_exact(self.reach_from[keys]).is_err() {
                                 self.out_of_memory = true;
                                 self.walk = Some(walk);
                                 break;
-                            };
+                            }
                             self.reach.resize(self.reach_from[keys], (0u16, 0i32));
-                            self.reach_next.extend_from_slice(&self.reach_from);
+                            self.reach_placing = true;
                             self.reach_lanes = 0;
                         }
                     } else if let Some(lane) = self.lanes_reach.get_mut(self.reach_lanes) {
+                        // each id's start is its next place while placing,
+                        // so that it ends where the next id starts
                         for (id, along, score) in std::mem::take(lane) {
-                            self.reach[self.reach_next[id as usize]] = (along, score);
-                            self.reach_next[id as usize] += 1;
+                            self.reach[self.reach_from[id as usize]] = (along, score);
+                            self.reach_from[id as usize] += 1;
                         }
                         self.reach_lanes += 1;
                     } else {
@@ -3694,9 +3689,11 @@ impl Threats {
                             self.walk = Some(walk);
                             break;
                         }
-                        // placed, the lanes' reach is let go
+                        // placed, each id's start is where the one before it
+                        // ended, and the lanes' reach is let go
+                        self.reach_from.copy_within(0..keys, 1);
+                        self.reach_from[0] = 0;
                         self.lanes_reach = Vec::new();
-                        self.reach_next = Vec::new();
                         self.all_listed = true;
                     }
                     if !self.all_listed {
