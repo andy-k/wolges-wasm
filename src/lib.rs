@@ -1400,6 +1400,10 @@ struct SimNewRequest {
     // the lexicon's own, and a step stops, out of memory, once no room is left
     #[serde(default)]
     max_memory_mb: Option<usize>,
+    // the lexicon is already this board's prune (build_kbwg's), taken as it
+    // is: never pruned again
+    #[serde(default)]
+    pruned: bool,
 }
 
 // a field the request must give, null among the values it may take
@@ -2234,12 +2238,13 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let blanks_on_board = (game_state.board_tiles.iter())
         .filter(|&&tile| tile & 0x80 != 0)
         .count();
-    let kwg = if move_picker::late_graph_pays(
-        game_state.bag.len(),
-        blanks_on_board < game_config.alphabet().freq(0) as usize,
-        u64::MAX,
-        1,
-    ) {
+    let kwg = if !req.pruned
+        && move_picker::late_graph_pays(
+            game_state.bag.len(),
+            blanks_on_board < game_config.alphabet().freq(0) as usize,
+            u64::MAX,
+            1,
+        ) {
         match &memory {
             None => late_kwg(
                 &req.lexicon,
@@ -4702,6 +4707,10 @@ struct EndgameNewRequest {
     // buckets beside the new ones
     #[serde(default)]
     reserve_mb: Option<usize>,
+    // the lexicon is already this board's prune (build_kbwg's), taken as it
+    // is: never pruned again
+    #[serde(default)]
+    pruned: bool,
     // with two tiles or more in the bag: what each player knows once the first
     // move is made ("info_sets" or "random_draws", wolges's PegModel), and the
     // exchanges each seat has made
@@ -5732,6 +5741,16 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     // it, and where it has not room for the prune the lexicon's own graph,
     // whatever the prune took let go (the prune is for speed alone)
     let pruned = |game_config: &CachedRules| -> Result<_, String> {
+        // a graph pruned already is taken with its run letters, where they fit
+        if req.pruned {
+            let bits = kwg
+                .kwg
+                .run_bits_if(|bytes| limit.as_ref().is_none_or(|memory| memory.has_room(bytes)));
+            return Ok(std::sync::Arc::new(EndgameGraph::Lexicon(
+                std::sync::Arc::clone(&kwg),
+                bits,
+            )));
+        }
         let Some(memory) = &limit else {
             let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg)?;
             return Ok(std::sync::Arc::new(EndgameGraph::Pruned(
@@ -8379,6 +8398,69 @@ mod tests {
             do_endgame_free(handle).unwrap_err(),
         ] {
             assert!(err.contains("freed"), "{err}");
+        }
+    }
+
+    // build_kbwg's bytes, precached as a kbwg and given with pruned: true,
+    // answer an endgame and a sim (classic and jumbled) as the lexicon whole
+    // does, pruned by endgame_new and sim_new; a cap with no room refuses the
+    // bytes, out of memory
+    #[test]
+    fn a_board_pruned_ahead_answers_as_one_pruned_by_the_request() {
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let racks = rack.iter().chain(&others).copied().collect::<Vec<_>>();
+        for (rules, jumbled) in [("CrosswordGame", false), ("WordSmog", true)] {
+            let lexicon = format!("tiny-ahead-{rules}");
+            tiny_lexicon_for(&lexicon, jumbled);
+            let board = late_board_of(rules, &racks);
+            let build = format!(r#"{{"lexicon":"{lexicon}","rules":"{rules}","board":{board}"#);
+            let bytes = do_build_kbwg(&format!("{build}}}"), held_bytes).unwrap();
+            let pruned_key = format!("{lexicon}-pruned");
+            let graph = Kwg::from_reader::<kwg::Node24>(bytes.len(), |at, piece| {
+                piece.copy_from_slice(&bytes[at..at + piece.len()])
+            })
+            .unwrap();
+            CACHED_KWG
+                .write()
+                .unwrap()
+                .insert(pruned_key.clone(), CachedKwg::new(graph).into());
+            let new = |lexicon: &str, more: &str| {
+                do_endgame_new(
+                    &format!(
+                        r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"{rules}","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#
+                    ),
+                    held_bytes,
+                )
+                .unwrap()
+            };
+            let answer = |handle| {
+                let answer = endgame_step(handle, r#"{"ms":60000}"#);
+                do_endgame_free(handle).unwrap();
+                answer
+            };
+            let whole = answer(new(&lexicon, ""));
+            assert_eq!(
+                answer(new(&pruned_key, r#","pruned":true"#)),
+                whole,
+                "{rules}"
+            );
+            let sim = |lexicon: &str, more: &str| {
+                let sim = do_sim_new(&format!(
+                    r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","leave":"noleave","rules":"{rules}","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7,"plies":2{more}}}"#
+                ))
+                .unwrap();
+                do_sim_add(sim, &format!("[{PASS}]")).unwrap();
+                let answer = step(sim, r#"{"iterations":8,"prune":false}"#);
+                do_sim_free(sim).unwrap();
+                answer
+            };
+            assert_eq!(
+                sim(&pruned_key, r#","pruned":true"#),
+                sim(&lexicon, ""),
+                "{rules}"
+            );
+            let refused = do_build_kbwg(&format!(r#"{build},"max_memory_mb":1}}"#), || 1 << 20);
+            assert_eq!(refused, Err(OUT_OF_MEMORY.to_string()), "{rules}");
         }
     }
 
