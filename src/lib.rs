@@ -284,12 +284,14 @@ type Movegen = movegen::KurniaMoveGenerator<u32, false, false>;
 
 // a cached game config with its move generators: one is made the first time
 // a request needs one while none is free, and lent to it (CachedRules::lend),
-// so no request makes its own, and given back when the request is done; and
-// the table of no leaves, made once, for walks that read none
+// so no request makes its own, and given back when the request is done; the
+// table of no leaves, made once, for walks that read none; and the buffers
+// answers are written in (try_json_kept)
 struct CachedRules {
     game_config: game_config::GameConfig,
     movegens: std::sync::Mutex<Vec<Movegen>>,
     no_leaves: Klv,
+    answers: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 impl std::ops::Deref for CachedRules {
@@ -306,6 +308,7 @@ impl CachedRules {
             game_config,
             movegens: Default::default(),
             no_leaves: Klv::empty().map_err(err_to_str)?,
+            answers: Default::default(),
         })
     }
 
@@ -333,6 +336,55 @@ impl CachedRules {
             rules: rules.clone(),
             movegen: Some(rules.lend()?.take()),
         })
+    }
+}
+
+// a room a request takes from where its rules keep them (one made if none is
+// there), given back as the request lets it go
+struct Taken<'r, T> {
+    rooms: &'r std::sync::Mutex<Vec<T>>,
+    room: Option<T>,
+}
+
+impl<'r, T: Default> Taken<'r, T> {
+    fn from(rooms: &'r std::sync::Mutex<Vec<T>>) -> Result<Self, String> {
+        let room = rooms.lock().map_err(err_to_str)?.pop().unwrap_or_default();
+        Ok(Self {
+            rooms,
+            room: Some(room),
+        })
+    }
+}
+
+impl<T> std::ops::Deref for Taken<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        let Some(room) = &self.room else {
+            unreachable!("a taken room is held till it is let go");
+        };
+        room
+    }
+}
+
+impl<T> std::ops::DerefMut for Taken<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        let Some(room) = &mut self.room else {
+            unreachable!("a taken room is held till it is let go");
+        };
+        room
+    }
+}
+
+// a room the rules have no room to keep is let go
+impl<T> Drop for Taken<'_, T> {
+    fn drop(&mut self) {
+        if let Some(room) = self.room.take()
+            && let Ok(mut rooms) = self.rooms.lock()
+            && rooms.try_reserve(1).is_ok()
+        {
+            rooms.push(room);
+        }
     }
 }
 
@@ -633,7 +685,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
         return_js_error!(OUT_OF_MEMORY.to_string());
     }
 
-    match try_json(&ValuedPlaysJson(plays))? {
+    match try_json_kept(&game_config, &ValuedPlaysJson(plays))? {
         Some(json) => Ok(json),
         None => Err(OUT_OF_MEMORY.into()),
     }
@@ -2392,11 +2444,43 @@ impl std::io::Write for TryWriter {
     }
 }
 
-fn try_json(value: &impl serde::Serialize) -> Result<Option<String>, String> {
-    let mut writer = TryWriter(Vec::new());
-    match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => String::from_utf8(writer.0).map(Some).map_err(err_to_str),
+// value as json, none where a growth is refused, written in a buffer its rules
+// keep from answer to answer, so that only the answer's own string is made, at
+// its length
+fn try_json_kept(
+    rules: &CachedRules,
+    value: &impl serde::Serialize,
+) -> Result<Option<String>, String> {
+    let mut taken = Taken::<Vec<u8>>::from(&rules.answers)?;
+    let mut writer = TryWriter(std::mem::take(&mut *taken));
+    writer.0.clear();
+    let written = serde_json::to_writer(&mut writer, value);
+    *taken = writer.0;
+    match written {
+        Ok(()) => {
+            let text = std::str::from_utf8(&taken).map_err(err_to_str)?;
+            let mut json = String::new();
+            if json.try_reserve_exact(text.len()).is_err() {
+                return Ok(None);
+            }
+            json.push_str(text);
+            Ok(Some(json))
+        }
         Err(e) if e.is_io() => Ok(None),
+        Err(e) => Err(err_to_str(e)),
+    }
+}
+
+// value as json where a larger answer was refused, written in the room that
+// answer grew (which this one fits) and given as the answer itself, so that
+// writing it grows nothing; the rules keep no buffer till the next answer
+fn json_in_kept_room(rules: &CachedRules, value: &impl serde::Serialize) -> Result<String, String> {
+    let mut taken = Taken::<Vec<u8>>::from(&rules.answers)?;
+    let mut writer = TryWriter(std::mem::take(&mut *taken));
+    writer.0.clear();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => String::from_utf8(writer.0).map_err(err_to_str),
+        Err(e) if e.is_io() => Err(OUT_OF_MEMORY.into()),
         Err(e) => Err(err_to_str(e)),
     }
 }
@@ -3538,13 +3622,15 @@ impl Threats {
             squares,
             out_of_memory,
         };
-        if let Some(json) = try_json(&answer)? {
-            return Ok(json);
+        match try_json_kept(&self.game_config, &answer)? {
+            Some(json) => Ok(json),
+            None => {
+                answer.plays.kept = &[];
+                answer.plays.held = &[];
+                answer.out_of_memory = true;
+                json_in_kept_room(&self.game_config, &answer)
+            }
         }
-        answer.plays.kept = &[];
-        answer.plays.held = &[];
-        answer.out_of_memory = true;
-        serde_json::to_string(&answer).map_err(err_to_str)
     }
 }
 
@@ -3684,7 +3770,8 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
     let stepped = sim.step(req.iterations.unwrap_or(u64::MAX), pruning, || {
         deadline.is_some_and(|deadline| now() >= deadline)
     })?;
-    serde_json::to_string(&sim.report(stepped, against.as_ref())).map_err(err_to_str)
+    try_json_kept(&sim.game_config, &sim.report(stepped, against.as_ref()))?
+        .ok_or_else(|| OUT_OF_MEMORY.into())
 }
 
 // what a change does to each play given
@@ -9113,6 +9200,7 @@ mod tests {
 
     #[test]
     fn a_threats_count_is_more_than_32_bits() {
+        let rules = CachedRules::new(game_config::make_english_game_config()).unwrap();
         let found = ThreatsAnswer {
             racks: 0,
             count: u64::from(u32::MAX) + 1,
@@ -9135,8 +9223,10 @@ mod tests {
             squares: Vec::new(),
             out_of_memory: false,
         };
-        let answer =
-            serde_json::from_str::<serde_json::Value>(&try_json(&found).unwrap().unwrap()).unwrap();
+        let answer = serde_json::from_str::<serde_json::Value>(
+            &try_json_kept(&rules, &found).unwrap().unwrap(),
+        )
+        .unwrap();
         assert_eq!(answer["count"], u64::from(u32::MAX) + 1);
     }
 
