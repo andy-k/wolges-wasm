@@ -5060,11 +5060,17 @@ pub fn endgame_free(handle: u32) -> Result<(), JsValue> {
 
 fn do_endgame_free(handle: u32) -> Result<(), String> {
     let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
-    endgames
-        .live
-        .remove(&handle)
-        .map(|_| ())
-        .ok_or_else(|| no_endgame(handle))
+    let endgame = (endgames.live.remove(&handle)).ok_or_else(|| no_endgame(handle))?;
+    // its graph's nodes, when nothing else holds them, go to its lexicon's
+    // pruner, for the next graph pruned from it
+    if let Some(graph) = std::sync::Arc::into_inner(endgame.kwg)
+        && let Some(lexicon) = (CACHED_KWG.read().map_err(err_to_str)?)
+            .get(&endgame.lexicon)
+            .cloned()
+    {
+        lexicon.pruner.lock().map_err(err_to_str)?.spare = Some(graph.into_kwg());
+    }
+    Ok(())
 }
 
 // a lexicon's graph pruned for a sim, with the rules and the board it was
@@ -5138,24 +5144,28 @@ fn late_kwg(
 }
 
 // what a lexicon's graphs are pruned with, kept from prune to prune: an empty
-// leave table, the words, and the builder (the generator is the rules' own,
-// lent, CachedRules::lend)
+// leave table, the words, the builder, and the nodes of a pruned graph let go,
+// for the next to be made in (the generator is the rules' own, lent,
+// CachedRules::lend)
 #[derive(Default)]
 struct Pruner {
     empty_klv: Option<Klv>,
     words: Vec<bites::Bites>,
     builder: build::Builder,
+    spare: Option<Kwg>,
 }
 
 // the lexicon's words the board can still take, whatever the racks, made into
 // a graph of their own, as wolges's endgame command prunes its own: the same
-// answers, a far smaller graph to generate on
+// answers, a far smaller graph to generate on. It is made in the nodes the
+// lexicon's pruner was last given, if any
 fn pruned_kwg(
     game_config: &CachedRules,
     board_tiles: &[u8],
     lexicon: &CachedKwg,
 ) -> Result<Kwg, String> {
-    let mut graph = kwg::Kwg(Vec::new());
+    let spare = lexicon.pruner.lock().map_err(err_to_str)?.spare.take();
+    let mut graph = spare.unwrap_or_else(|| kwg::Kwg(Vec::new()));
     prune_into(game_config, board_tiles, lexicon, &mut graph)?;
     Ok(graph)
 }
@@ -5172,6 +5182,7 @@ fn prune_into(
         empty_klv,
         words,
         builder,
+        spare: _,
     } = &mut *pruner;
     let empty_klv = match empty_klv {
         Some(klv) => klv,
@@ -6468,10 +6479,11 @@ mod tests {
             assert!(fields(&late.kwg) == anew(board_tiles));
         }
         forget_late_kwg("tiny-pruned-again").unwrap();
-        // graphs pruned one after another by the lexicon's pruner
+        // graphs pruned in nodes given back to the lexicon's pruner
         for board_tiles in &boards {
             let graph = pruned_kwg(&game_config, board_tiles, &kwg).unwrap();
             assert!(fields(&graph) == anew(board_tiles));
+            kwg.pruner.lock().unwrap().spare = Some(graph);
         }
     }
 
