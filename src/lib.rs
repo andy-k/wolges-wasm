@@ -153,8 +153,8 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
             }
         }
         let mut cached = CACHED_GAME_CONFIG.write().unwrap();
-        cached.insert(classic.into(), gc.into());
-        cached.insert(jumbled.into(), jumbled_gc.into());
+        cached.insert(classic.into(), CachedRules::new(gc).into());
+        cached.insert(jumbled.into(), CachedRules::new(jumbled_gc).into());
     }
     Ok(())
 }
@@ -276,7 +276,107 @@ static CACHED_KWG: std::sync::LazyLock<WasmCache<CachedKwg>> =
     std::sync::LazyLock::new(Default::default);
 static CACHED_KLV: std::sync::LazyLock<WasmCache<CachedKlv>> =
     std::sync::LazyLock::new(Default::default);
-static CACHED_GAME_CONFIG: std::sync::LazyLock<WasmCache<game_config::GameConfig>> =
+// the move generator every request makes its moves with
+type Movegen = movegen::KurniaMoveGenerator<u32, false, false>;
+
+// a cached game config with its move generators: one is made the first time
+// a request needs one while none is free, and lent to it (CachedRules::lend),
+// so no request makes its own, and given back when the request is done
+struct CachedRules {
+    game_config: game_config::GameConfig,
+    movegens: std::sync::Mutex<Vec<Movegen>>,
+}
+
+impl std::ops::Deref for CachedRules {
+    type Target = game_config::GameConfig;
+
+    fn deref(&self) -> &game_config::GameConfig {
+        &self.game_config
+    }
+}
+
+impl CachedRules {
+    fn new(game_config: game_config::GameConfig) -> Self {
+        Self {
+            game_config,
+            movegens: Default::default(),
+        }
+    }
+
+    // a free generator, reset for any word graph (each request may name
+    // another), or one made if none is free
+    fn lend(&self) -> Result<Lent<&Self>, String> {
+        let free = self.movegens.lock().map_err(err_to_str)?.pop();
+        let movegen = match free {
+            Some(mut movegen) => {
+                movegen.reset_for_another_kwg();
+                movegen
+            }
+            None => Movegen::try_new(&self.game_config).map_err(err_to_str)?,
+        };
+        Ok(Lent {
+            rules: self,
+            movegen: Some(movegen),
+        })
+    }
+
+    // a generator as lend lends one, to what holds the rules past the request
+    // (a threats question), given back as that is let go
+    fn lend_held(rules: &std::sync::Arc<Self>) -> Result<Lent<std::sync::Arc<Self>>, String> {
+        Ok(Lent {
+            rules: rules.clone(),
+            movegen: Some(rules.lend()?.take()),
+        })
+    }
+}
+
+// a generator lent to a request, given back to the rules (held by reference
+// or shared) as the request lets it go, or kept by what takes it (Lent::take)
+struct Lent<R: std::ops::Deref<Target = CachedRules>> {
+    rules: R,
+    movegen: Option<Movegen>,
+}
+
+impl<R: std::ops::Deref<Target = CachedRules>> Lent<R> {
+    fn take(mut self) -> Movegen {
+        let Some(movegen) = self.movegen.take() else {
+            unreachable!("a lent generator is taken once");
+        };
+        movegen
+    }
+}
+
+impl<R: std::ops::Deref<Target = CachedRules>> std::ops::Deref for Lent<R> {
+    type Target = Movegen;
+
+    fn deref(&self) -> &Movegen {
+        let Some(movegen) = &self.movegen else {
+            unreachable!("a lent generator is read only until taken");
+        };
+        movegen
+    }
+}
+
+impl<R: std::ops::Deref<Target = CachedRules>> std::ops::DerefMut for Lent<R> {
+    fn deref_mut(&mut self) -> &mut Movegen {
+        let Some(movegen) = &mut self.movegen else {
+            unreachable!("a lent generator is read only until taken");
+        };
+        movegen
+    }
+}
+
+impl<R: std::ops::Deref<Target = CachedRules>> Drop for Lent<R> {
+    fn drop(&mut self) {
+        if let Some(movegen) = self.movegen.take()
+            && let Ok(mut free) = self.rules.movegens.lock()
+        {
+            free.push(movegen);
+        }
+    }
+}
+
+static CACHED_GAME_CONFIG: std::sync::LazyLock<WasmCache<CachedRules>> =
     std::sync::LazyLock::new(Default::default);
 
 macro_rules! get_wasm_cache {
@@ -455,9 +555,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
 
-    let mut move_generator =
-        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-            .map_err(err_to_str)?;
+    let mut move_generator = game_config.lend()?;
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
@@ -665,7 +763,7 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
 struct Tables {
     kwg: std::sync::Arc<CachedKwg>,
     klv: std::sync::Arc<CachedKlv>,
-    game_config: std::sync::Arc<game_config::GameConfig>,
+    game_config: std::sync::Arc<CachedRules>,
 }
 
 // each checked against the rules: a word graph or leave table with tiles the
@@ -756,19 +854,17 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
     // that make the run of tiles down through it a word and those that make the
     // run across one, each 0 when no tile is beside it that way
     let mut hooks = vec![(0u64, 0u64); kibitzer.board_tiles.len()];
-    movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-        .map_err(err_to_str)?
-        .gen_hooks(
-            &movegen::BoardSnapshot {
-                board_tiles: &kibitzer.board_tiles,
-                game_config: &game_config,
-                kwg: &kwg.kwg,
-                anagrams: None,
-                rack_lengths: None,
-                klv: &Klv::empty().map_err(err_to_str)?,
-            },
-            |idx, down, across| hooks[idx] = (down, across),
-        );
+    game_config.lend()?.gen_hooks(
+        &movegen::BoardSnapshot {
+            board_tiles: &kibitzer.board_tiles,
+            game_config: &game_config,
+            kwg: &kwg.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &Klv::empty().map_err(err_to_str)?,
+        },
+        |idx, down, across| hooks[idx] = (down, across),
+    );
     let alphabet_len = game_config.alphabet().len();
     let letters = |bits: u64| {
         (bits != 0).then(|| {
@@ -979,9 +1075,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
-    let mut move_generator =
-        movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-            .map_err(err_to_str)?;
+    let mut move_generator = game_config.lend()?;
     let mut cached = CACHED_INFER.lock().map_err(err_to_str)?;
     let tables = match &mut *cached {
         Some(held) if held.rules == req.rules && held.leave == req.leave => &mut held.tables,
@@ -1266,7 +1360,7 @@ struct SimCandidate {
 // to the game's end), its seed, which part of how many it is, its iterations so
 // far, and its candidates
 struct Sim {
-    game_config: std::sync::Arc<game_config::GameConfig>,
+    game_config: std::sync::Arc<CachedRules>,
     kwg: std::sync::Arc<CachedKwg>,
     klv: std::sync::Arc<CachedKlv>,
     game_state: game_state::GameState,
@@ -1883,11 +1977,8 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
-    let mut simmer = simmer::Simmer::with_generator(
-        &game_config,
-        movegen::KurniaMoveGenerator::try_new(&game_config).map_err(err_to_str)?,
-    )
-    .map_err(err_to_str)?;
+    let mut simmer = simmer::Simmer::with_generator(&game_config, game_config.lend()?.take())
+        .map_err(err_to_str)?;
     let packed = inferred.map(|leaves| simmer::KeptLeaves {
         seat: opponent as u8,
         leaves,
@@ -2630,9 +2721,9 @@ struct Threats {
     list_ms: f64,
     drawn: (ThreatSums, f64, usize), // the last weighing's draws, each's weight, their number
     kwg: std::sync::Arc<CachedKwg>,
-    game_config: std::sync::Arc<game_config::GameConfig>,
+    game_config: std::sync::Arc<CachedRules>,
     pool: Vec<u8>,
-    move_generator: movegen::KurniaMoveGenerator<u32, false, false>,
+    move_generator: Lent<std::sync::Arc<CachedRules>>,
 }
 
 // the threats made, by handle; a handle is never used twice
@@ -2771,8 +2862,7 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
     let mut racks = listed;
     racks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let move_generator = movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
-        .map_err(err_to_str)?;
+    let move_generator = CachedRules::lend_held(&game_config)?;
     let pool = (0u8..)
         .zip(unseen.iter())
         .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize))
@@ -4045,7 +4135,7 @@ struct EndgameAnswer {
 // table between steps, with tiles in the bag the search so far (one tile's, or
 // two or more's), and the last answer
 struct Endgame {
-    game_config: std::sync::Arc<game_config::GameConfig>,
+    game_config: std::sync::Arc<CachedRules>,
     kwg: std::sync::Arc<kwg::RunGraph<kwg::Node24>>, // with its run letters, found as it was made
     arm_tables: std::sync::Arc<anagrams::ArmTables>,
     lexicon: String, // the lexicon its graph was pruned from
@@ -4133,7 +4223,7 @@ macro_rules! step_solver {
                 $endgame.kwg.kwg(),
                 &$endgame.arm_tables,
                 $endgame.kwg.run_letters(),
-                movegen::KurniaMoveGenerator::try_new(&$endgame.game_config).map_err(err_to_str)?,
+                $endgame.game_config.lend()?.take(),
             ),
         }
         .map_err(err_to_str)?
@@ -4760,7 +4850,7 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         }
     };
     // a graph pruned here, with its run letters
-    let pruned = |game_config: &game_config::GameConfig| -> Result<_, String> {
+    let pruned = |game_config: &CachedRules| -> Result<_, String> {
         let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg.kwg)?;
         Ok(std::sync::Arc::new(kwg::RunGraph::new(pruned)))
     };
@@ -5000,7 +5090,7 @@ fn forget_late_kwg(lexicon: &str) -> Result<(), String> {
 fn late_kwg(
     lexicon: &str,
     rules: &str,
-    game_config: &game_config::GameConfig,
+    game_config: &CachedRules,
     board_tiles: &[u8],
     kwg: &Kwg,
 ) -> Result<std::sync::Arc<CachedKwg>, String> {
@@ -5029,25 +5119,19 @@ fn late_kwg(
 // the lexicon's words the board can still take, whatever the racks, made into
 // a graph of their own, as wolges's endgame command prunes its own: the same
 // answers, a far smaller graph to generate on
-fn pruned_kwg(
-    game_config: &game_config::GameConfig,
-    board_tiles: &[u8],
-    kwg: &Kwg,
-) -> Result<Kwg, String> {
+fn pruned_kwg(game_config: &CachedRules, board_tiles: &[u8], kwg: &Kwg) -> Result<Kwg, String> {
     let mut words = Vec::<bites::Bites>::new();
-    movegen::KurniaMoveGenerator::<u32, false, false>::try_new(game_config)
-        .map_err(err_to_str)?
-        .gen_remaining_words(
-            &movegen::BoardSnapshot {
-                board_tiles,
-                game_config,
-                kwg,
-                anagrams: None,
-                rack_lengths: None,
-                klv: &Klv::empty().map_err(err_to_str)?,
-            },
-            |word: &[u8]| words.push(word.into()),
-        );
+    game_config.lend()?.gen_remaining_words(
+        &movegen::BoardSnapshot {
+            board_tiles,
+            game_config,
+            kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &Klv::empty().map_err(err_to_str)?,
+        },
+        |word: &[u8]| words.push(word.into()),
+    );
     Kwg::from_bytes_alloc(&build::build_for_game(game_config, &words).map_err(err_to_str)?)
         .map_err(err_to_str)
 }
