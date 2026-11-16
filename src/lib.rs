@@ -2279,10 +2279,10 @@ struct ThreatsRequest {
 // tiles: the tiles it places in tile order (0 for a blank). chance: the chance
 // the opponent's rack holds them.
 #[derive(serde::Serialize)]
-struct ThreatPlay {
+struct ThreatPlay<'a> {
     #[serde(flatten)]
-    play: kibitzer::JsonPlay,
-    tiles: Vec<u8>,
+    play: kibitzer::JsonPlayRef<'a>,
+    tiles: &'a [u8],
     chance: f64,
 }
 
@@ -2316,7 +2316,7 @@ struct ThreatsAnswer<'a> {
     exact: bool,
     walked: f64,
     plays: ThreatPlays<'a>,
-    squares: Vec<Vec<Option<ThreatSquare>>>, // row by row; null where a tile is
+    squares: ThreatSquares<'a>, // row by row; null where a tile is
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     out_of_memory: bool,
 }
@@ -2344,18 +2344,63 @@ impl serde::Serialize for ThreatPlays<'_> {
                 })
                 .take(self.most)
                 .map(|play| ThreatPlay {
-                    tiles: self.keys.get(play.id as usize).to_vec(),
+                    tiles: self.keys.get(play.id as usize),
                     chance: self.holds.at(play.id as usize),
-                    play: (&movegen::Play::Place {
+                    play: kibitzer::JsonPlayRef::Play {
                         down: play.down,
                         lane: play.lane,
                         idx: play.idx,
-                        word: play.word[..].into(),
+                        word: &play.word,
                         score: play.score,
-                    })
-                        .into(),
+                    },
                 }),
         )
+    }
+}
+
+// a board's squares row by row as ThreatSquare writes each, null where a tile
+// is, each read from the sums where they are held
+struct ThreatSquares<'a> {
+    board_tiles: &'a [u8],
+    cols: usize,
+    square_best: &'a [i32],
+    chance: ThreatTotal<'a>,
+    expected: ThreatTotal<'a>,
+    reach: ThreatTotal<'a>,
+}
+
+impl serde::Serialize for ThreatSquares<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            (self.board_tiles.chunks(self.cols))
+                .zip((0..).step_by(self.cols))
+                .map(|(row, from)| ThreatRow {
+                    squares: self,
+                    row,
+                    from,
+                }),
+        )
+    }
+}
+
+// a row of ThreatSquares, its first square's place on the board at from
+struct ThreatRow<'a> {
+    squares: &'a ThreatSquares<'a>,
+    row: &'a [u8],
+    from: usize,
+}
+
+impl serde::Serialize for ThreatRow<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let squares = self.squares;
+        serializer.collect_seq((self.row.iter().zip(self.from..)).map(|(&tile, at)| {
+            (tile == 0).then(|| ThreatSquare {
+                best: equity::descale_score(squares.square_best[at].max(0)),
+                chance: squares.chance.at(at),
+                expected: squares.expected.at(at) / equity::SCALE as f64,
+                reach: squares.reach.at(at),
+            })
+        }))
     }
 }
 
@@ -3572,32 +3617,14 @@ impl Threats {
             drawn: pick(drawn_sums),
             each: *each,
         };
-        let square_chance = total(|sums| &sums.square_chance);
-        let square_expected = total(|sums| &sums.square_expected);
-        let square_reach = total(|sums| &sums.square_reach);
-        let rows = self.board_tiles.chunks(self.cols);
-        let mut squares = Vec::new();
-        let mut refused_squares = squares.try_reserve_exact(rows.len()).is_err();
-        for (row, from) in rows.zip((0..).step_by(self.cols)) {
-            let mut line = Vec::new();
-            if refused_squares || line.try_reserve_exact(row.len()).is_err() {
-                refused_squares = true;
-                break;
-            }
-            line.extend((row.iter().zip(from..)).map(|(&tile, at)| {
-                (tile == 0).then(|| ThreatSquare {
-                    best: equity::descale_score(self.square_best[at].max(0)),
-                    chance: square_chance.at(at),
-                    expected: square_expected.at(at) / equity::SCALE as f64,
-                    reach: square_reach.at(at),
-                })
-            }));
-            squares.push(line);
-        }
-        if refused_squares {
-            squares = Vec::new();
-            out_of_memory = true;
-        }
+        let squares = ThreatSquares {
+            board_tiles: &self.board_tiles,
+            cols: self.cols,
+            square_best: &self.square_best,
+            chance: total(|sums| &sums.square_chance),
+            expected: total(|sums| &sums.square_expected),
+            reach: total(|sums| &sums.square_reach),
+        };
         let mut answer = ThreatsAnswer {
             racks: self.racks.len(),
             count: self.count,
@@ -9220,7 +9247,14 @@ mod tests {
                 keys: &Interned::default(),
                 holds: Default::default(),
             },
-            squares: Vec::new(),
+            squares: ThreatSquares {
+                board_tiles: &[],
+                cols: 15,
+                square_best: &[],
+                chance: Default::default(),
+                expected: Default::default(),
+                reach: Default::default(),
+            },
             out_of_memory: false,
         };
         let answer = serde_json::from_str::<serde_json::Value>(
