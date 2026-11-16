@@ -285,12 +285,14 @@ type Movegen = movegen::KurniaMoveGenerator<u32, false, false>;
 // a cached game config with its move generators: one is made the first time
 // a request needs one while none is free, and lent to it (CachedRules::lend),
 // so no request makes its own, and given back when the request is done; the
-// table of no leaves, made once, for walks that read none; and the buffers
+// table of no leaves, made once, for walks that read none; and the buffers of
+// the analyze requests done, for the next ones (AnalyzeRoom), and the buffers
 // answers are written in (try_json_kept)
 struct CachedRules {
     game_config: game_config::GameConfig,
     movegens: std::sync::Mutex<Vec<Movegen>>,
     no_leaves: Klv,
+    analyze_rooms: std::sync::Mutex<Vec<AnalyzeRoom>>,
     answers: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
@@ -308,6 +310,7 @@ impl CachedRules {
             game_config,
             movegens: Default::default(),
             no_leaves: Klv::empty().map_err(err_to_str)?,
+            analyze_rooms: Default::default(),
             answers: Default::default(),
         })
     }
@@ -384,6 +387,25 @@ impl<T> Drop for Taken<'_, T> {
             && rooms.try_reserve(1).is_ok()
         {
             rooms.push(room);
+        }
+    }
+}
+
+// what analyze grows, kept by its rules for the next analyze there: the
+// position as read, and for a jumbled game the plays seen, each as its
+// equity, placement, score, and tiles in tile order, with its scratch
+struct AnalyzeRoom {
+    kibitzer: kibitzer::Kibitzer,
+    seen: Interned,
+    key: Vec<u8>,
+}
+
+impl Default for AnalyzeRoom {
+    fn default() -> Self {
+        Self {
+            kibitzer: kibitzer::Kibitzer::new(),
+            seen: Default::default(),
+            key: Vec::new(),
         }
     }
 }
@@ -608,7 +630,9 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
         ));
     }
 
-    let mut kibitzer = kibitzer::Kibitzer::new();
+    let mut taken = Taken::<AnalyzeRoom>::from(&game_config.analyze_rooms)?;
+    let room = &mut *taken;
+    let kibitzer = &mut room.kibitzer;
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
@@ -625,8 +649,9 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
 
     let mut refused = false;
     {
-        let mut seen_moves = fash::MyHashSet::default();
-        let mut alpha_buf = Vec::new();
+        let (seen_moves, key) = (&mut room.seen, &mut room.key);
+        seen_moves.clear();
+        // a play seen is one of the same equity, placement, score, and tiles
         let mut dedup = |equity: equity::Equity, play: &movegen::Play| match play {
             movegen::Play::Exchange { .. } => true,
             movegen::Play::Place {
@@ -636,23 +661,20 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
                 word,
                 score,
             } => {
-                alpha_buf.clear();
-                alpha_buf.extend_from_slice(word);
-                alpha_buf.sort_unstable();
-                if seen_moves.try_reserve(1).is_err() {
-                    refused = true;
-                    return false;
+                key.clear();
+                key.extend_from_slice(&equity.raw().to_le_bytes());
+                key.extend([*down as u8, *lane as u8, *idx as u8]);
+                key.extend_from_slice(&score.to_le_bytes());
+                let tiles = key.len();
+                key.extend_from_slice(word);
+                key[tiles..].sort_unstable();
+                match seen_moves.add(key) {
+                    Some((_, new)) => new,
+                    None => {
+                        refused = true;
+                        false
+                    }
                 }
-                seen_moves.insert((
-                    equity.raw(),
-                    movegen::Play::Place {
-                        down: *down,
-                        lane: *lane,
-                        idx: *idx,
-                        word: alpha_buf[..].into(),
-                        score: *score,
-                    },
-                ))
             }
         };
         move_generator.gen_moves_filtered_lean_walked::<movegen::OncePerScore, _, _>(
