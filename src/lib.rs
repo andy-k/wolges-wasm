@@ -153,8 +153,8 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
             }
         }
         let mut cached = CACHED_GAME_CONFIG.write().unwrap();
-        cached.insert(classic.into(), CachedRules::new(gc).into());
-        cached.insert(jumbled.into(), CachedRules::new(jumbled_gc).into());
+        cached.insert(classic.into(), CachedRules::new(gc)?.into());
+        cached.insert(jumbled.into(), CachedRules::new(jumbled_gc)?.into());
     }
     Ok(())
 }
@@ -284,10 +284,12 @@ type Movegen = movegen::KurniaMoveGenerator<u32, false, false>;
 
 // a cached game config with its move generators: one is made the first time
 // a request needs one while none is free, and lent to it (CachedRules::lend),
-// so no request makes its own, and given back when the request is done
+// so no request makes its own, and given back when the request is done; and
+// the table of no leaves, made once, for walks that read none
 struct CachedRules {
     game_config: game_config::GameConfig,
     movegens: std::sync::Mutex<Vec<Movegen>>,
+    no_leaves: Klv,
 }
 
 impl std::ops::Deref for CachedRules {
@@ -299,11 +301,12 @@ impl std::ops::Deref for CachedRules {
 }
 
 impl CachedRules {
-    fn new(game_config: game_config::GameConfig) -> Self {
-        Self {
+    fn new(game_config: game_config::GameConfig) -> Result<Self, String> {
+        Ok(Self {
             game_config,
             movegens: Default::default(),
-        }
+            no_leaves: Klv::empty().map_err(err_to_str)?,
+        })
     }
 
     // a free generator, reset for any word graph (each request may name
@@ -864,7 +867,7 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
             kwg: &kwg.kwg,
             anagrams: None,
             rack_lengths: None,
-            klv: &Klv::empty().map_err(err_to_str)?,
+            klv: &game_config.no_leaves,
         },
         |idx, down, across| hooks[idx] = (down, across),
     );
@@ -3025,14 +3028,13 @@ impl Threats {
         if self.pool.is_empty() {
             return Ok(Some(0));
         }
-        let empty_klv = Klv::empty().map_err(err_to_str)?;
         let board_snapshot = movegen::BoardSnapshot {
             board_tiles: &self.board_tiles,
             game_config: &self.game_config,
             kwg: &self.kwg.kwg,
             anagrams: None,
             rack_lengths: None,
-            klv: &empty_klv,
+            klv: &self.game_config.no_leaves,
         };
         let cols = self.cols;
         let jumbled = matches!(
@@ -5246,13 +5248,11 @@ fn late_kwg(
     Ok(pruned)
 }
 
-// what a lexicon's graphs are pruned with, kept from prune to prune: an empty
-// leave table, the words, the builder, and the nodes of a pruned graph let go,
-// for the next to be made in (the generator is the rules' own, lent,
-// CachedRules::lend)
+// what a lexicon's graphs are pruned with, kept from prune to prune: the
+// words, the builder, and the nodes of a pruned graph let go, for the next to
+// be made in (the generator and the table of no leaves are the rules' own)
 #[derive(Default)]
 struct Pruner {
-    empty_klv: Option<Klv>,
     words: Vec<bites::Bites>,
     builder: build::Builder,
     spare: Option<Kwg>,
@@ -5282,15 +5282,10 @@ fn prune_into(
 ) -> Result<(), String> {
     let mut pruner = lexicon.pruner.lock().map_err(err_to_str)?;
     let Pruner {
-        empty_klv,
         words,
         builder,
         spare: _,
     } = &mut *pruner;
-    let empty_klv = match empty_klv {
-        Some(klv) => klv,
-        None => empty_klv.insert(Klv::empty().map_err(err_to_str)?),
-    };
     words.clear();
     game_config.lend()?.gen_remaining_words(
         &movegen::BoardSnapshot {
@@ -5299,7 +5294,7 @@ fn prune_into(
             kwg: &lexicon.kwg,
             anagrams: None,
             rack_lengths: None,
-            klv: empty_klv,
+            klv: &game_config.no_leaves,
         },
         |word: &[u8]| words.push(word.into()),
     );
