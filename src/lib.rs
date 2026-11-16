@@ -447,6 +447,8 @@ struct PlayScoreRoom {
     game_state: Option<game_state::GameState>,
     kibitzer: kibitzer::Kibitzer,
     ps: play_scorer::PlayScorer,
+    words: Vec<u8>,
+    word_ends: Vec<usize>,
 }
 
 impl Default for PlayScoreRoom {
@@ -455,6 +457,8 @@ impl Default for PlayScoreRoom {
             game_state: None,
             kibitzer: kibitzer::Kibitzer::new(),
             ps: play_scorer::PlayScorer::new(),
+            words: Vec::new(),
+            word_ends: Vec::new(),
         }
     }
 }
@@ -831,54 +835,128 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
         klv: &klv.klv,
     };
 
-    let ps = &mut room.ps;
-    let result = req
-        .plays
-        .iter()
-        .map(|json_play| {
-            let play = movegen::Play::from(json_play);
-            match ps.validate_play(board_snapshot, game_state, &play) {
-                Err(err) => ScoredPlay::Error {
-                    error: err.to_string(),
-                },
-                Ok(adjusted_play) => {
-                    let is_canonical = adjusted_play.is_none();
-                    let mut canonical_play = adjusted_play.unwrap_or(play);
-                    let recounted_score = ps.compute_score(board_snapshot, &canonical_play);
-                    match canonical_play {
-                        movegen::Play::Exchange { .. } => {}
-                        movegen::Play::Place { ref mut score, .. } => {
-                            if *score != recounted_score {
-                                *score = recounted_score;
-                            }
-                        }
-                    };
-                    let recounted_equity = ps.compute_equity(
-                        board_snapshot,
-                        game_state,
-                        &canonical_play,
-                        move_filter::LEAVE_SCALE_DENOM,
-                        recounted_score,
-                    );
-                    let mut invalid_words = Vec::new();
-                    ps.find_invalid_words(board_snapshot, &canonical_play, |word| {
-                        invalid_words.push(word.into())
-                    });
-                    ScoredPlay::Scored {
-                        canonical: is_canonical,
-                        valid: invalid_words.is_empty(),
-                        invalid_words,
-                        json_play_with_equity: kibitzer::JsonPlayWithEquity {
-                            equity: recounted_equity as f32 / equity::SCALE as f32,
-                            play: (&canonical_play).into(),
-                        },
-                    }
-                }
-            }
-        })
-        .collect::<Vec<_>>();
+    let answer = ScoredPlaysJson {
+        plays: &req.plays,
+        scoring: std::cell::RefCell::new(PlayScoring {
+            ps: &mut room.ps,
+            board_snapshot,
+            game_state,
+            words: &mut room.words,
+            word_ends: &mut room.word_ends,
+        }),
+    };
+    Ok(try_json_kept(&game_config, &answer)?.ok_or(OUT_OF_MEMORY)?)
+}
 
-    Ok(serde_json::to_string(&result).map_err(err_to_str)?)
+// what scoring a play reads, and the invalid words it finds, kept by the room
+// as one list of tiles and where each word ends
+struct PlayScoring<'a, 'b> {
+    ps: &'a mut play_scorer::PlayScorer,
+    board_snapshot: &'a movegen::BoardSnapshot<'b, kwg::Node24, kwg::Node24>,
+    game_state: &'a game_state::GameState,
+    words: &'a mut Vec<u8>,
+    word_ends: &'a mut Vec<usize>,
+}
+
+// a scored play as ScoredPlay writes it, its words and play read where they
+// are held
+#[derive(serde::Serialize)]
+#[serde(tag = "result")]
+enum ScoredPlayRef<'a> {
+    #[serde(rename = "error")]
+    Error { error: String },
+    #[serde(rename = "scored")]
+    Scored {
+        canonical: bool,
+        valid: bool,
+        invalid_words: WordsJson<'a>,
+        #[serde(flatten)]
+        json_play_with_equity: kibitzer::JsonPlayRefWithEquity<'a>,
+    },
+}
+
+// words held as one list of tiles and each word's end, written as a list of
+// lists
+struct WordsJson<'a> {
+    words: &'a [u8],
+    ends: &'a [usize],
+}
+
+impl serde::Serialize for WordsJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let starts = std::iter::once(0).chain(self.ends.iter().copied());
+        serializer.collect_seq(
+            starts
+                .zip(self.ends)
+                .map(|(from, &to)| &self.words[from..to]),
+        )
+    }
+}
+
+// a request's plays, each scored as it is written, so that no list of results
+// is made
+struct ScoredPlaysJson<'a, 'b> {
+    plays: &'a [kibitzer::JsonPlay],
+    scoring: std::cell::RefCell<PlayScoring<'a, 'b>>,
+}
+
+impl serde::Serialize for ScoredPlaysJson<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.plays.len()))?;
+        let mut scoring = self.scoring.borrow_mut();
+        let PlayScoring {
+            ps,
+            board_snapshot,
+            game_state,
+            words,
+            word_ends,
+        } = &mut *scoring;
+        for json_play in self.plays {
+            let play = movegen::Play::from(json_play);
+            let adjusted_play = match ps.validate_play(board_snapshot, game_state, &play) {
+                Err(err) => {
+                    seq.serialize_element(&ScoredPlayRef::Error {
+                        error: err.to_string(),
+                    })?;
+                    continue;
+                }
+                Ok(adjusted_play) => adjusted_play,
+            };
+            let is_canonical = adjusted_play.is_none();
+            let mut canonical_play = adjusted_play.unwrap_or(play);
+            let recounted_score = ps.compute_score(board_snapshot, &canonical_play);
+            if let movegen::Play::Place { ref mut score, .. } = canonical_play {
+                *score = recounted_score;
+            }
+            let recounted_equity = ps.compute_equity(
+                board_snapshot,
+                game_state,
+                &canonical_play,
+                move_filter::LEAVE_SCALE_DENOM,
+                recounted_score,
+            );
+            words.clear();
+            word_ends.clear();
+            ps.find_invalid_words(board_snapshot, &canonical_play, |word| {
+                words.extend_from_slice(word);
+                word_ends.push(words.len());
+            });
+            seq.serialize_element(&ScoredPlayRef::Scored {
+                canonical: is_canonical,
+                valid: word_ends.is_empty(),
+                invalid_words: WordsJson {
+                    words,
+                    ends: word_ends,
+                },
+                json_play_with_equity: kibitzer::JsonPlayRefWithEquity {
+                    equity: recounted_equity as f32 / equity::SCALE as f32,
+                    play: (&canonical_play).into(),
+                },
+            })?;
+        }
+        seq.end()
+    }
 }
 
 // an analyzer's calls: the letters that fit every empty square beside a tile,
