@@ -1360,6 +1360,90 @@ fn do_infer_free(handle: u32) -> Result<(), String> {
         .ok_or_else(|| no_inference(handle))
 }
 
+// an inference as bytes, for infer_import in another instance: the count of
+// leaves and of their tiles in all (each a u32, little-endian), each leave's
+// length (a byte each), every leave's tiles one after another, and each
+// leave's weight (an f64 each, little-endian), all in the order held
+#[wasm_bindgen]
+pub fn infer_export(handle: u32) -> Result<Vec<u8>, JsValue> {
+    Ok(do_infer_export(handle)?)
+}
+
+fn do_infer_export(handle: u32) -> Result<Vec<u8>, String> {
+    let leaves = (INFERENCES.lock().map_err(err_to_str)?.live.get(&handle))
+        .cloned()
+        .ok_or_else(|| no_inference(handle))?;
+    let count = leaves.len();
+    let tiles = (0..count).map(|i| leaves.leave(i).len()).sum::<usize>();
+    let too_many = || "inference: too many leaves to export".to_string();
+    let header = [
+        u32::try_from(count).map_err(|_| too_many())?,
+        u32::try_from(tiles).map_err(|_| too_many())?,
+    ];
+    let len = (count.checked_mul(9))
+        .and_then(|len| len.checked_add(tiles)?.checked_add(8))
+        .ok_or_else(too_many)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| OUT_OF_MEMORY)?;
+    for n in header {
+        bytes.extend_from_slice(&n.to_le_bytes());
+    }
+    for i in 0..count {
+        let leave = leaves.leave(i);
+        bytes.push(u8::try_from(leave.len()).map_err(|_| too_many())?);
+    }
+    for i in 0..count {
+        bytes.extend_from_slice(leaves.leave(i));
+    }
+    for i in 0..count {
+        bytes.extend_from_slice(&leaves.weight(i).to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+// infer_export's bytes as a new inference here, its handle as infer's, freed
+// by infer_free; bytes that do not add up are refused
+#[wasm_bindgen]
+pub fn infer_import(bytes: &[u8]) -> Result<u32, JsValue> {
+    Ok(do_infer_import(bytes)?)
+}
+
+fn do_infer_import(bytes: &[u8]) -> Result<u32, String> {
+    let wrong = || "infer_import: the bytes do not add up".to_string();
+    let (head, rest) = bytes.split_at_checked(8).ok_or_else(wrong)?;
+    let (count, tiles) = head.split_at(4);
+    let count = u32::from_le_bytes(count.try_into().map_err(|_| wrong())?) as usize;
+    let tiles = u32::from_le_bytes(tiles.try_into().map_err(|_| wrong())?) as usize;
+    let (lens, rest) = rest.split_at_checked(count).ok_or_else(wrong)?;
+    let (all, weights) = rest.split_at_checked(tiles).ok_or_else(wrong)?;
+    if Some(weights.len()) != count.checked_mul(8)
+        || lens.iter().map(|&len| len as usize).sum::<usize>() != tiles
+    {
+        return Err(wrong());
+    }
+    let mut leaves = infer::PackedLeaves::new();
+    leaves
+        .try_reserve(count, tiles)
+        .map_err(|_| OUT_OF_MEMORY)?;
+    let mut start = 0;
+    for (&len, weight) in lens.iter().zip(weights.as_chunks::<8>().0) {
+        let end = start + len as usize;
+        let weight = f64::from_le_bytes(*weight);
+        leaves
+            .push(&all[start..end], weight)
+            .map_err(|e| format!("infer_import: {e}"))?;
+        start = end;
+    }
+    let mut inferences = INFERENCES.lock().map_err(err_to_str)?;
+    if inferences.live.try_reserve(1).is_err() {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    let handle = (inferences.made.checked_add(1)).ok_or("too many inferences made")?;
+    inferences.made = handle;
+    inferences.live.insert(handle, std::sync::Arc::new(leaves));
+    Ok(handle)
+}
+
 // sim_new: a position (rack, board, lexicon, leave, rules, each seat's score in
 // points, the seat to move, and the scoreless turns and the passes in a row so
 // far; each seat's rack size, by default the mover's rack with full racks for
@@ -7031,6 +7115,73 @@ mod tests {
         assert!(made("tiny-infer-fresh", ENGLISH) && !made("tiny-infer-again", ENGLISH));
         assert!(evict_klv("tiny-infer-fresh".into()).unwrap());
         assert!(!made("tiny-infer-fresh", ENGLISH));
+    }
+
+    // an inference exported and imported answers a sim as the original handle
+    // does, under classic and jumbled rules, and exports the same bytes again;
+    // bytes that do not add up, or carry a weight not finite, are refused
+    #[test]
+    fn an_imported_inference_sims_as_its_original() {
+        let _one = one_infer_test();
+        for (rules, jumbled) in [("CrosswordGame", false), ("WordSmog", true)] {
+            let lexicon = format!("tiny-infer-share-{rules}");
+            tiny_lexicon_for(&lexicon, jumbled);
+            let handle = report(
+                &do_infer(&format!(
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"{lexicon}","leave":"noleave","rules":"{rules}","play":{LATE_CATS},"fuzz":{}}}"#,
+                    infer_board(),
+                    infer::FUZZ
+                ))
+                .unwrap(),
+            )["handle"]
+                .as_u64()
+                .unwrap() as u32;
+            let bytes = do_infer_export(handle).unwrap();
+            let imported = do_infer_import(&bytes).unwrap();
+            assert_ne!(imported, handle);
+            assert_eq!(do_infer_export(imported).unwrap(), bytes, "{rules}");
+            let sim = |inferred: u32| {
+                let sim = do_sim_new(&format!(
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"{lexicon}","leave":"noleave","rules":"{rules}","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"seed":7,"plies":2,"inferred":{inferred}}}"#,
+                    infer_board()
+                ))
+                .unwrap();
+                do_sim_add(sim, &format!("[{PASS}]")).unwrap();
+                let answer = step(sim, r#"{"iterations":16,"prune":false}"#);
+                do_sim_free(sim).unwrap();
+                answer
+            };
+            assert_eq!(sim(imported), sim(handle), "{rules}");
+            do_infer_free(handle).unwrap();
+            do_infer_free(imported).unwrap();
+            assert!(bytes.len() > 8 + 9, "{rules}");
+            let mut long = bytes.clone();
+            long.push(0);
+            let mut lens = bytes.clone();
+            lens[8] = lens[8].wrapping_add(1);
+            let mut nan = bytes.clone();
+            let at = nan.len() - 8;
+            nan[at..].copy_from_slice(&f64::NAN.to_le_bytes());
+            for (wrong, said) in [
+                (&bytes[..0], "infer_import: the bytes"),
+                (&bytes[..7], "infer_import: the bytes"),
+                (&bytes[..bytes.len() - 1], "infer_import: the bytes"),
+                (&long[..], "infer_import: the bytes"),
+                (&lens[..], "infer_import: the bytes"),
+                (&nan[..], "infer_import: a leave's weight"),
+            ] {
+                let err = do_infer_import(wrong).unwrap_err();
+                assert!(err.starts_with(said), "{rules}: {err}");
+            }
+        }
+        let empty = do_infer_import(&[0; 8]).unwrap();
+        assert_eq!(do_infer_export(empty).unwrap(), [0; 8]);
+        do_infer_free(empty).unwrap();
+        assert!(
+            do_infer_export(empty)
+                .unwrap_err()
+                .starts_with("inference ")
+        );
     }
 
     // with the bag empty there is nothing to infer: the mover holds every tile
