@@ -295,6 +295,7 @@ struct CachedRules {
     analyze_rooms: std::sync::Mutex<Vec<AnalyzeRoom>>,
     play_score_rooms: std::sync::Mutex<Vec<PlayScoreRoom>>,
     answers: std::sync::Mutex<Vec<Vec<u8>>>,
+    threats_rooms: std::sync::Mutex<Vec<ThreatsRoom>>,
 }
 
 impl std::ops::Deref for CachedRules {
@@ -314,6 +315,7 @@ impl CachedRules {
             analyze_rooms: Default::default(),
             play_score_rooms: Default::default(),
             answers: Default::default(),
+            threats_rooms: Default::default(),
         })
     }
 
@@ -2579,6 +2581,16 @@ impl Interned {
         self.slots.fill(0);
     }
 
+    // emptied, with no slots, each list's room let go
+    fn shrink(&mut self) {
+        self.bytes.clear();
+        self.bytes.shrink_to_fit();
+        self.ends.clear();
+        self.ends.shrink_to_fit();
+        self.slots.clear();
+        self.slots.shrink_to_fit();
+    }
+
     // the slot holding key's number, or the empty one it would take
     fn slot(&self, key: &[u8]) -> usize {
         let mask = self.slots.len() - 1;
@@ -2897,6 +2909,15 @@ impl ThreatLane {
         self.best.clear();
     }
 
+    // as clear makes it, each list's room let go
+    fn shrink(&mut self) {
+        self.clear();
+        self.slot.shrink_to_fit();
+        self.ids.shrink_to_fit();
+        self.best.shrink_to_fit();
+    }
+
+    // the lane's reach, a list of its own that placing lets go as it goes;
     // none on a refused growth
     fn drained(
         &mut self,
@@ -2989,6 +3010,13 @@ impl ThreatSums {
         (self.expected_best, self.bingo) = (0.0, 0.0);
     }
 
+    // as empty makes them, the room of the multisets' list let go, the
+    // squares' kept
+    fn shrink(&mut self) {
+        self.empty();
+        self.holds.shrink_to_fit();
+    }
+
     // the sums of nothing, of these many multisets and squares, in the room
     // held; none on a refused growth
     fn refill(&mut self, multisets: usize, squares: usize) -> Option<()> {
@@ -3041,6 +3069,16 @@ struct ThreatWeigher {
 }
 
 impl ThreatWeigher {
+    // emptied, its lists (each a board's squares or a rack's tiles) kept
+    fn shrink(&mut self) {
+        self.rack_square.clear();
+        self.touched.clear();
+        self.distinct.clear();
+        self.taken.clear();
+        self.sub.clear();
+        self.stamp = 0;
+    }
+
     // the rack (its tiles in tile order) weighed by weight into sums
     fn weigh(
         &mut self,
@@ -3153,14 +3191,64 @@ struct Threats {
     kwg: std::sync::Arc<CachedKwg>,
     game_config: std::sync::Arc<CachedRules>,
     pool: Vec<u8>,
-    move_generator: Movegen,
+    available_tally: Vec<u8>, // the tiles unseen, as the question read them
+    deal: ThreatDeal,
+    move_generator: Lent<std::sync::Arc<CachedRules>>,
 }
 
-// a threats question's buffers as it is made: they live with the question
-// alone, reused from step to step, and are let go with it (a one-shot threats
-// as it returns), so that no rules hold a large question's memory for good
+// a question let go gives its rules its room (ThreatsRoom) and its generator,
+// whose walk's buffers are let go alike (shrink_walk_buffers)
+impl Drop for Threats {
+    fn drop(&mut self) {
+        self.move_generator.shrink_walk_buffers();
+        if let Some(walk) = self.walk.take() {
+            self.retire_top(walk.top);
+        }
+        let kept = std::mem::take(&mut self.kept);
+        self.retire_list(kept);
+        let mut room = ThreatsRoom {
+            move_generator: self.move_generator.movegen.take(),
+            available_tally: std::mem::take(&mut self.available_tally),
+            board_tiles: std::mem::take(&mut self.board_tiles),
+            deal: std::mem::take(&mut self.deal),
+            racks: std::mem::take(&mut self.racks),
+            rack_tiles: std::mem::take(&mut self.rack_tiles),
+            pool: std::mem::take(&mut self.pool),
+            keys: std::mem::take(&mut self.keys),
+            key: std::mem::take(&mut self.key),
+            best: std::mem::take(&mut self.best),
+            found: std::mem::take(&mut self.found),
+            found_list: std::mem::take(&mut self.found_list),
+            order: std::mem::take(&mut self.order),
+            lists: std::mem::take(&mut self.lists),
+            lane: std::mem::take(&mut self.lane),
+            lanes_reach: std::mem::take(&mut self.lanes_reach),
+            reach: std::mem::take(&mut self.reach),
+            reach_from: std::mem::take(&mut self.reach_from),
+            square_best: std::mem::take(&mut self.square_best),
+            exact_sums: std::mem::take(&mut self.exact_sums),
+            drawn_sums: std::mem::take(&mut self.drawn.0),
+            spare_sums: std::mem::take(&mut self.spare_sums),
+            upto: std::mem::take(&mut self.upto),
+            weigher: std::mem::take(&mut self.weigher),
+        };
+        room.shrink();
+        keep_threats_room(&self.game_config, room);
+    }
+}
+
+// a threats question's buffers as it is made: they live with the question,
+// reused from step to step, and are given back to its rules as it is let go
+// (a one-shot threats as it returns): the lists sized by the board, rack, or
+// tiles are kept as they are, and the room of those that grow with what the
+// question walks or deals is let go (ThreatsRoom::shrink), so that no rules
+// hold a large question's memory for good. One room, with its rules'
+// generator, is kept across every rules (threats_room, keep_threats_room): a
+// question for other rules takes it, letting the generator go, and grows its
+// lists to its own board and rack.
 #[derive(Default)]
 struct ThreatsRoom {
+    move_generator: Option<Movegen>,
     available_tally: Vec<u8>,
     board_tiles: Vec<u8>,
     deal: ThreatDeal,
@@ -3197,6 +3285,65 @@ struct ThreatDeal {
     chances: Vec<f64>,
 }
 
+impl ThreatDeal {
+    // emptied, the room of the racks' chances let go, the tiles' lists kept
+    fn shrink(&mut self) {
+        for list in [&mut self.left, &mut self.held, &mut self.rack] {
+            list.clear();
+        }
+        self.rest.clear();
+        self.chances.clear();
+        self.chances.shrink_to_fit();
+    }
+}
+
+impl ThreatsRoom {
+    // emptied, the lists sized by the board, rack, or tiles kept, the room of
+    // the others let go
+    fn shrink(&mut self) {
+        for list in [
+            &mut self.available_tally,
+            &mut self.board_tiles,
+            &mut self.pool,
+            &mut self.key,
+        ] {
+            list.clear();
+        }
+        self.deal.shrink();
+        self.racks.clear();
+        self.racks.shrink_to_fit();
+        self.rack_tiles.shrink();
+        self.keys.shrink();
+        self.best.clear();
+        self.best.shrink_to_fit();
+        self.square_best.clear();
+        self.found.clear();
+        self.found.shrink_to_fit();
+        self.found_list.clear();
+        self.found_list.shrink_to_fit();
+        self.order.clear();
+        self.order.shrink_to_fit();
+        self.lists.shrink();
+        self.lane.shrink();
+        self.lanes_reach.clear();
+        self.lanes_reach.shrink_to_fit();
+        self.reach.clear();
+        self.reach.shrink_to_fit();
+        self.reach_from.clear();
+        self.reach_from.shrink_to_fit();
+        for sums in [
+            &mut self.exact_sums,
+            &mut self.drawn_sums,
+            &mut self.spare_sums,
+        ] {
+            sums.shrink();
+        }
+        self.upto.clear();
+        self.upto.shrink_to_fit();
+        self.weigher.shrink();
+    }
+}
+
 // the threats made, by handle; a handle is never used twice
 #[derive(Default)]
 struct ThreatsMade {
@@ -3228,6 +3375,37 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
     threats_with(req, kwg, game_config)
 }
 
+// the one threats room kept across every rules, its own rules' if they keep
+// it, else another's, whose generator (of those rules) is let go; a new one if
+// none is kept
+fn threats_room(rules: &CachedRules) -> Result<ThreatsRoom, String> {
+    if let Some(room) = rules.threats_rooms.lock().map_err(err_to_str)?.pop() {
+        return Ok(room);
+    }
+    for other in CACHED_GAME_CONFIG.read().map_err(err_to_str)?.values() {
+        if let Some(mut room) = other.threats_rooms.lock().map_err(err_to_str)?.pop() {
+            room.move_generator = None;
+            return Ok(room);
+        }
+    }
+    Ok(ThreatsRoom::default())
+}
+
+// a threats room given back to its rules, kept there only when they keep none,
+// and any other rules' room let go, so that one room is kept across every rules
+fn keep_threats_room(rules: &std::sync::Arc<CachedRules>, room: ThreatsRoom) {
+    if let Ok(all) = CACHED_GAME_CONFIG.read() {
+        for other in all.values() {
+            if !std::sync::Arc::ptr_eq(other, rules)
+                && let Ok(mut rooms) = other.threats_rooms.lock()
+            {
+                rooms.clear();
+            }
+        }
+    }
+    keep_room(&rules.threats_rooms, room);
+}
+
 // threats_made's question, of these tables
 fn threats_with(
     req: ThreatsRequest,
@@ -3247,12 +3425,19 @@ fn threats_with(
             req.rack.len()
         ));
     }
-    let mut room = ThreatsRoom::default();
+    let mut room = threats_room(&game_config)?;
     let mut kibitzer = kibitzer::Kibitzer {
         available_tally: std::mem::take(&mut room.available_tally),
         board_tiles: std::mem::take(&mut room.board_tiles),
     };
-    threats_in_room(req, kwg, game_config, &mut kibitzer, &mut room)
+    let made = threats_in_room(req, kwg, game_config.clone(), &mut kibitzer, &mut room);
+    if made.is_err() {
+        // a question refused gives back the room it took, cut as one let go
+        (room.available_tally, room.board_tiles) = (kibitzer.available_tally, kibitzer.board_tiles);
+        room.shrink();
+        keep_threats_room(&game_config, room);
+    }
+    made
 }
 
 // threats_made's question, made in the room it took, whose buffers it only
@@ -3368,7 +3553,16 @@ fn threats_in_room(
         })
     });
 
-    let move_generator = game_config.own_generator()?;
+    let move_generator = Lent {
+        rules: game_config.clone(),
+        movegen: Some(match room.move_generator.take() {
+            Some(mut movegen) => {
+                movegen.reset_for_another_kwg();
+                movegen
+            }
+            None => game_config.own_generator()?,
+        }),
+    };
     let pool = &mut room.pool;
     pool.clear();
     pool.extend(
@@ -3446,6 +3640,8 @@ fn threats_in_room(
         kwg,
         game_config,
         pool: room.pool,
+        available_tally: std::mem::take(&mut kibitzer.available_tally),
+        deal: room.deal,
         move_generator,
     })
 }
@@ -3643,7 +3839,7 @@ impl Threats {
                 if !self.all_listed {
                     // every lane walked: the pool lists kept from lane to lane
                     // are let go before the reach is built
-                    self.lists = Default::default();
+                    self.lists.shrink();
                     let keys = self.keys.len();
                     if !self.reach_placing {
                         if self.reach_from.is_empty() {
@@ -3693,7 +3889,8 @@ impl Threats {
                         // ended, and the lanes' reach is let go
                         self.reach_from.copy_within(0..keys, 1);
                         self.reach_from[0] = 0;
-                        self.lanes_reach = Vec::new();
+                        self.lanes_reach.clear();
+                        self.lanes_reach.shrink_to_fit();
                         self.all_listed = true;
                     }
                     if !self.all_listed {
