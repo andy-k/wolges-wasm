@@ -2239,7 +2239,7 @@ struct ThreatPlays<'a> {
     through: Option<usize>,
     cols: usize,
     most: usize,
-    keys: &'a [Box<[u8]>],
+    keys: &'a Interned,
     holds: ThreatTotal<'a>,
 }
 
@@ -2256,7 +2256,7 @@ impl serde::Serialize for ThreatPlays<'_> {
                 })
                 .take(self.most)
                 .map(|play| ThreatPlay {
-                    tiles: self.keys[play.id as usize].to_vec(),
+                    tiles: self.keys.get(play.id as usize).to_vec(),
                     chance: self.holds.at(play.id as usize),
                     play: (&movegen::Play::Place {
                         down: play.down,
@@ -2271,11 +2271,73 @@ impl serde::Serialize for ThreatPlays<'_> {
     }
 }
 
-fn try_boxed(bytes: &[u8]) -> Option<Box<[u8]>> {
-    let mut boxed = Vec::new();
-    boxed.try_reserve_exact(bytes.len()).ok()?;
-    boxed.extend_from_slice(bytes);
-    Some(boxed.into_boxed_slice())
+// byte strings, each held once, end to end in one buffer and numbered as they
+// come, found by their bytes through an open-addressed table of their numbers,
+// so that no string is a heap object of its own; cleared, it keeps its room
+#[derive(Default)]
+struct Interned {
+    bytes: Vec<u8>,
+    ends: Vec<usize>, // where each string's bytes end
+    slots: Vec<u32>,  // a string's number + 1 (0: none), a power of 2 of them
+}
+
+impl Interned {
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn get(&self, id: usize) -> &[u8] {
+        let start = id.checked_sub(1).map_or(0, |before| self.ends[before]);
+        &self.bytes[start..self.ends[id]]
+    }
+
+    // the slot holding key's number, or the empty one it would take
+    fn slot(&self, key: &[u8]) -> usize {
+        let mask = self.slots.len() - 1;
+        let hash = std::hash::BuildHasher::hash_one(&fash::MyHasherDefault::default(), key);
+        let mut at = hash as usize & mask;
+        loop {
+            match self.slots[at] {
+                0 => return at,
+                n if self.get(n as usize - 1) == key => return at,
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    fn find(&self, key: &[u8]) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        self.slots[self.slot(key)].checked_sub(1)
+    }
+
+    // key's number, and whether it is new; none on a refused growth. The
+    // table is regrown before it is more than half full.
+    fn add(&mut self, key: &[u8]) -> Option<(u32, bool)> {
+        if let Some(id) = self.find(key) {
+            return Some((id, false));
+        }
+        if 2 * (self.len() + 1) > self.slots.len() {
+            let mut slots = Vec::new();
+            let len = (2 * (self.len() + 1)).next_power_of_two();
+            slots.try_reserve_exact(len).ok()?;
+            slots.resize(len, 0);
+            for n in std::mem::replace(&mut self.slots, slots) {
+                if n != 0 {
+                    let at = self.slot(self.get(n as usize - 1));
+                    self.slots[at] = n;
+                }
+            }
+        }
+        self.bytes.try_reserve(key.len()).ok()?;
+        self.ends.try_reserve(1).ok()?;
+        let at = self.slot(key);
+        self.bytes.extend_from_slice(key);
+        self.ends.push(self.bytes.len());
+        self.slots[at] = self.ends.len() as u32;
+        Some((self.ends.len() as u32 - 1, true))
+    }
 }
 
 struct TryWriter(Vec<u8>);
@@ -2360,7 +2422,7 @@ struct ThreatFound {
     down: bool,
     lane: i8,
     idx: i8,
-    word: Box<[u8]>,
+    word: Vec<u8>,
     score: i32,
     id: u32,
 }
@@ -2419,29 +2481,32 @@ impl ThreatTop {
         score: i32,
         id: u32,
     ) -> bool {
-        let found = |word| ThreatFound {
-            down,
-            lane,
-            idx,
-            word,
-            score,
-            id,
-        };
         if self.heap.len() < self.most {
-            if self.heap.try_reserve(1).is_err() {
+            let mut held = Vec::new();
+            if self.heap.try_reserve(1).is_err() || held.try_reserve_exact(word.len()).is_err() {
                 return false;
             }
-            let Some(word) = try_boxed(word) else {
-                return false;
-            };
-            self.heap.push(found(word));
+            held.extend_from_slice(word);
+            self.heap.push(ThreatFound {
+                down,
+                lane,
+                idx,
+                word: held,
+                score,
+                id,
+            });
         } else if let Some(mut worst) = self.heap.peek_mut()
             && (std::cmp::Reverse(score), down, lane, idx, word) < worst.rank()
         {
-            let Some(word) = try_boxed(word) else {
+            // the play it replaces gives up its word's room
+            let more = word.len().saturating_sub(worst.word.len());
+            if worst.word.try_reserve(more).is_err() {
                 return false;
-            };
-            *worst = found(word);
+            }
+            worst.word.clear();
+            worst.word.extend_from_slice(word);
+            (worst.down, worst.lane, worst.idx) = (down, lane, idx);
+            (worst.score, worst.id) = (score, id);
         }
         true
     }
@@ -2611,7 +2676,7 @@ impl ThreatTotal<'_> {
 // what weighing a rack reads: each multiset's id and best score, each
 // multiset's squares with its best score through each, and each square's best
 struct ThreatTables<'a> {
-    ids: &'a fash::MyHashMap<Box<[u8]>, u32>,
+    keys: &'a Interned,
     best: &'a [i32],
     reach: &'a [(u16, i32)],
     reach_from: &'a [usize],
@@ -2660,7 +2725,7 @@ impl ThreatWeigher {
             for (&(tile, _), &n) in self.distinct.iter().zip(&self.taken) {
                 self.sub.extend(std::iter::repeat_n(tile, n as usize));
             }
-            let Some(&id) = tables.ids.get(&self.sub[..]) else {
+            let Some(id) = tables.keys.find(&self.sub) else {
                 continue;
             };
             let id = id as usize;
@@ -2699,8 +2764,7 @@ impl ThreatWeigher {
 // step at a time: the racks counted exactly so far (the likeliest first), their
 // sums and what an answer reads
 struct Threats {
-    ids: fash::MyHashMap<Box<[u8]>, u32>,
-    keys: Vec<Box<[u8]>>,
+    keys: Interned, // each multiset's tiles, by its id
     best: Vec<i32>,
     kept: Vec<ThreatFound>,
     walk: Option<ThreatWalk>,
@@ -2724,7 +2788,8 @@ struct Threats {
     cols: usize,
     rack_size: usize,
     opponent_rack: usize,
-    racks: Vec<(Box<[u8]>, f64)>,
+    racks: Vec<(u32, f64)>, // each rack's number in rack_tiles, its chance
+    rack_tiles: Interned,
     counted: usize,
     covered: f64,
     exact_sums: ThreatSums,
@@ -2818,7 +2883,8 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
 
     // the racks the opponent may hold, each its chance: a leave's chance, and
     // the rest of the rack dealt from the tiles unseen but the leave's
-    let mut racks = fash::MyHashMap::<Box<[u8]>, f64>::default();
+    let mut rack_tiles = Interned::default();
+    let mut chances = Vec::new();
     let mut left = vec![0u8; unseen.len()];
     let mut rest = vec![0usize; unseen.len() + 1];
     let mut held = Vec::new();
@@ -2852,27 +2918,31 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
                 rack.extend_from_slice(leave);
                 rack.extend_from_slice(dealt);
                 rack.sort_unstable();
-                if let Some(chance) = racks.get_mut(&rack[..]) {
-                    *chance += ways;
+                if chances.try_reserve(1).is_err() {
+                    refused = true;
                     return;
                 }
-                match try_boxed(&rack) {
-                    Some(key) if racks.try_reserve(1).is_ok() => {
-                        racks.insert(key, ways);
-                    }
-                    _ => refused = true,
+                match rack_tiles.add(&rack) {
+                    Some((id, false)) => chances[id as usize] += ways,
+                    Some((_, true)) => chances.push(ways),
+                    None => refused = true,
                 }
             },
         );
     }
-    let mut listed = Vec::new();
-    if refused || listed.try_reserve_exact(racks.len()).is_err() {
+    let mut racks = Vec::new();
+    if refused || racks.try_reserve_exact(chances.len()).is_err() {
         return Err(OUT_OF_MEMORY.into());
     }
-    listed.extend(racks);
+    racks.extend((0..).zip(chances));
     // the likeliest racks first, so a time cut weighs the most of them
-    let mut racks = listed;
-    racks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    racks.sort_unstable_by(|a, b| {
+        (b.1.total_cmp(&a.1)).then_with(|| {
+            rack_tiles
+                .get(a.0 as usize)
+                .cmp(rack_tiles.get(b.0 as usize))
+        })
+    });
 
     let move_generator = CachedRules::lend_held(&game_config)?;
     let pool = (0u8..)
@@ -2895,8 +2965,7 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
             sub: Vec::new(),
             stamp: 0,
         },
-        ids: Default::default(),
-        keys: Vec::new(),
+        keys: Default::default(),
         best: Vec::new(),
         kept: Vec::new(),
         walk: None,
@@ -2919,6 +2988,7 @@ fn threats_made(req: ThreatsRequest) -> Result<Threats, String> {
         rack_size,
         opponent_rack,
         racks,
+        rack_tiles,
         counted: 0,
         covered: 0.0,
         rng: rand::rngs::ChaCha20Rng::seed_from_u64(seed),
@@ -2971,7 +3041,6 @@ impl Threats {
         );
         let aggregate = !self.all_listed && matches!(pass, ThreatPass::Lanes(..));
         let offer = !(jumbled && aggregate);
-        let ids = &mut self.ids;
         let keys = &mut self.keys;
         let best = &mut self.best;
         let lane_reach = &mut self.lane;
@@ -2986,31 +3055,24 @@ impl Threats {
                 return;
             }
             threat_key(word, &mut key);
-            let id = match ids.get(&key[..]) {
-                Some(&id) => {
+            if best.try_reserve(1).is_err() {
+                held = false;
+                return;
+            }
+            let id = match keys.add(&key) {
+                Some((id, false)) => {
                     if aggregate {
                         best[id as usize] = best[id as usize].max(score);
                     }
                     id
                 }
-                None => {
-                    let id = keys.len() as u32;
-                    let (Some(id_key), Some(listed_key)) = (try_boxed(&key), try_boxed(&key))
-                    else {
-                        held = false;
-                        return;
-                    };
-                    if ids.try_reserve(1).is_err()
-                        || keys.try_reserve(1).is_err()
-                        || best.try_reserve(1).is_err()
-                    {
-                        held = false;
-                        return;
-                    }
-                    ids.insert(id_key, id);
-                    keys.push(listed_key);
+                Some((id, true)) => {
                     best.push(if aggregate { score } else { i32::MIN });
                     id
+                }
+                None => {
+                    held = false;
+                    return;
                 }
             };
             if aggregate {
@@ -3281,7 +3343,7 @@ impl Threats {
         let mut refused = false;
         if self.all_listed {
             let tables = ThreatTables {
-                ids: &self.ids,
+                keys: &self.keys,
                 best: &self.best,
                 reach: &self.reach,
                 reach_from: &self.reach_from,
@@ -3294,10 +3356,11 @@ impl Threats {
                 if r.is_multiple_of(16) && r > 0 && half.is_some_and(|half| now() >= half) {
                     break;
                 }
-                let (rack, chance) = &self.racks[self.counted];
+                let (rack, chance) = self.racks[self.counted];
+                let rack = self.rack_tiles.get(rack as usize);
                 self.weigher
-                    .weigh(&tables, rack, *chance, &mut self.exact_sums);
-                self.covered += *chance;
+                    .weigh(&tables, rack, chance, &mut self.exact_sums);
+                self.covered += chance;
                 self.counted += 1;
             }
             let exact = self.counted == self.racks.len();
@@ -3327,7 +3390,7 @@ impl Threats {
                 {
                     let at = self.rng.random::<f64>() * rest_chance;
                     let i = (upto.partition_point(|&upto| upto <= at)).min(upto.len() - 1);
-                    let rack = &self.racks[self.counted + i].0;
+                    let rack = self.rack_tiles.get(self.racks[self.counted + i].0 as usize);
                     self.weigher.weigh(&tables, rack, 1.0, &mut drawn_sums);
                     samples += 1;
                 }
@@ -9032,7 +9095,7 @@ mod tests {
                 through: None,
                 cols: 15,
                 most: 0,
-                keys: &[],
+                keys: &Interned::default(),
                 holds: Default::default(),
             },
             squares: Vec::new(),
