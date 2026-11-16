@@ -3157,6 +3157,9 @@ impl Threats {
             }
             if walk.lane == passes {
                 if !self.all_listed {
+                    // every lane walked: the pool lists kept from lane to lane
+                    // are let go before the reach is built
+                    self.lists = Default::default();
                     let keys = self.keys.len();
                     if self.reach_next.is_empty() {
                         if self.reach_from.is_empty() {
@@ -3202,6 +3205,7 @@ impl Threats {
                             self.walk = Some(walk);
                             break;
                         };
+                        // placed, the lanes' reach is let go
                         self.lanes_reach = Vec::new();
                         self.reach_next = Vec::new();
                         self.exact_sums = exact_sums;
@@ -3280,7 +3284,9 @@ impl Threats {
                 walk.from = 0;
                 walk.seen = 0;
                 walk.size = 1;
-                self.lists = Default::default();
+                // a lane's lists cleared, their room kept for the next: held
+                // end to end, that room is the largest one lane's lists
+                self.lists.clear();
             } else {
                 walk.from = stopped.unwrap_or(to);
             }
