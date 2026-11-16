@@ -4046,7 +4046,7 @@ struct EndgameAnswer {
 // two or more's), and the last answer
 struct Endgame {
     game_config: std::sync::Arc<game_config::GameConfig>,
-    kwg: std::sync::Arc<Kwg>,
+    kwg: std::sync::Arc<kwg::RunGraph<kwg::Node24>>, // with its run letters, found as it was made
     arm_tables: std::sync::Arc<anagrams::ArmTables>,
     lexicon: String, // the lexicon its graph was pruned from
     rules: String,   // and the rules it was asked of
@@ -4132,8 +4132,9 @@ impl Endgame {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &self.game_config,
-                &self.kwg,
+                self.kwg.kwg(),
                 &self.arm_tables,
+                self.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
             )
             .map_err(err_to_str)?;
@@ -4278,8 +4279,9 @@ impl Endgame {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &self.game_config,
-                &self.kwg,
+                self.kwg.kwg(),
                 &self.arm_tables,
+                self.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
             )
             .map_err(err_to_str)?;
@@ -4488,8 +4490,9 @@ impl Endgame {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &self.game_config,
-                &self.kwg,
+                self.kwg.kwg(),
                 &self.arm_tables,
+                self.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
             )
             .map_err(err_to_str)?;
@@ -4749,20 +4752,24 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             ))
         }
     };
+    // a graph pruned here, with its run letters
+    let pruned = |game_config: &game_config::GameConfig| -> Result<_, String> {
+        let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg.kwg)?;
+        Ok(std::sync::Arc::new(kwg::RunGraph::new(pruned)))
+    };
     let (game_config, kwg, arm_tables, table) = match warm {
         Some((from, game_config, arm_tables)) => {
-            let kwg =
-                std::sync::Arc::new(pruned_kwg(&game_config, &kibitzer.board_tiles, &kwg.kwg)?);
+            let kwg = pruned(&game_config)?;
             let table = (ENDGAMES.lock().map_err(err_to_str)?.live.get_mut(&from))
                 .ok_or_else(|| format!("warm_from: {}", no_endgame(from)))?
                 .table
                 .take()
-                .map(|table| table.for_another_graph(&*kwg));
+                .map(|table| table.for_another_graph(kwg.kwg()));
             (game_config, kwg, arm_tables, table)
         }
         None => (
             std::sync::Arc::clone(&game_config),
-            std::sync::Arc::new(pruned_kwg(&game_config, &kibitzer.board_tiles, &kwg.kwg)?),
+            pruned(&game_config)?,
             std::sync::Arc::new(anagrams::ArmTables::None),
             None,
         ),
@@ -7053,6 +7060,7 @@ mod tests {
                 &game_config,
                 &kwg.kwg,
                 &arm_tables,
+                kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
             .unwrap();
@@ -7116,6 +7124,7 @@ mod tests {
                 &game_config,
                 &kwg.kwg,
                 &arm_tables,
+                kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
             .unwrap();
@@ -7568,6 +7577,7 @@ mod tests {
                 &game_config,
                 &kwg.kwg,
                 &arm_tables,
+                kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
             .unwrap();
