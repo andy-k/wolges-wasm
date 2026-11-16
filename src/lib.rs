@@ -4922,7 +4922,7 @@ struct EndgameAnswer {
 // two or more's), and the last answer
 struct Endgame {
     game_config: std::sync::Arc<CachedRules>,
-    kwg: std::sync::Arc<kwg::RunGraph<kwg::Node24>>, // with its run letters, found as it was made
+    kwg: std::sync::Arc<EndgameGraph>, // with its run letters, found as it was made
     arm_tables: std::sync::Arc<anagrams::ArmTables>,
     lexicon: String, // the lexicon its graph was pruned from
     rules: String,   // and the rules it was asked of
@@ -4993,6 +4993,44 @@ fn points(equity: equity::Equity) -> f64 {
     equity.raw() as f64 / equity::SCALE as f64
 }
 
+// an endgame's graph: the one pruned for it, with its run letters, or, where a
+// cap had not room for the prune, its lexicon's own, held as the lexicon is
+// and with none, which gives the same answers, only slower
+enum EndgameGraph {
+    Pruned(kwg::RunGraph<kwg::Node24>),
+    Lexicon(std::sync::Arc<CachedKwg>, kwg::RunBits),
+}
+
+impl EndgameGraph {
+    fn of_lexicon(lexicon: std::sync::Arc<CachedKwg>) -> Self {
+        let none = lexicon.kwg.run_bits_if(|_| false);
+        Self::Lexicon(lexicon, none)
+    }
+
+    fn kwg(&self) -> &Kwg {
+        match self {
+            Self::Pruned(graph) => graph.kwg(),
+            Self::Lexicon(lexicon, _) => &lexicon.kwg,
+        }
+    }
+
+    fn run_letters(&self) -> Result<kwg::RunLetters<'_>, String> {
+        match self {
+            Self::Pruned(graph) => Ok(graph.run_letters()),
+            Self::Lexicon(lexicon, none) => none.of(&lexicon.kwg).map_err(err_to_str),
+        }
+    }
+
+    // the pruned graph's nodes, for the next prune; a lexicon's own has none
+    // to give
+    fn into_kwg(self) -> Option<Kwg> {
+        match self {
+            Self::Pruned(graph) => Some(graph.into_kwg()),
+            Self::Lexicon(..) => None,
+        }
+    }
+}
+
 // a step's solver: the one earlier steps kept, else one made
 macro_rules! step_solver {
     ($endgame: expr) => {
@@ -5001,14 +5039,14 @@ macro_rules! step_solver {
                 &$endgame.game_config,
                 $endgame.kwg.kwg(),
                 &$endgame.arm_tables,
-                $endgame.kwg.run_letters(),
+                $endgame.kwg.run_letters()?,
                 kept,
             ),
             None => endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &$endgame.game_config,
                 $endgame.kwg.kwg(),
                 &$endgame.arm_tables,
-                $endgame.kwg.run_letters(),
+                $endgame.kwg.run_letters()?,
                 $endgame.game_config.own_generator()?,
             ),
         }
@@ -5468,10 +5506,10 @@ fn peg_play(play: &endgame::PegMove) -> kibitzer::JsonPlay {
 // a new endgame's handle
 #[wasm_bindgen]
 pub fn endgame_new(req_str: String) -> Result<u32, JsValue> {
-    Ok(do_endgame_new(&req_str)?)
+    Ok(do_endgame_new(&req_str, page_memory)?)
 }
 
-fn do_endgame_new(req_str: &str) -> Result<u32, String> {
+fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     let req = serde_json::from_str::<EndgameNewRequest>(req_str).map_err(err_to_str)?;
     let kwg = (CACHED_KWG
         .read()
@@ -5531,6 +5569,13 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     if req.max_memory_mb == Some(0) {
         return Err("max_memory_mb: at least 1, found 0".into());
     }
+    // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
+    // shifted would wrap to none)
+    let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
+    let limit = max_memory.map(|bytes| endgame::MemoryLimit {
+        bytes,
+        held: memory,
+    });
 
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
@@ -5644,10 +5689,21 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             ))
         }
     };
-    // a graph pruned here, with its run letters
+    // a graph pruned here, with its run letters; under a cap, pruned within
+    // it, and where it has not room for the prune the lexicon's own graph,
+    // whatever the prune took let go (the prune is for speed alone)
     let pruned = |game_config: &CachedRules| -> Result<_, String> {
-        let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg)?;
-        Ok(std::sync::Arc::new(kwg::RunGraph::new(pruned)))
+        let Some(memory) = &limit else {
+            let pruned = pruned_kwg(game_config, &kibitzer.board_tiles, &kwg)?;
+            return Ok(std::sync::Arc::new(EndgameGraph::Pruned(
+                kwg::RunGraph::new(pruned),
+            )));
+        };
+        let pruned = pruned_kwg_within(game_config, &kibitzer.board_tiles, &kwg, memory)?;
+        Ok(std::sync::Arc::new(match pruned {
+            Some(pruned) => EndgameGraph::Pruned(pruned),
+            None => EndgameGraph::of_lexicon(std::sync::Arc::clone(&kwg)),
+        }))
     };
     let (game_config, kwg, arm_tables, table) = match warm {
         Some((from, game_config, arm_tables)) => {
@@ -5666,9 +5722,6 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             None,
         ),
     };
-    // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
-    // shifted would wrap to none)
-    let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
     let reserve = (req.reserve_mb.unwrap_or(0).saturating_mul(1 << 20))
         .min(max_memory.map_or(usize::MAX, |bytes| bytes / 2));
     let endgame = Endgame {
@@ -5856,11 +5909,12 @@ fn do_endgame_free(handle: u32) -> Result<(), String> {
     // its graph's nodes, when nothing else holds them, go to its lexicon's
     // pruner, for the next graph pruned from it
     if let Some(graph) = std::sync::Arc::into_inner(endgame.kwg)
+        && let Some(kwg) = graph.into_kwg()
         && let Some(lexicon) = (CACHED_KWG.read().map_err(err_to_str)?)
             .get(&endgame.lexicon)
             .cloned()
     {
-        lexicon.pruner.lock().map_err(err_to_str)?.spare = Some(graph.into_kwg());
+        lexicon.pruner.lock().map_err(err_to_str)?.spare = Some(kwg);
     }
     Ok(())
 }
@@ -5958,6 +6012,64 @@ fn pruned_kwg(
     let mut graph = spare.unwrap_or_else(|| kwg::Kwg(Vec::new()));
     prune_into(game_config, board_tiles, lexicon, &mut graph)?;
     Ok(graph)
+}
+
+// pruned_kwg's graph with its run letters, each growth of the prune, the
+// build, the graph, and the run letters taken only within memory: none where
+// it has not room for the prune or the graph, and no run letters where it has
+// not room for them (whatever it took let go). Nothing of the lexicon's pruner
+// is used, and nothing of the prune is kept past it
+fn pruned_kwg_within(
+    game_config: &CachedRules,
+    board_tiles: &[u8],
+    lexicon: &CachedKwg,
+    memory: &endgame::MemoryLimit,
+) -> Result<Option<kwg::RunGraph<kwg::Node24>>, String> {
+    let empty_klv = Klv::empty().map_err(err_to_str)?;
+    let mut words = Vec::<bites::Bites>::new();
+    let mut refused = false;
+    let pruned = game_config.lend()?.gen_remaining_words_within(
+        &movegen::BoardSnapshot {
+            board_tiles,
+            game_config,
+            kwg: &lexicon.kwg,
+            anagrams: None,
+            rack_lengths: None,
+            klv: &empty_klv,
+        },
+        Some(memory),
+        |word: &[u8]| {
+            // a word too long to be held in its Bites takes its tiles' bytes
+            // too
+            refused = refused
+                || endgame::room_in(Some(memory), &mut words, 1).is_err()
+                || (word.len() >= std::mem::size_of::<bites::Bites>()
+                    && !memory.has_room(word.len()));
+            if !refused {
+                words.push(word.into());
+            }
+        },
+    );
+    if pruned.is_err() || refused {
+        return Ok(None);
+    }
+    let mut builder = build::Builder::default();
+    let bytes = match builder.build_for_game_within(game_config, &words, Some(memory)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.is::<endgame::Refused>() => return Ok(None),
+        Err(e) => return Err(err_to_str(e)),
+    };
+    // as many nodes as the bytes hold, and room for an empty lexicon's two
+    let mut graph = kwg::Kwg(Vec::new());
+    if endgame::room_in(Some(memory), &mut graph.0, (bytes.len() / 4).max(2)).is_err() {
+        return Ok(None);
+    }
+    graph.refill_from_bytes(bytes).map_err(err_to_str)?;
+    drop(builder);
+    drop(words);
+    Ok(Some(kwg::RunGraph::new_if(graph, |bytes| {
+        memory.has_room(bytes)
+    })))
 }
 
 // pruned_kwg's graph, made in graph's nodes, with the lexicon's pruner
@@ -7975,10 +8087,19 @@ mod tests {
     fn endgame_of(lexicon: &str, rack: &[u8], others: &[u8], more: &str) -> Result<u32, String> {
         tiny_lexicon(lexicon);
         let racks = rack.iter().chain(others).copied().collect::<Vec<_>>();
-        do_endgame_new(&format!(
-            r#"{{"rack":{rack:?},"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
-            late_board(&racks)
-        ))
+        do_endgame_new(
+            &format!(
+                r#"{{"rack":{rack:?},"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#,
+                late_board(&racks)
+            ),
+            none_held,
+        )
+    }
+
+    // a program's memory read as holding nothing, so that an endgame made
+    // under a cap smaller than the tests hold is not refused for it
+    fn none_held() -> usize {
+        0
     }
 
     // a clock that never moves, so no step runs out of time
@@ -8119,9 +8240,12 @@ mod tests {
             let lexicon = format!("tiny-end-{rules}");
             tiny_lexicon_for(&lexicon, jumbled);
             let board = late_board_of(rules, &racks);
-            let handle = do_endgame_new(&format!(
-                r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"{rules}","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
-            ))
+            let handle = do_endgame_new(
+                &format!(
+                    r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"{rules}","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
+                ),
+                held_bytes,
+            )
             .unwrap();
             let answer = endgame_step(handle, r#"{"ms":60000}"#);
             assert_eq!(answer["exact"], true, "{rules}");
@@ -8839,6 +8963,51 @@ mod tests {
         }
     }
 
+    // an endgame made under a cap prunes its graph within it: with the
+    // program holding all but a byte of the cap the prune has no room, and the
+    // endgame takes its lexicon's own graph instead; holding nothing, it takes
+    // the pruned one. Either way, in an empty bag's search and in a
+    // pre-endgame's, its answer is the one with no cap
+    #[test]
+    fn an_endgame_whose_prune_has_no_room_solves_on_its_lexicon() {
+        let cases = [
+            (&[S, E, A, T][..], &[A, T, E][..], ""),
+            (
+                &[S, B, D, F, G, H, I][..],
+                &[E, S, B, D, F, G, H, I, J][..],
+                r#","model":"random_draws","exchanges":[0,0]"#,
+            ),
+        ];
+        let lexicon = "tiny-end-new-room";
+        tiny_lexicon(lexicon);
+        for (rack, others, model) in cases {
+            let racks = rack.iter().chain(others).copied().collect::<Vec<_>>();
+            let req = |more: &str| {
+                format!(
+                    r#"{{"rack":{rack:?},"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{model}{more}}}"#,
+                    late_board(&racks)
+                )
+            };
+            let free = do_endgame_new(&req(""), held_bytes).unwrap();
+            let free_answer = endgame_step(free, r#"{"ms":60000}"#);
+            do_endgame_free(free).unwrap();
+            for (held, on_lexicon) in [((1 << 20) - 1, true), (0, false)] {
+                FAKE_HELD.with(|fake| fake.set(held));
+                let capped = do_endgame_new(&req(r#","max_memory_mb":1"#), fake_held).unwrap();
+                let graph = matches!(
+                    *ENDGAMES.lock().unwrap().live[&capped].kwg,
+                    EndgameGraph::Lexicon(..)
+                );
+                assert_eq!(graph, on_lexicon, "{model} {held}");
+                FAKE_HELD.with(|fake| fake.set(0));
+                let capped_answer =
+                    report(&do_endgame_step(capped, r#"{"ms":60000}"#, frozen, fake_held).unwrap());
+                assert_eq!(capped_answer, free_answer, "{model} {held}");
+                do_endgame_free(capped).unwrap();
+            }
+        }
+    }
+
     std::thread_local! {
         // the bytes fake_held says this thread's program holds
         static FAKE_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -8981,9 +9150,12 @@ mod tests {
     // an endgame on this board, seat 0 to move, with what more is given
     fn endgame_on(lexicon: &str, rack: &[u8], board: &str, more: &str) -> u32 {
         tiny_lexicon(lexicon);
-        do_endgame_new(&format!(
-            r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#
-        ))
+        do_endgame_new(
+            &format!(
+                r#"{{"rack":{rack:?},"board":{board},"lexicon":"{lexicon}","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0{more}}}"#
+            ),
+            none_held,
+        )
         .unwrap()
     }
 
@@ -9215,9 +9387,12 @@ mod tests {
         }
         tiny_lexicon("tiny-end-refuse");
         let board = late_board(&[A, T, E]);
-        let err = do_endgame_new(&format!(
-            r#"{{"rack":[],"board":{board},"lexicon":"tiny-end-refuse","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
-        ))
+        let err = do_endgame_new(
+            &format!(
+                r#"{{"rack":[],"board":{board},"lexicon":"tiny-end-refuse","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
+            ),
+            held_bytes,
+        )
         .unwrap_err();
         assert_eq!(err, "endgame: the rack is empty");
         // the seat to move, the scoreless turns, and the passes so far are the
@@ -9227,7 +9402,7 @@ mod tests {
                 r#"{{"rack":[{S}],"board":{board},"lexicon":"tiny-end-refuse","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0}}"#
             )
             .replace(&format!(r#","{field}":0"#), "");
-            let err = do_endgame_new(&req).unwrap_err();
+            let err = do_endgame_new(&req, held_bytes).unwrap_err();
             assert!(err.contains(&format!("missing field `{field}`")), "{err}");
         }
         let handle = endgame_of("tiny-end-refuse", &[S], &[A, T], "").unwrap();
