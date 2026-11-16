@@ -8558,6 +8558,48 @@ mod tests {
         }
     }
 
+    std::thread_local! {
+        // the bytes fake_held says this thread's program holds
+        static FAKE_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    // an endgame's memory read as FAKE_HELD, whatever the allocator holds
+    fn fake_held() -> usize {
+        FAKE_HELD.with(std::cell::Cell::get)
+    }
+
+    // a pre-endgame step whose cap (1 MiB) leaves no room at all takes none: it
+    // answers out of memory with no move valued and no root list kept (moves
+    // null), and once the room is there it answers as a step with no cap does
+    #[test]
+    fn a_pre_endgame_step_with_no_room_takes_none() {
+        let (rack, others) = ([S, B, D, F, G, H, I], [E, S, B, D, F, G, H, I, J]);
+        let model = r#","model":"random_draws","exchanges":[0,0]"#;
+        let lexicon = "tiny-end-no-room";
+        let free = endgame_of(lexicon, &rack, &others, model).unwrap();
+        let free_answer = endgame_step(free, r#"{"ms":60000}"#);
+        do_endgame_free(free).unwrap();
+        let capped = format!(r#"{model},"max_memory_mb":1"#);
+        let handle = endgame_of(lexicon, &rack, &others, &capped).unwrap();
+        FAKE_HELD.with(|held| held.set((1 << 20) - 1));
+        let step = |held: fn() -> usize| {
+            report(&do_endgame_step(handle, r#"{"ms":60000}"#, frozen, held).unwrap())
+        };
+        let refused = step(fake_held);
+        assert_eq!(refused["out_of_memory"], true, "{refused}");
+        assert_eq!(refused["moves"], serde_json::Value::Null, "{refused}");
+        assert_eq!(refused["play"], serde_json::Value::Null, "{refused}");
+        FAKE_HELD.with(|held| held.set(0));
+        let mut roomy = step(fake_held);
+        assert_eq!(roomy["out_of_memory"], false, "{roomy}");
+        roomy
+            .as_object_mut()
+            .unwrap()
+            .insert("steps".into(), 1.into());
+        assert_eq!(roomy, free_answer);
+        do_endgame_free(handle).unwrap();
+    }
+
     // draws_of stopped by the cap (1 MiB, less than a buffer kept holds) says
     // so in out_of_memory_in, the answer otherwise the step's own: its play,
     // value, win, moves, and candidates, none with draws. The one test whose
