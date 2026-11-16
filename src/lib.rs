@@ -632,15 +632,20 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
     if refused || move_generator.out_of_memory() {
         return_js_error!(OUT_OF_MEMORY.to_string());
     }
-    let mut result = Vec::<kibitzer::JsonPlayWithEquity>::new();
-    if result.try_reserve_exact(plays.len()).is_err() {
-        return_js_error!(OUT_OF_MEMORY.to_string());
-    }
-    result.extend(plays.iter().map(|x| x.into()));
 
-    match try_json(&result)? {
+    match try_json(&ValuedPlaysJson(plays))? {
         Some(json) => Ok(json),
         None => Err(OUT_OF_MEMORY.into()),
+    }
+}
+
+// valued plays as a list of kibitzer::JsonPlayWithEquity writes them, each
+// written from where it is held
+struct ValuedPlaysJson<'a>(&'a [movegen::ValuedMove]);
+
+impl serde::Serialize for ValuedPlaysJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(kibitzer::JsonPlayRefWithEquity::from))
     }
 }
 
