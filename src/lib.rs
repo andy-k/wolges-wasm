@@ -3777,27 +3777,52 @@ static HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::ne
 
 struct Counting;
 
+thread_local! {
+    // the bytes this thread's allocations may still take, held less freed:
+    // all there are (usize::MAX, never counted down), unless a test sets it to
+    // refuse this thread alone (refusing_from), whatever other threads hold
+    static ROOM: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+// whether this thread may allocate size bytes: none past its room, and none
+// that would overflow the count
+#[inline(always)]
+fn refused(size: usize) -> bool {
+    size > ROOM.get() || held_bytes().checked_add(size).is_none()
+}
+
+// this thread's room less taken bytes and plus given ones, where it counts
+#[inline(always)]
+fn spend(taken: usize, given: usize) {
+    let room = ROOM.get();
+    if room != usize::MAX {
+        ROOM.set((room - taken).saturating_add(given).min(usize::MAX - 1));
+    }
+}
+
 // every allocation counted onto the bytes held as it is made and off as it is
-// freed; refused when the count would overflow
+// freed; refused past its thread's room, or where the count would overflow
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if held_bytes().checked_add(layout.size()).is_none() {
+        if refused(layout.size()) {
             return std::ptr::null_mut();
         }
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
             HELD.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+            spend(layout.size(), 0);
         }
         p
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if held_bytes().checked_add(layout.size()).is_none() {
+        if refused(layout.size()) {
             return std::ptr::null_mut();
         }
         let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !p.is_null() {
             HELD.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+            spend(layout.size(), 0);
         }
         p
     }
@@ -3805,16 +3830,22 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
         unsafe { std::alloc::System.dealloc(p, layout) };
         HELD.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        spend(0, layout.size());
     }
 
     unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        if held_bytes().checked_add(new_size).is_none() {
+        // the whole new size asked, as the old block is held until it moves
+        if refused(new_size) {
             return std::ptr::null_mut();
         }
         let q = unsafe { std::alloc::System.realloc(p, layout, new_size) };
         if !q.is_null() {
             HELD.fetch_add(new_size, std::sync::atomic::Ordering::Relaxed);
             HELD.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+            spend(
+                new_size.saturating_sub(layout.size()),
+                layout.size().saturating_sub(new_size),
+            );
         }
         q
     }
@@ -8039,23 +8070,26 @@ mod tests {
                 r#","model":"random_draws","exchanges":[0,0]"#,
             ),
         ];
-        let kept = std::hint::black_box(vec![1u8; 2 << 20]);
+        // a reading of 2 MiB held, past the 1 MiB cap
+        let over = || 2 << 20;
         for (rack, others, model) in cases {
             for (cap, out) in [("", false), (r#","max_memory_mb":1"#, true)] {
                 let more = format!("{model}{cap}");
                 let handle = endgame_of("tiny-end-oom", rack, others, &more).unwrap();
-                let answer = endgame_step(handle, r#"{"ms":60000}"#);
+                let answer =
+                    report(&do_endgame_step(handle, r#"{"ms":60000}"#, frozen, over).unwrap());
                 let short = answer["exact"] == false;
                 assert_eq!(answer["out_of_memory"], out && short, "{more}: {answer}");
                 do_endgame_free(handle).unwrap();
             }
         }
-        drop(kept);
     }
 
     // draws_of stopped by the cap (1 MiB, less than a buffer kept holds) says
     // so in out_of_memory_in, the answer otherwise the step's own: its play,
-    // value, win, moves, and candidates, none with draws
+    // value, win, moves, and candidates, none with draws. The one test whose
+    // cap reads the allocator's own count, moved by a real allocation (other
+    // tests' allocations only add to it)
     #[test]
     fn draws_of_stopped_by_the_cap_says_so_and_answers_as_a_step() {
         let handle = endgame_of(
@@ -8835,18 +8869,18 @@ mod tests {
         do_threats_free(handle).unwrap();
     }
 
-    // f run with the count of bytes held raised so that a request of more than
-    // bytes would overflow it, and so is refused
+    // f run with this thread's room set so that its growth past bytes is
+    // refused; every other thread allocates as before
     fn refusing_from<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
-        let more = usize::MAX - held_bytes() - bytes;
-        HELD.fetch_add(more, std::sync::atomic::Ordering::Relaxed);
+        let room = ROOM.replace(bytes.min(usize::MAX - 1));
         let answer = f();
-        HELD.fetch_sub(more, std::sync::atomic::Ordering::Relaxed);
+        ROOM.set(room);
         answer
     }
 
-    // the ignored test name run alone, in a process of its own: raising the
-    // count refuses every thread's growth, so no other test may run beside it
+    // the ignored test name run alone, in a process of its own, for a test
+    // that reads the count of bytes held, which every other test's
+    // allocations move
     fn alone(name: &str) {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--ignored", "--test-threads", "1"])
@@ -8915,6 +8949,10 @@ mod tests {
         )
     }
 
+    // run alone though only its own thread is refused: its walk generates on a
+    // generator its rules lend, made or grown by whichever test last held it,
+    // and given back into their shared list, so what it allocates inside the
+    // refusal depends on the tests beside it
     #[test]
     fn a_threats_walk_refused_its_growth_answers_out_of_memory_alone() {
         alone("tests::a_threats_walk_refused_its_growth_answers_out_of_memory");
@@ -8997,12 +9035,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sim_refused_its_iterations_growth_answers_out_of_memory_alone() {
-        alone("tests::a_sim_refused_its_iterations_growth_answers_out_of_memory");
-    }
-
-    #[test]
-    #[ignore = "run alone by a_sim_refused_its_iterations_growth_answers_out_of_memory_alone"]
     fn a_sim_refused_its_iterations_growth_answers_out_of_memory() {
         let sim = cat_sim("tiny-sim-oom");
         let step = |iterations: usize| {
@@ -9044,12 +9076,6 @@ mod tests {
     }
 
     #[test]
-    fn an_analyze_refused_its_growth_answers_out_of_memory_alone() {
-        alone("tests::an_analyze_refused_its_growth_answers_out_of_memory");
-    }
-
-    #[test]
-    #[ignore = "run alone by an_analyze_refused_its_growth_answers_out_of_memory_alone"]
     fn an_analyze_refused_its_growth_answers_out_of_memory() {
         for (lexicon, rules, jumbled) in [
             ("alloc-analyze", "CrosswordGame", false),
