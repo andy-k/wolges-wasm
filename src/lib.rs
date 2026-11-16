@@ -334,13 +334,44 @@ impl CachedRules {
         })
     }
 
-    // a generator as lend lends one, to what holds the rules past the request
-    // (a threats question), given back as that is let go
-    fn lend_held(rules: &std::sync::Arc<Self>) -> Result<Lent<std::sync::Arc<Self>>, String> {
-        Ok(Lent {
-            rules: rules.clone(),
-            movegen: Some(rules.lend()?.take()),
-        })
+    // a generator of its own for what outlives a request (a threats question,
+    // a sim, an endgame), the free one if any (so that no second is made while
+    // it sits idle), let go with what takes it: one such grows its generator's
+    // buffers as far as it walks, and the rules keep none so grown
+    fn own_generator(&self) -> Result<Movegen, String> {
+        let free = self.movegens.lock().map_err(err_to_str)?.pop();
+        match free {
+            Some(mut movegen) => {
+                movegen.reset_for_another_kwg();
+                Ok(movegen)
+            }
+            None => Movegen::try_new(&self.game_config).map_err(err_to_str),
+        }
+    }
+
+    // a generator lent and taken (Lent::take) given back, free for the next
+    // request; it is kept only when no other is free, as a page's requests come
+    // one at a time, so that the rules hold one free generator's memory at most
+    // (one they have no room to keep is let go)
+    fn give_back(&self, movegen: Movegen) {
+        if let Ok(mut free) = self.movegens.lock()
+            && free.is_empty()
+            && free.try_reserve(1).is_ok()
+        {
+            free.push(movegen);
+        }
+    }
+}
+
+// a room let go kept by its rules only when they keep none: a page's requests
+// come one at a time, so one room is all the next takes, and the memory kept
+// is one room's (a second question's room, alive at once, is let go)
+fn keep_room<T>(rooms: &std::sync::Mutex<Vec<T>>, room: T) {
+    if let Ok(mut rooms) = rooms.lock()
+        && rooms.is_empty()
+        && rooms.try_reserve(1).is_ok()
+    {
+        rooms.push(room);
     }
 }
 
@@ -384,11 +415,8 @@ impl<T> std::ops::DerefMut for Taken<'_, T> {
 // a room the rules have no room to keep is let go
 impl<T> Drop for Taken<'_, T> {
     fn drop(&mut self) {
-        if let Some(room) = self.room.take()
-            && let Ok(mut rooms) = self.rooms.lock()
-            && rooms.try_reserve(1).is_ok()
-        {
-            rooms.push(room);
+        if let Some(room) = self.room.take() {
+            keep_room(self.rooms, room);
         }
     }
 }
@@ -432,19 +460,10 @@ impl Default for PlayScoreRoom {
 }
 
 // a generator lent to a request, given back to the rules (held by reference
-// or shared) as the request lets it go, or kept by what takes it (Lent::take)
+// or shared) as the request lets it go
 struct Lent<R: std::ops::Deref<Target = CachedRules>> {
     rules: R,
     movegen: Option<Movegen>,
-}
-
-impl<R: std::ops::Deref<Target = CachedRules>> Lent<R> {
-    fn take(mut self) -> Movegen {
-        let Some(movegen) = self.movegen.take() else {
-            unreachable!("a lent generator is taken once");
-        };
-        movegen
-    }
 }
 
 impl<R: std::ops::Deref<Target = CachedRules>> std::ops::Deref for Lent<R> {
@@ -452,7 +471,7 @@ impl<R: std::ops::Deref<Target = CachedRules>> std::ops::Deref for Lent<R> {
 
     fn deref(&self) -> &Movegen {
         let Some(movegen) = &self.movegen else {
-            unreachable!("a lent generator is read only until taken");
+            unreachable!("a lent generator is held till it is given back");
         };
         movegen
     }
@@ -461,7 +480,7 @@ impl<R: std::ops::Deref<Target = CachedRules>> std::ops::Deref for Lent<R> {
 impl<R: std::ops::Deref<Target = CachedRules>> std::ops::DerefMut for Lent<R> {
     fn deref_mut(&mut self) -> &mut Movegen {
         let Some(movegen) = &mut self.movegen else {
-            unreachable!("a lent generator is read only until taken");
+            unreachable!("a lent generator is held till it is given back");
         };
         movegen
     }
@@ -469,10 +488,8 @@ impl<R: std::ops::Deref<Target = CachedRules>> std::ops::DerefMut for Lent<R> {
 
 impl<R: std::ops::Deref<Target = CachedRules>> Drop for Lent<R> {
     fn drop(&mut self) {
-        if let Some(movegen) = self.movegen.take()
-            && let Ok(mut free) = self.rules.movegens.lock()
-        {
-            free.push(movegen);
+        if let Some(movegen) = self.movegen.take() {
+            self.rules.give_back(movegen);
         }
     }
 }
@@ -2128,7 +2145,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
-    let mut simmer = simmer::Simmer::with_generator(&game_config, game_config.lend()?.take())
+    let mut simmer = simmer::Simmer::with_generator(&game_config, game_config.own_generator()?)
         .map_err(err_to_str)?;
     let packed = inferred.map(|leaves| simmer::KeptLeaves {
         seat: opponent as u8,
@@ -2561,6 +2578,13 @@ fn try_json_kept(
     writer.0.clear();
     let written = serde_json::to_writer(&mut writer, value);
     *taken = writer.0;
+    // the buffer kept within twice the answer just written, so that one
+    // large answer does not hold its room for good; one refused keeps the room
+    // it grew, for the smaller answer written in its place
+    if written.is_ok() && taken.capacity() / 2 > taken.len() {
+        let len = taken.len();
+        taken.shrink_to(len);
+    }
     match written {
         Ok(()) => {
             let text = std::str::from_utf8(&taken).map_err(err_to_str)?;
@@ -3051,7 +3075,7 @@ struct Threats {
     kwg: std::sync::Arc<CachedKwg>,
     game_config: std::sync::Arc<CachedRules>,
     pool: Vec<u8>,
-    move_generator: Lent<std::sync::Arc<CachedRules>>,
+    move_generator: Movegen,
 }
 
 // a threats question's buffers as it is made: they live with the question
@@ -3267,7 +3291,7 @@ fn threats_in_room(
         })
     });
 
-    let move_generator = CachedRules::lend_held(&game_config)?;
+    let move_generator = game_config.own_generator()?;
     let pool = &mut room.pool;
     pool.clear();
     pool.extend(
@@ -4713,7 +4737,7 @@ macro_rules! step_solver {
                 $endgame.kwg.kwg(),
                 &$endgame.arm_tables,
                 $endgame.kwg.run_letters(),
-                $endgame.game_config.lend()?.take(),
+                $endgame.game_config.own_generator()?,
             ),
         }
         .map_err(err_to_str)?
