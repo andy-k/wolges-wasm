@@ -286,13 +286,14 @@ type Movegen = movegen::KurniaMoveGenerator<u32, false, false>;
 // a request needs one while none is free, and lent to it (CachedRules::lend),
 // so no request makes its own, and given back when the request is done; the
 // table of no leaves, made once, for walks that read none; and the buffers of
-// the analyze requests done, for the next ones (AnalyzeRoom), and the buffers
-// answers are written in (try_json_kept)
+// the analyze requests done, for the next ones (AnalyzeRoom, PlayScoreRoom),
+// and the buffers answers are written in (try_json_kept)
 struct CachedRules {
     game_config: game_config::GameConfig,
     movegens: std::sync::Mutex<Vec<Movegen>>,
     no_leaves: Klv,
     analyze_rooms: std::sync::Mutex<Vec<AnalyzeRoom>>,
+    play_score_rooms: std::sync::Mutex<Vec<PlayScoreRoom>>,
     answers: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
@@ -311,6 +312,7 @@ impl CachedRules {
             movegens: Default::default(),
             no_leaves: Klv::empty().map_err(err_to_str)?,
             analyze_rooms: Default::default(),
+            play_score_rooms: Default::default(),
             answers: Default::default(),
         })
     }
@@ -406,6 +408,25 @@ impl Default for AnalyzeRoom {
             kibitzer: kibitzer::Kibitzer::new(),
             seen: Default::default(),
             key: Vec::new(),
+        }
+    }
+}
+
+// what scoring plays grows, kept by its rules for the next request there: the
+// game state (made the first time, of these rules), the position as read, and
+// the scorer
+struct PlayScoreRoom {
+    game_state: Option<game_state::GameState>,
+    kibitzer: kibitzer::Kibitzer,
+    ps: play_scorer::PlayScorer,
+}
+
+impl Default for PlayScoreRoom {
+    fn default() -> Self {
+        Self {
+            game_state: None,
+            kibitzer: kibitzer::Kibitzer::new(),
+            ps: play_scorer::PlayScorer::new(),
         }
     }
 }
@@ -749,8 +770,13 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
         ));
     }
 
-    let mut game_state = game_state::GameState::new(&game_config);
-    let mut kibitzer = kibitzer::Kibitzer::new();
+    let mut taken = Taken::<PlayScoreRoom>::from(&game_config.play_score_rooms)?;
+    let room = &mut *taken;
+    // a kept game state reset is as a new one is made
+    let game_state =
+        (room.game_state).get_or_insert_with(|| game_state::GameState::new(&game_config));
+    game_state.reset();
+    let kibitzer = &mut room.kibitzer;
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
@@ -788,13 +814,13 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
         klv: &klv.klv,
     };
 
-    let mut ps = play_scorer::PlayScorer::new();
+    let ps = &mut room.ps;
     let result = req
         .plays
         .iter()
         .map(|json_play| {
             let play = movegen::Play::from(json_play);
-            match ps.validate_play(board_snapshot, &game_state, &play) {
+            match ps.validate_play(board_snapshot, game_state, &play) {
                 Err(err) => ScoredPlay::Error {
                     error: err.to_string(),
                 },
@@ -812,7 +838,7 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
                     };
                     let recounted_equity = ps.compute_equity(
                         board_snapshot,
-                        &game_state,
+                        game_state,
                         &canonical_play,
                         move_filter::LEAVE_SCALE_DENOM,
                         recounted_score,
@@ -1570,7 +1596,8 @@ impl Sim {
             rack_lengths: None,
             klv: &self.klv.klv,
         };
-        let mut ps = play_scorer::PlayScorer::new();
+        let mut taken = Taken::<PlayScoreRoom>::from(&self.game_config.play_score_rooms)?;
+        let ps = &mut taken.ps;
         let play = sim_play.to_play();
         let mut play = ps
             .validate_play(board_snapshot, &self.game_state, &play)
