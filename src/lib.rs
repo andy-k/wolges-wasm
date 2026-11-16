@@ -1398,6 +1398,11 @@ struct SimNewRequest {
     part: u64,
     #[serde(default = "one_part")]
     parts: u64,
+    // the most memory the wasm may hold while the sim runs, in MiB (none: no
+    // cap): the late graph is pruned only where it fits, else the sim walks
+    // the lexicon's own, and a step stops, out of memory, once no room is left
+    #[serde(default)]
+    max_memory_mb: Option<usize>,
 }
 
 // a field the request must give, null among the values it may take
@@ -1478,6 +1483,9 @@ struct SimStepRequest {
     prune_z: Option<f64>,
     prune_decided: Option<f64>,
     against: Option<SimPlay>,
+    // the sim's cap from this step on, in MiB, as sim_new's max_memory_mb
+    #[serde(default)]
+    max_memory_mb: Option<usize>,
 }
 
 // how a step prunes: every so many of the sim's iterations, behind by so many
@@ -1585,6 +1593,18 @@ struct Sim {
     // rollout, and the plies the rollouts played
     rows: Vec<(f64, i32, f64, i32, i32, usize)>,
     played: Vec<simmer::PlyPlayed>,
+    memory: Option<endgame::MemoryLimit>, // the sim's cap
+}
+
+// a sim's cap of max_memory_mb, read as an endgame's is
+fn sim_memory(max_memory_mb: Option<usize>) -> Result<Option<endgame::MemoryLimit>, String> {
+    match max_memory_mb {
+        Some(0) => Err("max_memory_mb: at least 1, found 0".into()),
+        mb => Ok(mb.map(|mb| endgame::MemoryLimit {
+            bytes: mb.saturating_mul(1 << 20),
+            held: page_memory,
+        })),
+    }
 }
 
 // the sims made, by handle; a handle is never used twice
@@ -1739,15 +1759,25 @@ impl Sim {
     ) -> Result<u64, String> {
         let rack_size = self.game_config.rack_size();
         let mut stepped = 0;
+        let memory = self.memory;
         while stepped < max
             && !self.out_of_memory
             && self.candidates.iter().any(|c| c.state == SimState::Running)
             && !out_of_time()
         {
+            // no room left under the cap: out of memory
+            if memory.is_some_and(|memory| !memory.has_room(1)) {
+                self.out_of_memory = true;
+                break;
+            }
             let iteration = self.iterations + 1;
             let room = |held: &mut Vec<f64>, first_iter: u64| {
                 let more = ((iteration - first_iter) as usize + 1).saturating_sub(held.len());
-                held.try_reserve(more).is_ok()
+                if memory.is_some() {
+                    endgame::room_in(memory.as_ref(), held, more).is_ok()
+                } else {
+                    held.try_reserve(more).is_ok()
+                }
             };
             if !(self.candidates.iter_mut())
                 .filter(|c| c.state == SimState::Running)
@@ -2203,6 +2233,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         }
     }
 
+    let memory = sim_memory(req.max_memory_mb)?;
     let blanks_on_board = (game_state.board_tiles.iter())
         .filter(|&&tile| tile & 0x80 != 0)
         .count();
@@ -2212,13 +2243,24 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         u64::MAX,
         1,
     ) {
-        late_kwg(
-            &req.lexicon,
-            &req.rules,
-            &game_config,
-            &game_state.board_tiles,
-            &kwg,
-        )?
+        match &memory {
+            None => late_kwg(
+                &req.lexicon,
+                &req.rules,
+                &game_config,
+                &game_state.board_tiles,
+                &kwg,
+            )?,
+            // under a cap, pruned within it, not held for later sims, and the
+            // lexicon's own where it has not room (the late graph is for speed
+            // alone)
+            Some(memory) => {
+                match pruned_graph_within(&game_config, &game_state.board_tiles, &kwg, memory)? {
+                    Some(graph) => std::sync::Arc::new(CachedKwg::new(graph)),
+                    None => kwg,
+                }
+            }
+        }
     } else {
         kwg
     };
@@ -2257,6 +2299,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         out_of_memory: false,
         rows: Vec::new(),
         played: Vec::new(),
+        memory,
     };
 
     let mut sims = SIMS.lock().map_err(err_to_str)?;
@@ -4306,8 +4349,12 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
         None => None,
     };
     let pruning = pruning_of(&req)?;
+    let memory = sim_memory(req.max_memory_mb)?;
     let mut sims = SIMS.lock().map_err(err_to_str)?;
     let sim = sims.live.get_mut(&handle).ok_or_else(|| no_sim(handle))?;
+    if memory.is_some() {
+        sim.memory = memory;
+    }
     // the play to compare against, checked before any step
     let against = match &req.against {
         Some(sim_play) => {
@@ -6029,6 +6076,19 @@ fn pruned_kwg_within(
     lexicon: &CachedKwg,
     memory: &endgame::MemoryLimit,
 ) -> Result<Option<kwg::RunGraph<kwg::Node24>>, String> {
+    Ok(
+        pruned_graph_within(game_config, board_tiles, lexicon, memory)?
+            .map(|graph| kwg::RunGraph::new_if(graph, |bytes| memory.has_room(bytes))),
+    )
+}
+
+// pruned_kwg_within's graph, with no run letters
+fn pruned_graph_within(
+    game_config: &CachedRules,
+    board_tiles: &[u8],
+    lexicon: &CachedKwg,
+    memory: &endgame::MemoryLimit,
+) -> Result<Option<Kwg>, String> {
     let empty_klv = Klv::empty().map_err(err_to_str)?;
     let mut words = Vec::<bites::Bites>::new();
     let mut refused = false;
@@ -6071,9 +6131,7 @@ fn pruned_kwg_within(
     graph.refill_from_bytes(bytes).map_err(err_to_str)?;
     drop(builder);
     drop(words);
-    Ok(Some(kwg::RunGraph::new_if(graph, |bytes| {
-        memory.has_room(bytes)
-    })))
+    Ok(Some(graph))
 }
 
 // pruned_kwg's graph, made in graph's nodes, with the lexicon's pruner
@@ -7386,6 +7444,37 @@ mod tests {
             assert!(fields(&graph) == anew(board_tiles));
             kwg.pruner.lock().unwrap().spare = Some(graph);
         }
+    }
+
+    // a late sim under a cap it never reaches steps as one with none; under
+    // one smaller than the tests hold (1 MiB) its late graph is the lexicon's
+    // own and a step stops at once, out of memory; a cap of 0 is refused
+    #[test]
+    fn a_sim_under_a_cap_steps_as_one_without_or_is_out_of_memory() {
+        let lexicon = "tiny-sim-capped";
+        tiny_lexicon(lexicon);
+        let Tables { game_config, .. } = tables(lexicon, "noleave", "CrosswordGame").unwrap();
+        let board = serde_json::to_string(&all_but_seat_board(&game_config)).unwrap();
+        let answer = |more: &str| {
+            let sim = sim_of(lexicon, &board, more);
+            do_sim_add(sim, &format!("[{PASS}]")).unwrap();
+            let answer = step(sim, r#"{"iterations":8,"prune":false}"#);
+            do_sim_free(sim).unwrap();
+            answer
+        };
+        let free = answer("");
+        assert_eq!(answer(r#","max_memory_mb":4096"#), free);
+        // more held than the cap, whatever other tests hold
+        let kept = std::hint::black_box(vec![1u8; 2 << 20]);
+        let tight = answer(r#","max_memory_mb":1"#);
+        drop(kept);
+        assert_eq!(tight["out_of_memory"], true, "{tight}");
+        assert_eq!(tight["stepped"], 0, "{tight}");
+        let err = do_sim_new(&format!(
+            r#"{{"rack":[{S}],"board":{board},"lexicon":"{lexicon}","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":2,"max_memory_mb":0}}"#
+        ))
+        .unwrap_err();
+        assert_eq!(err, "max_memory_mb: at least 1, found 0");
     }
 
     #[test]
