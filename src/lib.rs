@@ -1850,17 +1850,19 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         movegen::KurniaMoveGenerator::try_new(&game_config).map_err(err_to_str)?,
     )
     .map_err(err_to_str)?;
-    simmer.set_opponents_pass(req.opponents_pass);
+    let packed = inferred.map(|leaves| simmer::KeptLeaves {
+        seat: opponent as u8,
+        leaves,
+    });
     simmer.prepare(
         &game_config,
         &game_state,
-        req.plies.unwrap_or(usize::MAX),
-        true,
-        &known,
+        &simmer::SimChoices {
+            packed: packed.as_slice(),
+            opponents_pass: req.opponents_pass,
+            ..simmer::SimChoices::new(req.plies.unwrap_or(usize::MAX), true, &known)
+        },
     );
-    if let Some(leaves) = inferred {
-        simmer.set_packed_kept_leaves(opponent as u8, leaves);
-    }
     let pristine = simmer.prepared_state().clone();
     let sim = Sim {
         game_config,
@@ -2986,16 +2988,31 @@ fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
         None
     };
     if let Some(plies) = req.plies {
-        sim.simmer
-            .set_num_sim_plies(&sim.game_config, plies.unwrap_or(usize::MAX));
         sim.plies = plies;
     }
-    match held {
-        Some(OpponentLeaves::Listed(known)) => sim.simmer.set_kept_leaves(opponent as u8, &known),
-        Some(OpponentLeaves::Inferred(leaves)) => {
-            sim.simmer.set_packed_kept_leaves(opponent as u8, leaves)
+    if req.plies.is_some() || held.is_some() {
+        // prepared again from its start, as it was but for the change
+        let mut packed = sim.simmer.kept_leaves().to_vec();
+        match held {
+            Some(OpponentLeaves::Listed(known)) => {
+                packed.push(simmer::KeptLeaves::listed(opponent as u8, &known))
+            }
+            Some(OpponentLeaves::Inferred(leaves)) => packed.push(simmer::KeptLeaves {
+                seat: opponent as u8,
+                leaves,
+            }),
+            None => {}
         }
-        None => {}
+        let opponents_pass = sim.simmer.opponents_pass();
+        sim.simmer.prepare(
+            &sim.game_config,
+            &sim.pristine,
+            &simmer::SimChoices {
+                packed: &packed,
+                opponents_pass,
+                ..simmer::SimChoices::new(sim.plies.unwrap_or(usize::MAX), true, &[])
+            },
+        );
     }
     serde_json::to_string(&sim.report(0, None)).map_err(err_to_str)
 }
@@ -3317,7 +3334,6 @@ struct Endgame {
     in_bag: bool,
     bag: usize,
     peg_bag: Option<endgame::PegBagProgress>,
-    bag_moves: Vec<endgame::PegBagMove>, // the last answer's candidates, two or more in the bag
     turn: u8,
     lead: i32,
     pass_turns: u16,
@@ -3378,6 +3394,99 @@ fn points(equity: equity::Equity) -> f64 {
 }
 
 impl Endgame {
+    // a valued move's rows, of the splits from..to, valued again on the table
+    // earlier steps kept as the steps valued them, under the memory cap; or
+    // why some are missing
+    fn draws(
+        &mut self,
+        play: &movegen::Play,
+        rows: std::ops::Range<usize>,
+        clock: endgame::Clock,
+        memory: fn() -> usize,
+    ) -> Result<Result<endgame::PegBagRows, endgame::PegBagRowsMissing>, String> {
+        let Some(progress) = self.peg_bag.as_mut() else {
+            return Err("draws_of: only with two or more in the bag".into());
+        };
+        let mut solver =
+            endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
+                &self.game_config,
+                &self.kwg,
+                &self.arm_tables,
+                movegen::KurniaMoveGenerator::try_new(&self.game_config).map_err(err_to_str)?,
+            )
+            .map_err(err_to_str)?;
+        if let Some(table) = self.table.take()
+            && solver.give_table(table).is_err()
+        {
+            return Err("endgame: its table belongs to other tables".into());
+        }
+        solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
+        // shaped as a step's limits, which always have a time, but with no end
+        let limits = endgame::Limits {
+            time: Some(std::time::Duration::MAX),
+            states: None,
+            memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
+                bytes,
+                held: memory,
+            }),
+            clock: Some(clock),
+        };
+        let found = solver.peg_bag_rows(progress, play, rows, &limits);
+        self.table = Some(solver.take_table());
+        found.map_err(err_to_str)
+    }
+
+    // with two or more in the bag, the answer's candidates at the places
+    // given, best first, from the search; the one at the place draws names
+    // takes those draws, of so many rows
+    fn listed(
+        &self,
+        places: std::ops::Range<usize>,
+        draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
+    ) -> Vec<EndgameCandidate> {
+        let Some(progress) = self.peg_bag.as_ref() else {
+            return Vec::new();
+        };
+        let lead = points(equity::Equity::new(self.lead));
+        let (_, deals) = progress.splits();
+        let from = places.start;
+        let mut listed = (progress.answer_moves(places).iter())
+            .map(|valued| EndgameCandidate {
+                play: (&valued.play).into(),
+                win: valued.win_pct,
+                value: points(valued.expected_margin) - lead,
+                tiles: None,
+                draws: None,
+                deals: Some(deals),
+                draws_total: None,
+                exact: valued.exact,
+            })
+            .collect::<Vec<_>>();
+        if let Some((at, draws, rows)) = draws
+            && let Some(candidate) = at.checked_sub(from).and_then(|at| listed.get_mut(at))
+        {
+            candidate.draws = Some(draws);
+            candidate.draws_total = Some(rows);
+        }
+        listed
+    }
+
+    // the answer as JSON, its candidates listed from the search with two or
+    // more in the bag (listed)
+    fn answer_json(
+        &mut self,
+        draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
+    ) -> Result<String, String> {
+        if self.peg_bag.is_none() {
+            return serde_json::to_string(&self.answer).map_err(err_to_str);
+        }
+        let listed = self.listed(0..usize::MAX, draws);
+        let kept = self.answer.candidates.replace(listed);
+        let json = serde_json::to_string(&self.answer);
+        self.answer.candidates = kept;
+        json.map_err(err_to_str)
+    }
+
     // one solve of at most ms on the clock, on the table earlier steps kept
     fn solve(
         &mut self,
@@ -3404,7 +3513,6 @@ impl Endgame {
             }
             None => {}
         }
-        solver.set_clock(clock);
         let limits = endgame::Limits {
             time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
             states: None,
@@ -3412,13 +3520,13 @@ impl Endgame {
                 bytes,
                 held: memory,
             }),
+            clock: Some(clock),
         };
         let lead = points(equity::Equity::new(self.lead));
         let steps = self.answer.steps + 1;
         let answer = if let Some(progress) = self.peg_bag.as_mut() {
-            self.bag_moves = Vec::new();
             solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
-            let peg = solver.resume_peg(progress, &limits);
+            let peg = solver.resume_peg_best(progress, &limits, 1);
             let peg = peg
                 .map_err(err_to_str)
                 .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
@@ -3435,7 +3543,7 @@ impl Endgame {
             let value = valued.then(|| points(peg.expected_margin) - lead);
             let (endgames, nodes) = progress.searched();
             let (k, n) = progress.part_of();
-            let answer = EndgameAnswer {
+            EndgameAnswer {
                 part: (n > 1).then_some([k, n]),
                 out_of_memory: false,
                 bag: self.bag,
@@ -3449,25 +3557,11 @@ impl Endgame {
                 line: None,
                 win: valued.then_some(peg.win_pct),
                 tiles: None,
-                candidates: Some(
-                    (peg.moves.iter())
-                        .map(|valued| EndgameCandidate {
-                            play: (&valued.play).into(),
-                            win: valued.win_pct,
-                            value: points(valued.expected_margin) - lead,
-                            tiles: None,
-                            draws: None,
-                            deals: Some(valued.hypotheses.iter().map(|h| h.1).sum()),
-                            draws_total: None,
-                            exact: valued.exact,
-                        })
-                        .collect(),
-                ),
+                // listed from the search as a read asks (listed)
+                candidates: Some(Vec::new()),
                 endgames: Some(endgames),
                 moves: progress.moves().map(|(valued, of)| [valued, of]),
-            };
-            self.bag_moves = peg.moves;
-            answer
+            }
         } else if let Some(progress) = self.peg.as_mut() {
             solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
             let peg = solver.resume_peg_one_in_bag(progress, &limits);
@@ -3560,10 +3654,12 @@ impl Endgame {
                 }
             };
             self.nodes += solver.searched();
-            self.finished = Some((solved.depth, solved.value));
+            if let Some(value) = solved.value {
+                self.finished = Some((solved.depth, value));
+            }
             let mut line = Vec::new();
             solver.collect_pv(self.turn, &mut line);
-            let value = points(solved.value);
+            let value = solved.value.map(points);
             EndgameAnswer {
                 part: None,
                 out_of_memory: false,
@@ -3572,8 +3668,8 @@ impl Endgame {
                 nodes: self.nodes,
                 exact: solved.exact,
                 play: line.first().map(|(_, play)| play.into()),
-                value: Some(value),
-                spread: lead + value,
+                value,
+                spread: lead + value.unwrap_or(0.0),
                 depth: Some(solved.depth),
                 line: Some(
                     (line.iter())
@@ -3624,7 +3720,6 @@ impl Endgame {
             }
             None => {}
         }
-        solver.set_clock(clock);
         let limits = endgame::Limits {
             time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
             states: None,
@@ -3632,6 +3727,7 @@ impl Endgame {
                 bytes,
                 held: memory,
             }),
+            clock: Some(clock),
         };
         let lead = points(equity::Equity::new(self.lead));
         let mut racks = [Vec::new(), Vec::new()];
@@ -3797,6 +3893,48 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
     };
     let mut rack = req.rack;
     rack.sort_unstable();
+    let peg_bag = match bag_search {
+        Some((model, exchanges)) => {
+            let progress = endgame::PegBagProgress::new(
+                endgame::PegBagPosition {
+                    mover: req.turn,
+                    board: kibitzer.board_tiles.clone(),
+                    mover_rack: rack.clone(),
+                    unseen_tally: unseen.clone(),
+                    bag_size: bag,
+                    score_diff: equity::Equity::new(scores),
+                    exchanges,
+                    model,
+                },
+                endgame::PegBagChoices {
+                    part: req.part.map_or((0, 1), |[k, n]| (k, n)),
+                    estimates: req.estimates,
+                },
+            )
+            .map_err(err_to_str)?;
+            Some(progress)
+        }
+        None if req.estimates => {
+            return Err(format!(
+                "estimates: with two tiles or more in the bag, found {bag} in it"
+            ));
+        }
+        None if req.part.is_some() => {
+            return Err(format!(
+                "part: with two tiles or more in the bag, found {bag} in it"
+            ));
+        }
+        None => None,
+    };
+    let peg = (bag == 1).then(|| {
+        endgame::PegProgress::new(
+            req.turn,
+            &kibitzer.board_tiles,
+            &rack,
+            &unseen,
+            equity::Equity::new(scores),
+        )
+    });
     // a what-if warmed by an endgame before it (warm_from): with the bag empty
     // in both, of the same rules and lexicon, on a board holding every tile of
     // that one's on its square, the new one takes that one's graph (its words
@@ -3886,46 +4024,6 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
             )
         }
     };
-    let peg_bag = match bag_search {
-        Some((model, exchanges)) => {
-            let mut progress = endgame::PegBagProgress::new(endgame::PegBagPosition {
-                mover: req.turn,
-                board: kibitzer.board_tiles.clone(),
-                mover_rack: rack.clone(),
-                unseen_tally: unseen.clone(),
-                bag_size: bag,
-                score_diff: equity::Equity::new(scores),
-                exchanges,
-                model,
-            })
-            .map_err(err_to_str)?;
-            if let Some([k, n]) = req.part {
-                progress.part(k, n).map_err(err_to_str)?;
-            }
-            progress.set_estimates(req.estimates);
-            Some(progress)
-        }
-        None if req.estimates => {
-            return Err(format!(
-                "estimates: with two tiles or more in the bag, found {bag} in it"
-            ));
-        }
-        None if req.part.is_some() => {
-            return Err(format!(
-                "part: with two tiles or more in the bag, found {bag} in it"
-            ));
-        }
-        None => None,
-    };
-    let peg = (bag == 1).then(|| {
-        endgame::PegProgress::new(
-            req.turn,
-            &kibitzer.board_tiles,
-            &rack,
-            &unseen,
-            equity::Equity::new(scores),
-        )
-    });
     // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
     // shifted would wrap to none)
     let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
@@ -3943,7 +4041,6 @@ fn do_endgame_new(req_str: &str) -> Result<u32, String> {
         in_bag,
         bag,
         peg_bag,
-        bag_moves: Vec::new(),
         turn: req.turn,
         lead: scores,
         pass_turns: req.pass_turns,
@@ -4051,35 +4148,32 @@ fn do_endgame_step(
         if req.draws_range.is_some() {
             return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
         }
-        return serde_json::to_string(&endgame.answer).map_err(err_to_str);
+        return endgame.answer_json(None);
     };
-    let Some(valued) = endgame.bag_moves.get(i) else {
+    let listed = endgame.peg_bag.as_ref().map(|progress| {
+        let total = progress.answer_total();
+        (progress.answer_moves(i..i.saturating_add(1)).pop(), total)
+    });
+    let Some((Some(valued), _)) = listed else {
         return Err(format!(
             "draws_of: {i} is no candidate of the {} with draws",
-            endgame.bag_moves.len()
+            listed.map_or(0, |(_, total)| total)
         ));
     };
+    let play = valued.play.clone();
     let lead = points(equity::Equity::new(endgame.lead));
-    let total = valued.hypotheses.len();
+    let (total, _) = endgame.peg_bag.as_ref().map_or((0, 0), |p| p.splits());
     let [from, to] = req
         .draws_range
         .unwrap_or([0, total])
         .map(|at| at.min(total));
     let to = to.max(from);
-    let draws = bag_draws(
-        &valued.hypotheses[from..to],
-        &valued.wins[from..to],
-        &valued.draws[from..to],
-        lead,
-    );
-    let candidate = &mut endgame.answer.candidates.as_mut().unwrap()[i];
-    candidate.draws = Some(draws);
-    candidate.draws_total = Some(total);
-    let answer = serde_json::to_string(&endgame.answer).map_err(err_to_str);
-    let candidate = &mut endgame.answer.candidates.as_mut().unwrap()[i];
-    candidate.draws = None;
-    candidate.draws_total = None;
-    answer
+    let rows = match endgame.draws(&play, from..to, clock, memory)? {
+        Ok(rows) => rows,
+        Err(missing) => return Err(format!("draws_of: no rows, {missing:?}")),
+    };
+    let draws = bag_draws(&rows.hypotheses, &rows.wins, &rows.draws, lead);
+    endgame.answer_json(Some((i, draws, total)))
 }
 
 // an endgame let go, with its table and the tables it holds
@@ -4961,9 +5055,18 @@ mod tests {
             .collect::<Vec<_>>();
         let from_list = sim_of("tiny-infer-sim", &cat_board(), "");
         let plain = dealt(from_list, 1..=20);
-        (SIMS.lock().unwrap().live.get_mut(&from_list).unwrap())
-            .simmer
-            .set_kept_leaves(1, &listed);
+        {
+            let mut sims = SIMS.lock().unwrap();
+            let sim = sims.live.get_mut(&from_list).unwrap();
+            sim.simmer.prepare(
+                &sim.game_config,
+                &sim.pristine,
+                &simmer::SimChoices {
+                    packed: &[simmer::KeptLeaves::listed(1, &listed)],
+                    ..simmer::SimChoices::new(sim.plies.unwrap_or(usize::MAX), true, &[])
+                },
+            );
+        }
         let racks = dealt(from_handle, 1..=20);
         assert_eq!(dealt(from_list, 1..=20), racks);
         assert_ne!(plain, racks);
@@ -6318,20 +6421,25 @@ mod tests {
             .unwrap();
         let mut sorted = rack.to_vec();
         sorted.sort_unstable();
+        let mut progress = endgame::PegBagProgress::new(
+            endgame::PegBagPosition {
+                mover: 0,
+                board: kibitzer.board_tiles.clone(),
+                mover_rack: sorted,
+                unseen_tally: kibitzer.available_tally.clone(),
+                bag_size: 2,
+                score_diff: equity::Equity::ZERO,
+                exchanges: [0, 0],
+                model,
+            },
+            endgame::PegBagChoices {
+                part: (0, 1),
+                estimates: false,
+            },
+        )
+        .unwrap();
         let result = solver
-            .solve_peg(
-                endgame::PegBagPosition {
-                    mover: 0,
-                    board: kibitzer.board_tiles.clone(),
-                    mover_rack: sorted,
-                    unseen_tally: kibitzer.available_tally.clone(),
-                    bag_size: 2,
-                    score_diff: equity::Equity::ZERO,
-                    exchanges: [0, 0],
-                    model,
-                },
-                &endgame::Limits::NONE,
-            )
+            .resume_peg(&mut progress, &endgame::Limits::NONE, 1)
             .unwrap()
             .unwrap();
         let play: kibitzer::JsonPlay = result.best_move.as_ref().unwrap().into();
@@ -6346,7 +6454,7 @@ mod tests {
             points(result.expected_margin),
             "{name}"
         );
-        assert_eq!(draws.len(), result.hypotheses.len(), "{name}");
+        assert_eq!(draws.len(), progress.splits().0, "{name}");
         do_endgame_free(handle).unwrap();
     }
 
