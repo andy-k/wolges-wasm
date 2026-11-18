@@ -3628,6 +3628,20 @@ fn threats_in_room(
     room: &mut ThreatsRoom,
 ) -> Result<Threats, String> {
     let rack_size = game_config.rack_size() as usize;
+    let alphabet_len = game_config.alphabet().len() as usize;
+    let dim = game_config.board_layout().dim();
+    let cols = dim.cols as usize;
+    let squares = dim.rows as usize * cols;
+    kibitzer.available_tally.clear();
+    kibitzer.board_tiles.clear();
+    if kibitzer
+        .available_tally
+        .try_reserve_exact(alphabet_len)
+        .is_err()
+        || kibitzer.board_tiles.try_reserve_exact(squares).is_err()
+    {
+        return Err(OUT_OF_MEMORY.into());
+    }
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
@@ -3635,7 +3649,6 @@ fn threats_in_room(
         if !req.rack.is_empty() {
             return Err("rack, unseen: give one or the other".into());
         }
-        let alphabet_len = game_config.alphabet().len() as usize;
         if unseen.len() != alphabet_len {
             return Err(format!(
                 "unseen: a count each of {alphabet_len} tiles, found {} counts",
@@ -3679,10 +3692,18 @@ fn threats_in_room(
     } = &mut room.deal;
     chances.clear();
     left.clear();
-    left.resize(unseen.len(), 0u8);
     rest.clear();
-    rest.resize(unseen.len() + 1, 0usize);
     held.clear();
+    rack.clear();
+    if left.try_reserve_exact(alphabet_len).is_err()
+        || rest.try_reserve_exact(alphabet_len + 1).is_err()
+        || held.try_reserve_exact(opponent_rack).is_err()
+        || rack.try_reserve_exact(opponent_rack).is_err()
+    {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    left.resize(alphabet_len, 0);
+    rest.resize(alphabet_len + 1, 0);
     let mut refused = false;
     for (leave, weight) in (0..leaves).map(leave) {
         if weight == 0.0 {
@@ -3731,6 +3752,23 @@ fn threats_in_room(
         })
     });
 
+    room.pool.clear();
+    room.weigher.rack_square.clear();
+    room.square_best.clear();
+    if room.pool.try_reserve_exact(num_unseen).is_err()
+        || room.weigher.rack_square.try_reserve_exact(squares).is_err()
+        || room.square_best.try_reserve_exact(squares).is_err()
+    {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    room.pool.extend(
+        (0u8..)
+            .zip(unseen.iter())
+            .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
+    );
+    room.weigher.rack_square.resize(squares, (usize::MAX, 0));
+    room.weigher.stamp = 0;
+    room.square_best.resize(squares, i32::MIN);
     let move_generator = Lent {
         rules: game_config.clone(),
         movegen: Some(match room.move_generator.take() {
@@ -3741,29 +3779,12 @@ fn threats_in_room(
             None => game_config.own_generator()?,
         }),
     };
-    let pool = &mut room.pool;
-    pool.clear();
-    pool.extend(
-        (0u8..)
-            .zip(unseen.iter())
-            .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
-    );
-    let dim = game_config.board_layout().dim();
-    let cols = dim.cols as usize;
-    let squares = kibitzer.board_tiles.len();
     let seed = req
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
     // every check passed: the room's buffers are the question's, the others
     // emptied as a new question's are made
     let room = std::mem::take(room);
-    let mut weigher = room.weigher;
-    weigher.rack_square.clear();
-    weigher.rack_square.resize(squares, (usize::MAX, 0i32));
-    weigher.stamp = 0;
-    let mut square_best = room.square_best;
-    square_best.clear();
-    square_best.resize(squares, i32::MIN);
     let (mut exact_sums, mut drawn_sums) = (room.exact_sums, room.drawn_sums);
     exact_sums.empty();
     drawn_sums.empty();
@@ -3779,7 +3800,7 @@ fn threats_in_room(
     best.clear();
     Ok(Threats {
         exact_sums,
-        weigher,
+        weigher: room.weigher,
         keys,
         key: room.key,
         best,
@@ -3801,7 +3822,7 @@ fn threats_in_room(
         reach_from,
         reach_lanes: 0,
         reach_placing: false,
-        square_best,
+        square_best: room.square_best,
         board_tiles: std::mem::take(&mut kibitzer.board_tiles),
         cols,
         rack_size,
@@ -10513,6 +10534,39 @@ mod tests {
             cat_board(),
             serde_json::to_string(&unseen).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_threats_question_refused_its_scratch_answers_out_of_memory() {
+        tiny_lexicon("alloc-threats-setup");
+        let kwg = CACHED_KWG.read().unwrap()["alloc-threats-setup"].clone();
+        let rules: std::sync::Arc<_> = CachedRules::new(game_config::make_english_game_config())
+            .unwrap()
+            .into();
+        let mut unseen = [0u8; 27];
+        unseen[A as usize] = 1;
+        let req = format!(
+            r#"{{"board":{},"lexicon":"alloc-threats-setup","rules":"CrosswordGame","unseen":{},"seed":1}}"#,
+            cat_board(),
+            serde_json::to_string(&unseen).unwrap(),
+        );
+        let mut room = ThreatsRoom {
+            move_generator: Some(rules.own_generator().unwrap()),
+            ..ThreatsRoom::default()
+        };
+        let mut kibitzer = kibitzer::Kibitzer {
+            available_tally: Vec::with_capacity(unseen.len()),
+            board_tiles: Vec::with_capacity(15 * 15),
+        };
+        let mut make =
+            |req| threats_in_room(req, kwg.clone(), rules.clone(), &mut kibitzer, &mut room);
+        let small = serde_json::from_str(&req).unwrap();
+        // enough to deal one tile, but not for the per-square score scratch
+        let refused = refusing_from(768, || make(small));
+        assert_eq!(refused.err().as_deref(), Some(OUT_OF_MEMORY));
+        let retried = make(serde_json::from_str(&req).unwrap()).unwrap();
+        assert_eq!(retried.racks.as_slice(), &[(0, 1.0)]);
+        assert_eq!(retried.pool, [A]);
     }
 
     // run alone though only its own thread is refused: its walk generates on a
