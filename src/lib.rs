@@ -3529,6 +3529,16 @@ struct ThreatsMade {
     live: fash::MyHashMap<u32, Threats>,
 }
 
+impl ThreatsMade {
+    fn insert(&mut self, threats: Threats) -> Result<u32, String> {
+        let handle = self.made.checked_add(1).ok_or("too many threats made")?;
+        self.live.try_reserve(1).map_err(|_| OUT_OF_MEMORY)?;
+        self.made = handle;
+        self.live.insert(handle, threats);
+        Ok(handle)
+    }
+}
+
 static THREATS: std::sync::LazyLock<std::sync::Mutex<ThreatsMade>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -4425,11 +4435,7 @@ pub fn threats_new(req_str: String) -> Result<u32, JsValue> {
 fn do_threats_new(req_str: &str) -> Result<u32, String> {
     let req = serde_json::from_str::<ThreatsRequest>(req_str).map_err(err_to_str)?;
     let threats = threats_made(req)?;
-    let mut made = THREATS.lock().map_err(err_to_str)?;
-    let handle = made.made.checked_add(1).ok_or("too many threats made")?;
-    made.made = handle;
-    made.live.insert(handle, threats);
-    Ok(handle)
+    THREATS.lock().map_err(err_to_str)?.insert(threats)
 }
 
 // threats_step: ms, a time to run (none: every rack counted; 0: nothing more
@@ -10534,6 +10540,18 @@ mod tests {
             cat_board(),
             serde_json::to_string(&unseen).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_refused_threats_handle_does_not_use_a_number() {
+        let req = many_threats();
+        let make = || threats_made(serde_json::from_str(&req).unwrap()).unwrap();
+        let mut made = ThreatsMade::default();
+        let threats = make();
+        let refused = refusing_from(256, || made.insert(threats));
+        assert_eq!(refused.err().as_deref(), Some(OUT_OF_MEMORY));
+        assert!(made.live.is_empty());
+        assert_eq!(made.insert(make()).unwrap(), 1);
     }
 
     #[test]
