@@ -253,6 +253,7 @@ struct CachedKlv {
 impl CachedKlv {
     fn new(table: Klv) -> Result<Self, JsValue> {
         let (min_leave, max_leave) = table.leave_range();
+        let (min_leave, max_leave) = (min_leave.raw(), max_leave.raw());
         if min_leave < -LEAVE_LIMIT || max_leave > LEAVE_LIMIT {
             return_js_error!(format!(
                 "leave: has values from {min_leave} to {max_leave} thousandths of a point, past {LEAVE_LIMIT} either way"
@@ -705,7 +706,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
                 key.clear();
                 key.extend_from_slice(&equity.raw().to_le_bytes());
                 key.extend([*down as u8, *lane as u8, *idx as u8]);
-                key.extend_from_slice(&score.to_le_bytes());
+                key.extend_from_slice(&score.raw().to_le_bytes());
                 let tiles = key.len();
                 key.extend_from_slice(word);
                 key[tiles..].sort_unstable();
@@ -926,7 +927,7 @@ impl serde::Serialize for ScoredPlaysJson<'_, '_> {
             let mut canonical_play = adjusted_play.unwrap_or(play);
             let recounted_score = ps.compute_score(board_snapshot, &canonical_play);
             if let movegen::Play::Place { ref mut score, .. } = canonical_play {
-                *score = recounted_score;
+                *score = equity::Equity::new(recounted_score);
             }
             let recounted_equity = ps.compute_equity(
                 board_snapshot,
@@ -1863,7 +1864,7 @@ impl Sim {
                 .ok_or_else(|| format!("bonus: {bonus} points overflow the score"))?
         };
         if let movegen::Play::Place { score: s, .. } = &mut play {
-            *s = score;
+            *s = equity::Equity::new(score);
         }
         let pass = movegen::Play::Exchange {
             tiles: [][..].into(),
@@ -2359,7 +2360,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
             .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
     );
     for i in 0..num_players {
-        game_state.players[i].score = scores[i];
+        game_state.players[i].score = equity::Equity::new(scores[i]);
         if i != turn {
             game_state
                 .bag
@@ -2680,7 +2681,7 @@ impl serde::Serialize for ThreatPlays<'_> {
                         lane: play.lane,
                         idx: play.idx,
                         word: &play.word,
-                        score: play.score,
+                        score: equity::Equity::new(play.score),
                     },
                 }),
         )
@@ -2724,7 +2725,9 @@ impl serde::Serialize for ThreatRow<'_> {
         let squares = self.squares;
         serializer.collect_seq((self.row.iter().zip(self.from..)).map(|(&tile, at)| {
             (tile == 0).then(|| ThreatSquare {
-                best: equity::descale_score(squares.square_best[at].max(0)),
+                best: equity::Equity::new(squares.square_best[at].max(0))
+                    .descaled()
+                    .raw(),
                 chance: squares.chance.at(at),
                 expected: squares.expected.at(at) / equity::SCALE as f64,
                 reach: squares.reach.at(at),
@@ -3998,8 +4001,7 @@ impl Threats {
                 self.move_generator.pool_plays_best_part(
                     &board_snapshot,
                     &self.pool,
-                    lanes,
-                    window,
+                    movegen::PoolWindow { lanes, window },
                     budget,
                     (&mut self.lists, part),
                     found,
@@ -4016,8 +4018,7 @@ impl Threats {
             ThreatPass::Top(lanes, window, floor) => self.move_generator.pool_plays_top_window(
                 &board_snapshot,
                 &self.pool,
-                lanes,
-                window,
+                movegen::PoolWindow { lanes, window },
                 most,
                 (&mut self.lists, floor),
                 found,
@@ -5287,7 +5288,6 @@ impl Endgame {
         {
             return Err("endgame: its table belongs to other tables".into());
         }
-        solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
         // shaped as a step's limits, which always have a time, but with no end
         let limits = endgame::Limits {
             time: Some(std::time::Duration::MAX),
@@ -5468,7 +5468,6 @@ impl Endgame {
         let lead = points(equity::Equity::new(self.lead));
         let steps = self.answer.steps + 1;
         let answer = if let Some(progress) = self.peg_bag.as_mut() {
-            solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
             let peg = solver.resume_peg_best(progress, &limits, 1);
             let peg = peg
                 .map_err(err_to_str)
@@ -5508,7 +5507,6 @@ impl Endgame {
                 moves: progress.moves().map(|(valued, of)| [valued, of]),
             }
         } else if let Some(progress) = self.peg.as_mut() {
-            solver.set_scoreless_turns(self.pass_turns, self.zero_turns);
             let peg = solver.resume_peg_one_in_bag_best(progress, &limits, 1);
             let peg = peg
                 .map_err(err_to_str)
@@ -5836,6 +5834,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                     unseen_tally: unseen.clone(),
                     bag_size: bag,
                     score_diff: equity::Equity::new(scores),
+                    scoreless: [req.pass_turns, req.zero_turns],
                     exchanges,
                     model,
                 },
@@ -5868,6 +5867,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
             &rack,
             &unseen,
             equity::Equity::new(scores),
+            [req.pass_turns, req.zero_turns],
         )
     });
     // an endgame warmed by one before it (warm_from), of the same rules and
@@ -9283,6 +9283,7 @@ mod tests {
                 unseen_tally: kibitzer.available_tally.clone(),
                 bag_size: 2,
                 score_diff: equity::Equity::ZERO,
+                scoreless: [0, 0],
                 exchanges: [0, 0],
                 model,
             },
