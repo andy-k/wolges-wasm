@@ -837,12 +837,36 @@ may lie between the opponent's rack and the bag. The request:
     tiles in the bag. The search's early passes value every move fast where a
     line still leaves tiles in the bag, each such value an estimate and the
     answer then not exact, and its later passes make them exact.
+  root_moves: array of plays or null, optional. The plays the search may choose
+    its play among, as below; left out, it may choose any.
 
 endgame_new refuses an empty rack, a rack that is not full while the bag holds
 a tile, a position whose opponent holds no tiles, model or exchanges left out
 with two or more tiles in the bag, and part or estimates with fewer. Under a
 cap, an endgame with two or more tiles in the bag whose ways the tiles may lie
-do not fit throws out_of_memory.
+do not fit throws out_of_memory. So does one whose root_moves do not fit, under
+a cap or not.
+
+Given root_moves, endgame_step chooses its play among those plays alone, and
+searches the replies and the moves after them as without it. With an empty bag,
+first_moves_ms values each of them; with tiles in the bag, the answer's
+candidates are those plays. The list holds 1 to 65534 plays, each as analyze or
+an endgame answer gives it, a placement with its score; a pass is among them
+when {"action":"exchange","tiles":[]} is. Each play is checked as the endgame
+is made: it must be a play of the rack on the board that makes only words of
+the lexicon, a placement must give its score as scored, an exchange must be one
+the bag and the player's exchanges so far allow, and no play may be given
+twice, the same or written another way. A play that fails refuses the endgame
+with a message that names it, as in root_moves[1]: wrong score, and that
+message comes in double quotes of its own. A word holding -128 ("invalid blank
+tile") or a score past 2147483 points either way ("score out of range") refuses
+it too, its message naming the play in the same way but with no quotes.
+
+With one tile in the bag, under rules that allow an exchange while the bag
+holds a tile (Spanish), root_moves makes the endgame search as one with two or
+more tiles in the bag does, and all this file gives for two or more tiles in
+the bag then holds for it: model and exchanges are required, part and estimates
+may be given, and its steps answer as with two or more tiles.
 
 An endgame holds its rules, the lexicon pruned for its board (under a cap
 without room for the prune, the lexicon itself), and its solver's table from
@@ -928,10 +952,10 @@ With candidates_range the answer also gives candidates_total, how many
 candidates there are, and, when draws_of's candidate is not in the range,
 drawn: that candidate with its draws, and index, its place.
 
-With one tile in the bag, under rules that allow an exchange while the bag
-holds a tile (Spanish), the search values each tile as if the player to move
-knew it is the one in the bag: the answer gives win, value, and tiles, but its
-play stays null and its candidates empty.
+Without root_moves, with one tile in the bag, under rules that allow an
+exchange while the bag holds a tile (Spanish), the search values each tile as
+if the player to move knew it is the one in the bag: the answer gives win,
+value, and tiles, but its play stays null and its candidates empty.
 
 A step's answer takes the last one's place when it is better: with an empty
 bag, when the last had no play, or the step's is exact, deeper, or worth more

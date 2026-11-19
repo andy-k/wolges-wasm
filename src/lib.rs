@@ -4863,6 +4863,7 @@ struct EndgameNewRequest {
     pass_turns: u16,
     #[serde(default)]
     max_memory_mb: Option<usize>,
+    root_moves: Option<Vec<kibitzer::JsonPlay>>,
     // the solver's table from the start, in MiB (none or 0: it grows from one
     // bucket), held to half of max_memory_mb, as a growing table holds its old
     // buckets beside the new ones
@@ -5146,6 +5147,7 @@ struct Endgame {
     in_bag: bool,
     bag: usize,
     peg_bag: Option<endgame::PegBagProgress>,
+    root_moves: Option<endgame::RootMoves>,
     turn: u8,
     lead: i32,
     pass_turns: u16,
@@ -5256,6 +5258,7 @@ macro_rules! step_solver {
             ),
         }
         .map_err(err_to_str)?
+        .with_root_moves($endgame.root_moves.as_ref())
     };
 }
 
@@ -5801,7 +5804,9 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     }
     // with two tiles or more in the bag, what each player knows and the
     // exchanges made are the position's too
-    let bag_search = if bag >= 2 {
+    let committed_exchange =
+        bag == 1 && req.root_moves.is_some() && game_config.exchange_tile_limit() <= 1;
+    let bag_search = if bag >= 2 || committed_exchange {
         let model = match req.model.as_deref() {
             Some("info_sets") => endgame::PegModel::InfoSets,
             Some("random_draws") => endgame::PegModel::RandomDraws,
@@ -5811,7 +5816,8 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 ));
             }
         };
-        let exchanges = (req.exchanges)
+        let exchanges = req
+            .exchanges
             .ok_or_else(|| format!("exchanges: each seat's, with {bag} tiles in the bag"))?;
         if exchanges.iter().any(|&made| made < 0) {
             return Err(format!("exchanges: each must be >= 0, found {exchanges:?}"));
@@ -5822,6 +5828,46 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     };
     let mut rack = req.rack;
     rack.sort_unstable();
+    let mut root_moves = if let Some(requested) = req.root_moves {
+        let mut plays = Vec::new();
+        plays
+            .try_reserve_exact(requested.len())
+            .map_err(|_| OUT_OF_MEMORY)?;
+        for (i, play) in requested.iter().enumerate() {
+            if let kibitzer::JsonPlay::Play { word, score, .. } = play {
+                if word.contains(&i8::MIN) {
+                    return Err(format!("root_moves[{i}]: invalid blank tile"));
+                }
+                if score.checked_mul(equity::SCALE).is_none() {
+                    return Err(format!("root_moves[{i}]: score out of range"));
+                }
+            }
+            plays.push(play.into());
+        }
+        let mut state = game_state::GameState::new(&game_config);
+        state.board_tiles.copy_from_slice(&kibitzer.board_tiles);
+        state.turn = req.turn;
+        state.players[turn].rack.clone_from(&rack);
+        state.players[turn].num_exchanges = bag_search.map_or(0, |(_, made)| made[turn]);
+        state.bag.set_from_iter(std::iter::repeat_n(0, bag));
+        Some(
+            endgame::RootMoves::checked(
+                &movegen::BoardSnapshot {
+                    board_tiles: &state.board_tiles,
+                    game_config: &game_config,
+                    kwg: &kwg.kwg,
+                    anagrams: None,
+                    rack_lengths: None,
+                    klv: &game_config.no_leaves,
+                },
+                &state,
+                plays,
+            )
+            .map_err(err_to_str)?,
+        )
+    } else {
+        None
+    };
     let peg_bag = match bag_search {
         Some((model, exchanges)) => {
             // the position's splits, taken only where the cap has room for
@@ -5846,7 +5892,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
             )
             .map_err(err_to_str)?
             .ok_or(OUT_OF_MEMORY)?;
-            Some(progress)
+            Some(progress.with_root_moves(root_moves.take()))
         }
         None if req.estimates => {
             return Err(format!(
@@ -5860,7 +5906,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         }
         None => None,
     };
-    let peg = (bag == 1).then(|| {
+    let peg = (bag == 1 && peg_bag.is_none()).then(|| {
         endgame::PegProgress::new(
             req.turn,
             &kibitzer.board_tiles,
@@ -5869,6 +5915,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
             equity::Equity::new(scores),
             [req.pass_turns, req.zero_turns],
         )
+        .with_root_moves(root_moves.take())
     });
     // an endgame warmed by one before it (warm_from), of the same rules and
     // lexicon: the new one takes that one's table, which then leaves that one,
@@ -5957,6 +6004,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         in_bag,
         bag,
         peg_bag,
+        root_moves,
         turn: req.turn,
         lead: scores,
         pass_turns: req.pass_turns,
@@ -8575,6 +8623,108 @@ mod tests {
         let kept = std::hint::black_box(vec![1u8; 1 << 20]);
         assert!(memory_held() >= kept.len() as f64);
         drop(kept);
+    }
+
+    #[test]
+    fn a_committed_one_tile_request_requires_an_explicit_position() {
+        let lexicon = "tiny-end-committed-fields";
+        let rules = "CrosswordGame/spanish";
+        tiny_lexicon(lexicon);
+        let rack = [A, A, E, E, S, T, C];
+        let unseen = [A, A, E, E, B, D, H, T];
+        let tiles = rack.into_iter().chain(unseen).collect::<Vec<_>>();
+        let mut request = serde_json::json!({
+            "rack": rack, "board": report(&late_board_of(rules, &tiles)), "lexicon": lexicon,
+            "rules": rules, "scores": [0, 0], "turn": 0, "zero_turns": 0, "pass_turns": 0,
+        });
+        let make = |req: &serde_json::Value| do_endgame_new(&req.to_string(), none_held);
+        do_endgame_free(make(&request).unwrap()).unwrap();
+        request["root_moves"] = serde_json::json!([report(PASS)]);
+        assert!(make(&request).unwrap_err().starts_with("model:"));
+        request["model"] = serde_json::json!("random_draws");
+        assert!(make(&request).unwrap_err().starts_with("exchanges:"));
+        request["exchanges"] = serde_json::json!([0, 0]);
+        do_endgame_free(make(&request).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_endgame_can_value_just_one_selected_root_play() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
+        for bag in 0..=2 {
+            let others = &others[..7 + bag];
+            let more = if bag == 2 {
+                r#","model":"random_draws","exchanges":[0,0]"#
+            } else {
+                ""
+            };
+            let solve = if bag == 0 {
+                r#"{"ms":60000,"first_moves_ms":60000}"#
+            } else {
+                r#"{"ms":60000}"#
+            };
+            let lexicon = format!("tiny-end-root-{bag}");
+            let full = endgame_of(&lexicon, &rack, others, more).unwrap();
+            let answer = endgame_step(full, solve);
+            assert_eq!(answer["exact"], true, "{answer}");
+            let candidates = answer["candidates"].as_array().unwrap();
+            let chosen = candidates
+                .iter()
+                .rev()
+                .find(|play| play["play"]["action"] == "play")
+                .unwrap();
+            assert!(candidates.len() > 1, "{answer}");
+            let play = &chosen["play"];
+            let root = format!(r#"{more},"root_moves":[{play}],"warm_from":{full}"#);
+            let selected = endgame_of(&lexicon, &rack, others, &root).unwrap();
+            let scoped = endgame_step(selected, solve);
+            assert_eq!(scoped["exact"], true, "{scoped}");
+            assert_eq!(scoped["play"], *play);
+            assert_eq!(scoped["value"], chosen["value"]);
+            assert_eq!(scoped["candidates"], serde_json::json!([chosen]));
+            if bag == 2 {
+                let full_rows = endgame_step(full, &format!(r#"{{"ms":0,"draws_of":{play}}}"#));
+                let scoped_rows = endgame_step(selected, r#"{"ms":0,"draws_of":0}"#);
+                let candidate = full_rows["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["play"] == *play)
+                    .unwrap();
+                assert_eq!(scoped_rows["candidates"][0]["draws"], candidate["draws"]);
+            }
+            do_endgame_free(selected).unwrap();
+            do_endgame_free(full).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_endgame_refuses_invalid_root_plays_when_created() {
+        let rack = [S, E, A, T];
+        let others = [A, T, E];
+        for (root, error) in [
+            ("[]", "expected"),
+            (
+                r#"[{"action":"exchange","tiles":[19]}]"#,
+                "exchange is unavailable",
+            ),
+            (
+                r#"[{"action":"exchange","tiles":[]},{"action":"exchange","tiles":[]}]"#,
+                "duplicate",
+            ),
+            (
+                r#"[{"action":"play","down":false,"lane":2,"idx":5,"word":[-128,0],"score":0}]"#,
+                "invalid blank",
+            ),
+            (
+                r#"[{"action":"play","down":false,"lane":2,"idx":5,"word":[19,0],"score":2147483647}]"#,
+                "score out of range",
+            ),
+        ] {
+            let more = format!(r#","root_moves":{root}"#);
+            let refused = endgame_of("tiny-end-root-invalid", &rack, &others, &more).unwrap_err();
+            assert!(refused.contains(error), "{refused}");
+        }
     }
 
     // an empty bag asked for every first move's value: each exact, best first,
