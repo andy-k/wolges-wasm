@@ -91,6 +91,18 @@ impl Shortlist {
     }
 }
 
+pub(crate) fn copy_plays(shared: &Shared, ids: &[u32]) -> Result<Vec<movegen::Play>, String> {
+    let shortlist = shared.lock().map_err(err_to_str)?;
+    let mut plays = Vec::new();
+    plays
+        .try_reserve_exact(ids.len())
+        .map_err(|_| OUT_OF_MEMORY)?;
+    for &id in ids {
+        plays.push(shortlist.play(id)?.clone());
+    }
+    Ok(plays)
+}
+
 #[wasm_bindgen]
 pub fn shortlist_new(req_str: String) -> Result<u32, JsValue> {
     Ok(do_new(&req_str)?)

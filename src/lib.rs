@@ -5001,6 +5001,8 @@ fn page_clock() -> std::time::Duration {
 // model and the exchanges below are the position's too
 #[derive(serde::Deserialize)]
 struct EndgameNewRequest {
+    shortlist: Option<u32>,
+    root_ids: Option<Vec<u32>>,
     rack: Vec<u8>,
     #[serde(rename = "board")]
     board_tiles: Vec<Vec<i8>>,
@@ -5060,7 +5062,7 @@ struct EndgameNewRequest {
 struct EndgameStepRequest {
     ms: Option<f64>,
     #[serde(default)]
-    priority: Vec<kibitzer::JsonPlay>,
+    priority: Option<Vec<kibitzer::JsonPlay>>,
     #[serde(default)]
     first_moves_ms: Option<f64>,
     #[serde(default)]
@@ -5080,6 +5082,7 @@ struct EndgameStepRequest {
 enum DrawsOf {
     // its index in the answer's candidates
     Index(usize),
+    Id { id: u32 },
     // its play, as a candidate's play reads
     Play(kibitzer::JsonPlay),
 }
@@ -5287,6 +5290,8 @@ struct EndgameAnswer {
 // table between steps, with tiles in the bag the search so far (one tile's, or
 // two or more's), and the last answer
 struct Endgame {
+    shortlist: Option<shortlist::Shared>,
+    priority: Option<std::sync::Arc<[movegen::Play]>>,
     game_config: std::sync::Arc<CachedRules>,
     kwg: std::sync::Arc<EndgameGraph>, // with its run letters, found as it was made
     arm_tables: std::sync::Arc<anagrams::ArmTables>,
@@ -5573,23 +5578,40 @@ impl Endgame {
     fn place_of(&self, draws_of: DrawsOf) -> Result<usize, String> {
         match draws_of {
             DrawsOf::Index(i) => Ok(i),
+            DrawsOf::Id { id } => {
+                let shared = shortlist::attached(&self.shortlist)?;
+                let shortlist = shared.lock().map_err(err_to_str)?;
+                let play = shortlist.play(id)?;
+                self.draws_place(play)
+                    .0
+                    .ok_or_else(|| format!("draws_of: shortlist move {id} has no draws"))
+            }
             DrawsOf::Play(play) => {
-                let found = (self.peg_bag.as_ref()).map(|progress| {
-                    (
-                        progress.answer_place(&(&play).into()),
-                        progress.answer_total(),
-                    )
-                });
-                match found {
-                    Some((Some(i), _)) => Ok(i),
-                    _ => Err(format!(
-                        "draws_of: {} is no candidate of the {} with draws",
-                        serde_json::to_string(&play).map_err(err_to_str)?,
-                        found.map_or(0, |(_, total)| total)
+                let (at, total) = self.draws_place(&(&play).into());
+                match at {
+                    Some(i) => Ok(i),
+                    None => Err(format!(
+                        "draws_of: {} is no candidate of the {total} with draws",
+                        serde_json::to_string(&play).map_err(err_to_str)?
                     )),
                 }
             }
         }
+    }
+
+    fn draws_place(&self, play: &movegen::Play) -> (Option<usize>, usize) {
+        self.peg_bag.as_ref().map_or((None, 0), |progress| {
+            (progress.answer_place(play), progress.answer_total())
+        })
+    }
+
+    fn check_priority(&self) -> Result<(), String> {
+        if self.bag == 1 && self.peg_bag.is_none() && self.game_config.exchange_tile_limit() <= 1 {
+            return Err(
+                "priority: the one-tile clairvoyant search has no committed root moves".into(),
+            );
+        }
+        Ok(())
     }
 
     // one solve of at most ms on the clock, on the table earlier steps kept
@@ -5982,6 +6004,16 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
+    let shortlist = shortlist::attach(
+        req.shortlist,
+        &req.rules,
+        &kwg,
+        &kibitzer.board_tiles,
+        &req.rack,
+    )?;
+    if req.root_moves.is_some() && req.root_ids.is_some() {
+        return Err("give root_moves or root_ids, not both".into());
+    }
     // the tiles the side to move cannot see: the other side's rack, and the
     // bag's, if any
     let unseen = kibitzer.available_tally.clone();
@@ -5997,8 +6029,9 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     }
     // with two tiles or more in the bag, what each player knows and the
     // exchanges made are the position's too
-    let committed_exchange =
-        bag == 1 && req.root_moves.is_some() && game_config.exchange_tile_limit() <= 1;
+    let committed_exchange = bag == 1
+        && (req.root_moves.is_some() || req.root_ids.is_some())
+        && game_config.exchange_tile_limit() <= 1;
     let bag_search = if bag >= 2 || committed_exchange {
         let model = match req.model.as_deref() {
             Some("info_sets") => endgame::PegModel::InfoSets,
@@ -6021,8 +6054,16 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     };
     let mut rack = req.rack;
     rack.sort_unstable();
-    let mut root_moves = if let Some(requested) = req.root_moves {
-        let plays = decode_root_plays(&requested, "root_moves")?;
+    let root_plays = match (req.root_moves, req.root_ids) {
+        (Some(requested), None) => Some(decode_root_plays(&requested, "root_moves")?),
+        (None, Some(ids)) => Some(shortlist::copy_plays(
+            shortlist::attached(&shortlist)?,
+            &ids,
+        )?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("root lists already checked"),
+    };
+    let mut root_moves = if let Some(plays) = root_plays {
         let mut state = game_state::GameState::new(&game_config);
         state.board_tiles.copy_from_slice(&kibitzer.board_tiles);
         state.turn = req.turn;
@@ -6172,6 +6213,8 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     let reserve = (req.reserve_mb.unwrap_or(0).saturating_mul(1 << 20))
         .min(max_memory.map_or(usize::MAX, |bytes| bytes / 2));
     let endgame = Endgame {
+        shortlist,
+        priority: None,
         game_config,
         kwg,
         arm_tables,
@@ -6227,6 +6270,31 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     Ok(handle)
 }
 
+// order pending first plays for subsequent steps. An empty array clears it.
+#[wasm_bindgen]
+pub fn endgame_prioritize(handle: u32, ids: &[u32]) -> Result<(), JsValue> {
+    Ok(do_endgame_prioritize(handle, ids)?)
+}
+
+fn do_endgame_prioritize(handle: u32, ids: &[u32]) -> Result<(), String> {
+    let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+    let endgame = endgames
+        .live
+        .get_mut(&handle)
+        .ok_or_else(|| no_endgame(handle))?;
+    if ids.is_empty() {
+        endgame.priority = None;
+    } else {
+        endgame.check_priority()?;
+        let shortlist = shortlist::attached(&endgame.shortlist)?;
+        endgame.priority = Some(shortlist::copy_plays(shortlist, ids)?.into());
+        if endgame.bag == 0 {
+            endgame.keep_first_moves = true;
+        }
+    }
+    Ok(())
+}
+
 // a step of an endgame, as EndgameAnswer
 #[wasm_bindgen]
 pub fn endgame_step(handle: u32, req_str: String) -> Result<String, JsValue> {
@@ -6260,29 +6328,26 @@ fn do_endgame_step(
             );
         }
     }
-    let priority = decode_root_plays(&req.priority, "priority")?;
-    if !priority.is_empty() {
+    let inline = (req.priority.as_ref())
+        .map(|plays| decode_root_plays(plays, "priority"))
+        .transpose()?;
+    if inline.as_ref().is_some_and(|plays| !plays.is_empty()) {
+        endgame.check_priority()?;
         if endgame.bag == 0 {
             if req.first_moves_ms.is_none() {
                 return Err("priority: give first_moves_ms with an empty bag".into());
             }
             endgame.keep_first_moves = true;
         }
-        if endgame.bag == 1
-            && endgame.peg_bag.is_none()
-            && endgame.game_config.exchange_tile_limit() <= 1
-        {
-            return Err(
-                "priority: the one-tile clairvoyant search has no committed root moves".into(),
-            );
-        }
     }
+    let kept = endgame.priority.clone();
+    let priority = inline.as_deref().or(kept.as_deref()).unwrap_or(&[]);
     // an exact answer stays: no solve can better it
     if ms > 0.0 && !endgame.answer.exact {
-        endgame.solve(ms, clock, memory, &priority)?;
+        endgame.solve(ms, clock, memory, priority)?;
     }
     if let Some(ms) = req.first_moves_ms {
-        endgame.value_first_moves(ms, clock, memory, &priority)?;
+        endgame.value_first_moves(ms, clock, memory, priority)?;
     }
     if req.brief {
         if req.draws_of.is_some() {
@@ -8927,6 +8992,112 @@ mod tests {
         let kept = std::hint::black_box(vec![1u8; 1 << 20]);
         assert!(memory_held() >= kept.len() as f64);
         drop(kept);
+    }
+
+    #[test]
+    fn shortlist_moves_survive_switching_from_sim_to_endgame_and_back() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
+        let lexicon = "tiny-end-shortlist-switch";
+        tiny_lexicon(lexicon);
+        let all_tiles = [rack.as_slice(), others.as_slice()].concat();
+        let mut request = serde_json::json!({
+            "rack": rack,
+            "board": report(&late_board(&all_tiles)),
+            "lexicon": lexicon,
+            "rules": "CrosswordGame",
+            "scores": [0, 0],
+            "turn": 0,
+            "zero_turns": 0,
+            "pass_turns": 0,
+            "model": "random_draws",
+            "exchanges": [0, 0],
+            "leave": "noleave",
+            "plies": 2,
+            "seed": 7,
+        });
+        let reference = do_endgame_new(&request.to_string(), none_held).unwrap();
+        let full = endgame_step(reference, r#"{"ms":60000}"#);
+        assert_eq!(full["exact"], true);
+        let play = &full["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["play"]["action"] == "play")
+            .unwrap()["play"];
+        let shortlist = shortlist::do_new(&request.to_string()).unwrap();
+        let ids = shortlist::do_add(shortlist, &format!("[{play},{PASS}]")).unwrap();
+        request["shortlist"] = serde_json::json!(shortlist);
+
+        let sim = do_sim_new(&request.to_string()).unwrap();
+        assert_eq!(
+            do_sim_change_ids(sim, &ids, SimChange::Add).unwrap(),
+            [0, 0]
+        );
+        do_sim_free(sim).unwrap();
+
+        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
+        do_endgame_prioritize(endgame, &[ids[1]]).unwrap();
+        assert!(do_endgame_prioritize(endgame, &[u32::MAX]).is_err());
+        let saved = ENDGAMES.lock().unwrap().live[&endgame].priority.clone();
+        assert!(matches!(
+            saved.unwrap().as_ref(),
+            [movegen::Play::Exchange { tiles }] if tiles.is_empty()
+        ));
+        assert_eq!(endgame_step(endgame, r#"{"ms":0}"#)["exact"], false);
+        let solved = endgame_step(endgame, r#"{"ms":60000}"#);
+        assert_eq!(full["candidates"], solved["candidates"]);
+        let by_id = format!(
+            r#"{{"ms":0,"draws_of":{{"id":{}}},"candidates_range":[0,0]}}"#,
+            ids[0]
+        );
+        let by_play = format!(r#"{{"ms":0,"draws_of":{play},"candidates_range":[0,0]}}"#);
+        assert_eq!(
+            endgame_step(endgame, &by_id),
+            endgame_step(endgame, &by_play)
+        );
+        do_endgame_prioritize(endgame, &[]).unwrap();
+        do_endgame_free(endgame).unwrap();
+
+        request["root_ids"] = serde_json::json!([ids[0]]);
+        let fixed = do_endgame_new(&request.to_string(), none_held).unwrap();
+        let one = endgame_step(fixed, r#"{"ms":60000}"#);
+        assert_eq!(one["exact"], true);
+        assert_eq!(one["play"], *play);
+        assert_eq!(one["candidates"].as_array().unwrap().len(), 1);
+        do_endgame_free(fixed).unwrap();
+        do_endgame_free(reference).unwrap();
+        let resumed = do_sim_new(&request.to_string()).unwrap();
+        assert_eq!(
+            do_sim_change_ids(resumed, &ids, SimChange::Add).unwrap(),
+            [0, 0]
+        );
+        do_sim_free(resumed).unwrap();
+        shortlist::do_free(shortlist).unwrap();
+    }
+
+    #[test]
+    fn an_endgame_uses_the_saved_order_in_a_timed_step() {
+        let lexicon = "tiny-end-shortlist-order";
+        tiny_lexicon(lexicon);
+        let rack = [S, B, D, F, G, H, I];
+        let tiles = [S, B, D, F, G, H, I, E, S, B, D, F, G, H, I];
+        let mut request = serde_json::json!({
+            "rack": rack, "board": report(&late_board(&tiles)), "lexicon": lexicon,
+            "rules": "CrosswordGame", "scores": [0, 0], "turn": 0, "zero_turns": 0,
+            "pass_turns": 0,
+        });
+        let shortlist = shortlist::do_new(&request.to_string()).unwrap();
+        let ids = shortlist::do_add(shortlist, &format!("[{PASS}]")).unwrap();
+        request["shortlist"] = serde_json::json!(shortlist);
+        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
+        do_endgame_prioritize(endgame, &ids).unwrap();
+        shortlist::do_free(shortlist).unwrap();
+        let short = report(&do_endgame_step(endgame, r#"{"ms":1}"#, ticking, none_held).unwrap());
+        assert_eq!(short["candidates"][0]["play"], report(PASS), "{short}");
+        assert_eq!(short["exact"], false);
+        assert!(endgame_step(endgame, r#"{"ms":60000}"#)["exact"] == true);
+        do_endgame_free(endgame).unwrap();
     }
 
     #[test]

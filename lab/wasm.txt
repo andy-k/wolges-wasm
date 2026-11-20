@@ -76,11 +76,12 @@ its handle, a whole number, and later calls name it:
   sim: made by sim_new; changed by sim_add, sim_remove, sim_pause, sim_resume,
     sim_set, and the id calls (sim_add_ids and the others); stepped by
     sim_step; freed by sim_free.
-  endgame: made by endgame_new; stepped by endgame_step; its table taken by a
-    later endgame_new (warm_from); freed by endgame_free.
+  endgame: made by endgame_new; stepped by endgame_step; ordered by
+    endgame_prioritize; its table taken by a later endgame_new (warm_from);
+    freed by endgame_free.
   shortlist: made by shortlist_new; added to by shortlist_add; read by
-    shortlist_plays and by the shortlist field of sim_new; freed by
-    shortlist_free.
+    shortlist_plays and by the shortlist field of sim_new and endgame_new;
+    freed by shortlist_free.
 
 Each kind numbers its handles from 1 and never gives a number twice. An object
 lives, with all it holds, until its free call; nothing else frees it. A handle
@@ -94,8 +95,8 @@ another is refused.
 An object holds the tables it was made with. Loading another table under the
 same name, or evicting the name, changes no live object; only later requests
 read the new table, or are refused. A sim given an inference holds its leaves,
-and one given a shortlist holds the shortlist, whether or not the handle is
-freed.
+and a sim or endgame given a shortlist holds the shortlist, whether or not the
+handle is freed.
 
 Handles, and the ids of a shortlist's plays, belong to the module instance that
 made them. An inference moves to another instance as bytes, by infer_export in
@@ -627,7 +628,7 @@ weighed, until threats_free.
 SHORTLISTS
 
 A shortlist holds plays of one position, each checked once and known by an id,
-for sims to name by id.
+for sims and endgames to name by id.
 
 shortlist_new(request) makes a shortlist and answers its handle. The request:
 
@@ -653,9 +654,11 @@ shortlist_add, and shortlist_plays throw out_of_memory where the shortlist, the
 ids, or the answer does not fit.
 
 shortlist_free(handle) frees a shortlist and answers undefined, once no more
-plays are to be added to it and no more sims made with it. A sim given the
-shortlist keeps it, but a later sim_new cannot name it. Phonies, bonuses, and
-plays challenged off go to a sim by sim_add.
+plays are to be added to it and no more sims or endgames made with it. A sim or
+endgame given the shortlist keeps it, but a later sim_new or endgame_new cannot
+name it. A sim or endgame may be freed, letting go of its search, while its
+shortlist is kept for the next. Phonies, bonuses, and plays challenged off go
+to a sim by sim_add.
 
 
 SIMS
@@ -906,34 +909,44 @@ may lie between the opponent's rack and the bag. The request:
     answer then not exact, and its later passes make them exact.
   root_moves: array of plays or null, optional. The plays the search may choose
     its play among, as below; left out, it may choose any.
+  shortlist: shortlist handle or null, optional. A shortlist of this position,
+    as sim_new takes one, whose plays root_ids, endgame_prioritize, and
+    draws_of then name by id.
+  root_ids: array of whole numbers or null, optional. root_moves given as ids
+    in the endgame's shortlist, and never with root_moves; the plays are
+    checked as root_moves are, at this endgame's position, its bag and
+    exchanges included.
 
 endgame_new refuses an empty rack, a rack that is not full while the bag holds
 a tile, a position whose opponent holds no tiles, model or exchanges left out
 with two or more tiles in the bag, and part or estimates with fewer. Under a
 cap, an endgame with two or more tiles in the bag whose ways the tiles may lie
-do not fit throws out_of_memory. So does one whose root_moves do not fit, under
-a cap or not.
+do not fit throws out_of_memory. So does one whose root_moves or root_ids do
+not fit, under a cap or not.
 
-Given root_moves, endgame_step chooses its play among those plays alone, and
-searches the replies and the moves after them as without it. With an empty bag,
-first_moves_ms values each of them; with tiles in the bag, the answer's
-candidates are those plays. The list holds 1 to 65534 plays, each as analyze or
-an endgame answer gives it, a placement with its score; a pass is among them
-when {"action":"exchange","tiles":[]} is. Each play is checked as the endgame
-is made: it must be a play of the rack on the board that makes only words of
-the lexicon, a placement must give its score as scored, an exchange must be one
-the bag and the player's exchanges so far allow, and no play may be given
-twice, the same or written another way. A play that fails refuses the endgame
-with a message that names it, as in root_moves[1]: wrong score, and that
-message comes in double quotes of its own. A word holding -128 ("invalid blank
-tile") or a score past 2147483 points either way ("score out of range") refuses
-it too, its message naming the play in the same way but with no quotes.
+Given root_moves or root_ids, endgame_step chooses its play among those plays
+alone, and searches the replies and the moves after them as without it. With an
+empty bag, first_moves_ms values each of them; with tiles in the bag, the
+answer's candidates are those plays. The list holds 1 to 65534 plays, each as
+analyze or an endgame answer gives it, a placement with its score; a pass is
+among them when {"action":"exchange","tiles":[]} is. Each play is checked as
+the endgame is made: it must be a play of the rack on the board that makes only
+words of the lexicon, a placement must give its score as scored, an exchange
+must be one the bag and the player's exchanges so far allow, and no play may be
+given twice, the same or written another way. A play that fails refuses the
+endgame with a message that names it, as in root_moves[1]: wrong score, and
+that message comes in double quotes of its own; a play given by root_ids is
+named root_moves[i] too, i its place in root_ids. A word holding -128 ("invalid
+blank tile") or a score past 2147483 points either way ("score out of range")
+refuses it too, its message naming the play in the same way but with no quotes.
+root_ids is refused for an endgame with no shortlist ("no shortlist attached")
+or with an id the shortlist lacks ("shortlist move 9: none such").
 
 With one tile in the bag, under rules that allow an exchange while the bag
-holds a tile (Spanish), root_moves makes the endgame search as one with two or
-more tiles in the bag does, and all this file gives for two or more tiles in
-the bag then holds for it: model and exchanges are required, part and estimates
-may be given, and its steps answer as with two or more tiles.
+holds a tile (Spanish), root_moves or root_ids makes the endgame search as one
+with two or more tiles in the bag does, and all this file gives for two or more
+tiles in the bag then holds for it: model and exchanges are required, part and
+estimates may be given, and its steps answer as with two or more tiles.
 
 An endgame holds its rules, the lexicon pruned for its board (under a cap
 without room for the prune, the lexicon itself), and its solver's table from
@@ -949,13 +962,17 @@ it stands. The request:
     After solving, value every first move as well, on the table the steps kept,
     in at most this many milliseconds more; the answer's candidates then list
     them.
-  priority: array of plays, optional ([] if left out). Moves the search has yet
-    to value, to value first, in the order given, each a play as the answer's
+  priority: array of plays or null, optional. Moves the search has yet to
+    value, to value first, in the order given, each a play as the answer's
     candidates give it; a play that is not such a move is passed over. With an
     empty bag, priority orders the moves first_moves_ms values, and needs it.
-  draws_of: whole number, play, or null, optional; only with two or more tiles
-    in the bag. The candidate whose draws to give, by its place in the answer's
-    candidates, or by its play as the answer gives it.
+    Left out or null, the step uses the priority endgame_prioritize saved, if
+    any; given, even as [], it takes that one's place for this step alone.
+  draws_of: whole number, play, object, or null, optional; only with two or
+    more tiles in the bag. The candidate whose draws to give, by its place in
+    the answer's candidates, by its play as the answer gives it, or by
+    {"id":n}, its id in the endgame's shortlist. An id with no draws is refused
+    ("draws_of: shortlist move 9 has no draws").
   draws_range: [from, to] or null, optional; only with draws_of. The draws from
     place from to before place to.
   candidates_range: [from, to] or null, optional. Give only the candidates from
@@ -1007,7 +1024,8 @@ The answer:
   candidates: with tiles in the bag, every play the search valued, the best
     first. With an empty bag, the first moves first_moves_ms valued, the best
     first; left out before, and left out again by a later step whose solve
-    gives a new answer, unless a step has given a priority (above).
+    gives a new answer, unless a step or endgame_prioritize has given the
+    endgame a priority (above).
   endgames: with tiles in the bag, the endgames searched.
   moves: with tiles in the bag, [valued, of]: the moves the pass under way has
     valued, of all it values; left out before the search began.
@@ -1038,10 +1056,10 @@ With candidates_range the answer also gives candidates_total, how many
 candidates there are, and, when draws_of's candidate is not in the range,
 drawn: that candidate with its draws, and index, its place.
 
-Without root_moves, with one tile in the bag, under rules that allow an
-exchange while the bag holds a tile (Spanish), the search values each tile as
-if the player to move knew it is the one in the bag: the answer gives win,
-value, and tiles, but its play stays null and its candidates empty.
+Without root_moves or root_ids, with one tile in the bag, under rules that
+allow an exchange while the bag holds a tile (Spanish), the search values each
+tile as if the player to move knew it is the one in the bag: the answer gives
+win, value, and tiles, but its play stays null and its candidates empty.
 
 A step's answer takes the last one's place when it is better: with an empty
 bag, when the last had no play, or the step's is exact, deeper, or worth more
@@ -1053,14 +1071,26 @@ tiles in the bag, draws_of with fewer than two tiles in the bag or naming no
 candidate, brief with draws_of or candidates_range, draws_range without
 draws_of, a priority of one or more plays with an empty bag but no
 first_moves_ms, and one where the search values each tile as if it were known
-(one tile in the bag under Spanish rules without root_moves). A priority play
-whose word holds -128 or whose score is past 2147483 points either way is
-refused, as for root_moves. It refuses brief, draws_range, and draws_of after
-the step's solve, which stands. A step throws out_of_memory where its priority,
-or the first-move values it keeps, do not fit, and it throws when the rules let
-scoreless turns go on without end in the position, the message saying it is not
-solvable. When the cap stopped the draws that draws_of asked for, the answer
-comes as without draws_of, with out_of_memory true and out_of_memory_in
-"draws".
+(one tile in the bag under Spanish rules without root_moves or root_ids). A
+priority play whose word holds -128 or whose score is past 2147483 points
+either way is refused, as for root_moves. It refuses brief, draws_range, and
+draws_of after the step's solve, which stands. A step throws out_of_memory
+where its priority, or the first-move values it keeps, do not fit, and it
+throws when the rules let scoreless turns go on without end in the position,
+the message saying it is not solvable. When the cap stopped the draws that
+draws_of asked for, the answer comes as without draws_of, with out_of_memory
+true and out_of_memory_in "draws".
+
+endgame_prioritize(handle, ids) saves a priority for every later step of an
+endgame: the plays named by ids, a Uint32Array of ids in its shortlist, in that
+order. An empty array clears it. It answers undefined. A step orders its search
+by the saved priority as by its own (priority above), and needs no more than
+its ms. With an empty bag the saved priority orders the moves of
+first_moves_ms, which a step gives when it wants first-move values, and from
+then on the endgame keeps its first-move values from step to step, as after a
+step's priority. Given ids, endgame_prioritize refuses an endgame with no
+shortlist, an id the shortlist lacks, and an endgame whose search values each
+tile as if it were known, and it throws out_of_memory where the plays the ids
+name do not fit.
 
 endgame_free(handle) frees an endgame, with its table, and answers undefined.
