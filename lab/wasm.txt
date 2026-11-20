@@ -882,6 +882,10 @@ it stands. The request:
     After solving, value every first move as well, on the table the steps kept,
     in at most this many milliseconds more; the answer's candidates then list
     them.
+  priority: array of plays, optional ([] if left out). Moves the search has yet
+    to value, to value first, in the order given, each a play as the answer's
+    candidates give it; a play that is not such a move is passed over. With an
+    empty bag, priority orders the moves first_moves_ms values, and needs it.
   draws_of: whole number, play, or null, optional; only with two or more tiles
     in the bag. The candidate whose draws to give, by its place in the answer's
     candidates, or by its play as the answer gives it.
@@ -895,6 +899,21 @@ it stands. The request:
     candidates_range.
 
 The fields that shape the answer do not change the solve.
+
+A priority changes neither which plays are candidates nor what an exact answer
+means: the moves it leaves out are still valued, and values already found stay.
+A step may give another priority to steer what it values, or none. With tiles
+in the bag, priority orders the moves the pass under way has yet to value, and
+a step needs an ms above 0 for it to order anything. With an empty bag, the
+solve that ms runs keeps its own order, and priority orders the moves of
+first_moves_ms, as in
+
+  {"ms":0,"first_moves_ms":200,"priority":[{"action":"exchange","tiles":[]}]}
+
+From a step that gives an empty bag's endgame a priority on, the endgame keeps
+its first-move values from step to step: each later first_moves_ms adds its
+values to them, a value taking an old one's place unless the old one is exact
+and the new one is not, and a solve no longer leaves them out.
 
 The answer:
 
@@ -921,7 +940,7 @@ The answer:
   candidates: with tiles in the bag, every play the search valued, the best
     first. With an empty bag, the first moves first_moves_ms valued, the best
     first; left out before, and left out again by a later step whose solve
-    gives a new answer.
+    gives a new answer, unless a step has given a priority (above).
   endgames: with tiles in the bag, the endgames searched.
   moves: with tiles in the bag, [valued, of]: the moves the pass under way has
     valued, of all it values; left out before the search began.
@@ -964,11 +983,17 @@ where it stopped. The depth never falls.
 
 endgame_step refuses ms left out ("endgame_step: give ms"), first_moves_ms with
 tiles in the bag, draws_of with fewer than two tiles in the bag or naming no
-candidate, brief with draws_of or candidates_range, and draws_range without
-draws_of. It refuses all but ms after the step's solve, which stands. A step
-throws when the rules let scoreless turns go on without end in the position,
-the message saying it is not solvable. When the cap stopped the draws that
-draws_of asked for, the answer comes as without draws_of, with out_of_memory
-true and out_of_memory_in "draws".
+candidate, brief with draws_of or candidates_range, draws_range without
+draws_of, a priority of one or more plays with an empty bag but no
+first_moves_ms, and one where the search values each tile as if it were known
+(one tile in the bag under Spanish rules without root_moves). A priority play
+whose word holds -128 or whose score is past 2147483 points either way is
+refused, as for root_moves. It refuses brief, draws_range, and draws_of after
+the step's solve, which stands. A step throws out_of_memory where its priority,
+or the first-move values it keeps, do not fit, and it throws when the rules let
+scoreless turns go on without end in the position, the message saying it is not
+solvable. When the cap stopped the draws that draws_of asked for, the answer
+comes as without draws_of, with out_of_memory true and out_of_memory_in
+"draws".
 
 endgame_free(handle) frees an endgame, with its table, and answers undefined.

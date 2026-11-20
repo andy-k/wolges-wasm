@@ -4911,6 +4911,8 @@ struct EndgameNewRequest {
 struct EndgameStepRequest {
     ms: Option<f64>,
     #[serde(default)]
+    priority: Vec<kibitzer::JsonPlay>,
+    #[serde(default)]
     first_moves_ms: Option<f64>,
     #[serde(default)]
     draws_of: Option<DrawsOf>,
@@ -5148,6 +5150,7 @@ struct Endgame {
     bag: usize,
     peg_bag: Option<endgame::PegBagProgress>,
     root_moves: Option<endgame::RootMoves>,
+    keep_first_moves: bool,
     turn: u8,
     lead: i32,
     pass_turns: u16,
@@ -5446,8 +5449,9 @@ impl Endgame {
         ms: f64,
         clock: endgame::Clock,
         memory: fn() -> usize,
+        priority: &[movegen::Play],
     ) -> Result<(), String> {
-        let mut solver = step_solver!(self);
+        let mut solver = (step_solver!(self)).with_root_priority(priority);
         match self.table.take() {
             Some(table) => {
                 if solver.give_table(table).is_err() {
@@ -5618,7 +5622,11 @@ impl Endgame {
         };
         self.table = Some(solver.take_table());
         self.solver = Some(solver.into_kept());
+        let candidates = self.keep_first_moves.then(|| self.answer.candidates.take());
         self.answer.take(answer, self.in_bag);
+        if let Some(candidates) = candidates {
+            self.answer.candidates = candidates;
+        }
         Ok(())
     }
 
@@ -5631,8 +5639,9 @@ impl Endgame {
         ms: f64,
         clock: endgame::Clock,
         memory: fn() -> usize,
+        priority: &[movegen::Play],
     ) -> Result<(), String> {
-        let mut solver = step_solver!(self);
+        let mut solver = (step_solver!(self)).with_root_priority(priority);
         match self.table.take() {
             Some(table) => {
                 if solver.give_table(table).is_err() {
@@ -5672,32 +5681,67 @@ impl Endgame {
         self.table = Some(solver.take_table());
         self.solver = Some(solver.into_kept());
         let valued = valued.map_err(err_to_str)?;
-        self.answer.candidates = Some(
-            (valued.iter())
-                .filter_map(|first| {
-                    let value = points(first.value?);
-                    let spread = lead + value;
-                    Some(EndgameCandidate {
-                        play: (&first.play).into(),
-                        win: if spread > 0.0 {
-                            1.0
-                        } else if spread < 0.0 {
-                            0.0
-                        } else {
-                            0.5
-                        },
-                        value,
-                        tiles: None,
-                        draws: None,
-                        deals: None,
-                        draws_total: None,
-                        exact: first.exact,
-                    })
+        let candidates = (valued.iter())
+            .filter_map(|first| {
+                let value = points(first.value?);
+                let spread = lead + value;
+                Some(EndgameCandidate {
+                    play: (&first.play).into(),
+                    win: if spread > 0.0 {
+                        1.0
+                    } else if spread < 0.0 {
+                        0.0
+                    } else {
+                        0.5
+                    },
+                    value,
+                    tiles: None,
+                    draws: None,
+                    deals: None,
+                    draws_total: None,
+                    exact: first.exact,
                 })
-                .collect(),
-        );
+            })
+            .collect::<Vec<_>>();
+        if self.keep_first_moves {
+            let kept = self.answer.candidates.get_or_insert_default();
+            kept.try_reserve(candidates.len())
+                .map_err(|_| OUT_OF_MEMORY)?;
+            for candidate in candidates {
+                match kept.iter_mut().find(|old| old.play == candidate.play) {
+                    Some(old) if !old.exact || candidate.exact => *old = candidate,
+                    None => kept.push(candidate),
+                    _ => {}
+                }
+            }
+            kept.sort_by(|a, b| b.value.total_cmp(&a.value));
+        } else {
+            self.answer.candidates = Some(candidates);
+        }
         Ok(())
     }
+}
+
+fn decode_root_plays(
+    requested: &[kibitzer::JsonPlay],
+    field: &str,
+) -> Result<Vec<movegen::Play>, String> {
+    let mut plays = Vec::new();
+    plays
+        .try_reserve_exact(requested.len())
+        .map_err(|_| OUT_OF_MEMORY)?;
+    for (i, play) in requested.iter().enumerate() {
+        if let kibitzer::JsonPlay::Play { word, score, .. } = play {
+            if word.contains(&i8::MIN) {
+                return Err(format!("{field}[{i}]: invalid blank tile"));
+            }
+            if score.checked_mul(equity::SCALE).is_none() {
+                return Err(format!("{field}[{i}]: score out of range"));
+            }
+        }
+        plays.push(play.into());
+    }
+    Ok(plays)
 }
 
 // a move of a search with a tile in the bag, as the page reads it (a pass as an
@@ -5829,21 +5873,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     let mut rack = req.rack;
     rack.sort_unstable();
     let mut root_moves = if let Some(requested) = req.root_moves {
-        let mut plays = Vec::new();
-        plays
-            .try_reserve_exact(requested.len())
-            .map_err(|_| OUT_OF_MEMORY)?;
-        for (i, play) in requested.iter().enumerate() {
-            if let kibitzer::JsonPlay::Play { word, score, .. } = play {
-                if word.contains(&i8::MIN) {
-                    return Err(format!("root_moves[{i}]: invalid blank tile"));
-                }
-                if score.checked_mul(equity::SCALE).is_none() {
-                    return Err(format!("root_moves[{i}]: score out of range"));
-                }
-            }
-            plays.push(play.into());
-        }
+        let plays = decode_root_plays(&requested, "root_moves")?;
         let mut state = game_state::GameState::new(&game_config);
         state.board_tiles.copy_from_slice(&kibitzer.board_tiles);
         state.turn = req.turn;
@@ -6005,6 +6035,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         bag,
         peg_bag,
         root_moves,
+        keep_first_moves: false,
         turn: req.turn,
         lead: scores,
         pass_turns: req.pass_turns,
@@ -6070,21 +6101,39 @@ fn do_endgame_step(
         .live
         .get_mut(&handle)
         .ok_or_else(|| no_endgame(handle))?;
-    // an exact answer stays: no solve can better it
-    if ms > 0.0 && !endgame.answer.exact {
-        endgame.solve(ms, clock, memory)?;
-    }
-    match req.first_moves_ms {
-        None => {}
-        Some(ms) if !(ms >= 0.0 && ms.is_finite()) => {
+    if let Some(ms) = req.first_moves_ms {
+        if !(ms >= 0.0 && ms.is_finite()) {
             return Err(format!("first_moves_ms: {ms} is not a time to run"));
         }
-        Some(_) if endgame.bag != 0 => {
+        if endgame.bag != 0 {
             return Err(
                 "first_moves_ms: with tiles in the bag every move is valued in candidates".into(),
             );
         }
-        Some(ms) => endgame.value_first_moves(ms, clock, memory)?,
+    }
+    let priority = decode_root_plays(&req.priority, "priority")?;
+    if !priority.is_empty() {
+        if endgame.bag == 0 {
+            if req.first_moves_ms.is_none() {
+                return Err("priority: give first_moves_ms with an empty bag".into());
+            }
+            endgame.keep_first_moves = true;
+        }
+        if endgame.bag == 1
+            && endgame.peg_bag.is_none()
+            && endgame.game_config.exchange_tile_limit() <= 1
+        {
+            return Err(
+                "priority: the one-tile clairvoyant search has no committed root moves".into(),
+            );
+        }
+    }
+    // an exact answer stays: no solve can better it
+    if ms > 0.0 && !endgame.answer.exact {
+        endgame.solve(ms, clock, memory, &priority)?;
+    }
+    if let Some(ms) = req.first_moves_ms {
+        endgame.value_first_moves(ms, clock, memory, &priority)?;
     }
     if req.brief {
         if req.draws_of.is_some() {
@@ -8696,6 +8745,56 @@ mod tests {
             do_endgame_free(selected).unwrap();
             do_endgame_free(full).unwrap();
         }
+    }
+
+    #[test]
+    fn an_endgame_keeps_first_move_values_between_priority_steps() {
+        let handle = endgame_of("tiny-end-priority-empty", &[S, E, A, T], &[A, T, E], "").unwrap();
+        let plain = endgame_step(handle, r#"{"ms":0,"first_moves_ms":60000}"#);
+        let candidates = plain["candidates"].as_array().unwrap();
+        assert!(candidates.len() > 1);
+        let pass = serde_json::json!({"action":"exchange","tiles":[]});
+        let place = &candidates
+            .iter()
+            .find(|row| row["play"]["action"] == "play")
+            .unwrap()["play"];
+        for play in [&pass, place] {
+            let request = serde_json::json!({"ms":0,"first_moves_ms":0,"priority":[play]});
+            let changed = report(
+                &do_endgame_step(handle, &request.to_string(), ticking, held_bytes).unwrap(),
+            );
+            for old in candidates {
+                assert!(changed["candidates"].as_array().unwrap().contains(old));
+            }
+        }
+        let solved = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(solved["exact"], true);
+        for old in candidates {
+            assert!(solved["candidates"].as_array().unwrap().contains(old));
+        }
+        do_endgame_free(handle).unwrap();
+    }
+
+    #[test]
+    fn a_one_tile_step_values_the_preferred_pending_move_first() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I];
+        let pass = serde_json::json!({"action":"exchange","tiles":[]});
+        let handle = endgame_of("tiny-end-priority-bag", &rack, &others, "").unwrap();
+        let request = serde_json::json!({"ms":1,"priority":[pass]});
+        let answer =
+            report(&do_endgame_step(handle, &request.to_string(), ticking, held_bytes).unwrap());
+        assert_eq!(answer["moves"][0], 1, "{answer}");
+        assert_eq!(answer["candidates"][0]["play"], pass, "{answer}");
+        assert_eq!(answer["exact"], false);
+        let full = endgame_step(handle, r#"{"ms":60000}"#);
+        assert_eq!(full["exact"], true);
+        assert!(full["candidates"].as_array().unwrap().len() > 1);
+        let reference = endgame_of("tiny-end-priority-reference", &rack, &others, "").unwrap();
+        let reference_answer = endgame_step(reference, r#"{"ms":60000}"#);
+        assert_eq!(full["candidates"], reference_answer["candidates"]);
+        do_endgame_free(handle).unwrap();
+        do_endgame_free(reference).unwrap();
     }
 
     #[test]
