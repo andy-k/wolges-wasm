@@ -55,8 +55,8 @@ These messages are the ones a page may want to tell apart:
   out_of_memory: the call could not get the memory it needed (MEMORY below).
   missing kwg, missing klv, missing game_config: no lexicon, leave table, or
     rules is loaded under the name the request gives.
-  sim 7: none such, or freed (and the same for inference, threats, and
-    endgame): the handle is not live (HANDLES below).
+  sim 7: none such, or freed (and the same for inference, threats, endgame, and
+    shortlist): the handle is not live (HANDLES below).
 
 A panic or an allocation failure the module does not catch reaches the page as
 a WebAssembly RuntimeError instead of a thrown string, the panic's message
@@ -74,15 +74,19 @@ its handle, a whole number, and later calls name it:
   threats question: made by threats_new; stepped by threats_step; freed by
     threats_free.
   sim: made by sim_new; changed by sim_add, sim_remove, sim_pause, sim_resume,
-    and sim_set; stepped by sim_step; freed by sim_free.
+    sim_set, and the id calls (sim_add_ids and the others); stepped by
+    sim_step; freed by sim_free.
   endgame: made by endgame_new; stepped by endgame_step; its table taken by a
     later endgame_new (warm_from); freed by endgame_free.
+  shortlist: made by shortlist_new; added to by shortlist_add; read by
+    shortlist_plays and by the shortlist field of sim_new; freed by
+    shortlist_free.
 
 Each kind numbers its handles from 1 and never gives a number twice. An object
 lives, with all it holds, until its free call; nothing else frees it. A handle
 that was freed or never given is refused with "<kind> <number>: none such, or
-freed", the kind being inference, threats, sim, or endgame. Named in a
-request's inferred or warm_from field, the message starts with the field's
+freed", the kind being inference, threats, sim, endgame, or shortlist. Named in
+a request's inferred or warm_from field, the message starts with the field's
 name, as in: inferred: inference 7: none such, or freed. A second free of a
 handle is refused the same way. After 4294967295 handles of a kind, making
 another is refused.
@@ -90,11 +94,12 @@ another is refused.
 An object holds the tables it was made with. Loading another table under the
 same name, or evicting the name, changes no live object; only later requests
 read the new table, or are refused. A sim given an inference holds its leaves,
-whether or not the inference is freed.
+and one given a shortlist holds the shortlist, whether or not the handle is
+freed.
 
-Handles belong to the module instance that made them. An inference moves to
-another instance as bytes, by infer_export in one and infer_import in the
-other.
+Handles, and the ids of a shortlist's plays, belong to the module instance that
+made them. An inference moves to another instance as bytes, by infer_export in
+one and infer_import in the other.
 
 
 MEMORY
@@ -619,6 +624,40 @@ A threats object holds its lexicon, its rules, and all it has listed and
 weighed, until threats_free.
 
 
+SHORTLISTS
+
+A shortlist holds plays of one position, each checked once and known by an id,
+for sims to name by id.
+
+shortlist_new(request) makes a shortlist and answers its handle. The request:
+
+  rack: rack, required, 7 tiles at most. The rack of the player to move.
+  board: board, required.
+  lexicon, rules: strings, required.
+
+shortlist_add(handle, plays) adds plays to a shortlist and answers a
+Uint32Array of their ids, one for each play in the order given. plays is a JSON
+array of sim plays, each checked as sim_add checks one, and refused as well
+when a word it makes is not in the lexicon, when it gives a bonus or is
+challenged off, when its word holds -128, or when it exchanges more tiles than
+the bag holds, the bag being the tiles unseen less a full rack for each other
+player. A refused play refuses the whole call, which then adds none, the
+message naming it, as in plays[0]: play makes an invalid word. A placement's
+score is counted again from the board. A play is held as the scorer writes it,
+so a play given again, or written another way, answers the id it has. Ids count
+from 0 in the order the plays were first added, and never change.
+
+shortlist_plays(handle) answers a JSON array of the shortlist's plays in id
+order, each a play as the scorer writes it, with its score. shortlist_new,
+shortlist_add, and shortlist_plays throw out_of_memory where the shortlist, the
+ids, or the answer does not fit.
+
+shortlist_free(handle) frees a shortlist and answers undefined, once no more
+plays are to be added to it and no more sims made with it. A sim given the
+shortlist keeps it, but a later sim_new cannot name it. Phonies, bonuses, and
+plays challenged off go to a sim by sim_add.
+
+
 SIMS
 
 sim_new(request) makes a sim of a position and answers its handle. A sim rolls
@@ -651,6 +690,12 @@ of sim_new:
     runs (MEMORY above).
   pruned: true or false, optional (false if left out). The lexicon is already
     this board's pruned graph (build_kbwg), taken as it is.
+  shortlist: shortlist handle or null, optional. A shortlist of this position,
+    whose plays sim_add_ids and the other id calls below then name by id: of
+    the same board and rules name, of the same lexicon as loaded when the
+    shortlist was made (a name loaded again holds another), and of a rack of
+    the same tiles. A shortlist of another position is refused with "shortlist
+    1: position, rules, or lexicon differ".
 
 The player to move holds rack. The opponent is dealt a full rack from the tiles
 unseen, or all of them when fewer, and the bag holds the rest.
@@ -691,6 +736,11 @@ both, and answers how its candidates stand. The request:
     win within prune_decided of 1 or of 0 has its game won or lost.
   against: sim play or null, optional. A candidate of the sim to compare each
     candidate with.
+  against_id: whole number or null, optional. The id of a candidate to compare
+    each candidate with, in place of against and never with it. An id no
+    candidate of the sim has is refused.
+  compact: true or false, optional (false if left out). Each candidate named by
+    id gives its id and its static equity in place of its play.
   max_memory_mb: whole number or null, optional. The sim's cap from this step
     on, in place of the one before; left out or null, the cap stays as it was.
 
@@ -716,8 +766,12 @@ The answer:
 
 Each candidate:
 
+  id: given only with compact, for a candidate named by id: its id.
+  static_equity: given only with compact, for a candidate named by id, in place
+    of play: its static equity, a whole one written with .0 after it.
   play: the candidate as a valued play, its score counted again, with its
-    bonus, and its equity its static equity.
+    bonus, and its equity its static equity; left out with compact for a
+    candidate named by id.
   challenged_off: true, given only for a play challenged off.
   state: "running", "paused", or "pruned".
   n: how many times the candidate was rolled out.
@@ -737,9 +791,9 @@ Each candidate:
     tiles. With plies given, there are as many entries as plies, an empty one
     for a ply no rollout reached; with null, as many as the longest rollout
     reached.
-  against: given only when the step names a play against: this candidate less
-    that play on the iterations both ran, in win, equity, and objective, each a
-    statistic with its own n.
+  against: given only when the step gives against or against_id: this candidate
+    less that one on the iterations both ran, in win, equity, and objective,
+    each a statistic with its own n.
 
 sim_step throws out_of_memory where its answer does not fit.
 
@@ -773,6 +827,19 @@ second time. A play's static equity is its equity as play_score gives it, on
 the sim's position, with its bonus added; a play challenged off has a pass's. A
 play challenged off is a candidate apart from the same play standing. A play of
 one tile is one candidate whichever way it is written.
+
+sim_add_ids(handle, ids), sim_remove_ids(handle, ids), sim_pause_ids(handle,
+ids), and sim_resume_ids(handle, ids) do as sim_add, sim_remove, sim_pause, and
+sim_resume do, for the plays named by ids, a Uint32Array of ids in the sim's
+shortlist. Each answers a Uint8Array with one byte for each id, in the order
+given, saying where its play stood before the change: 0 absent, 1 running, 2
+paused, or 3 pruned. Every id is checked first. A sim with no shortlist is
+refused ("no shortlist attached"), and an id the shortlist lacks refuses the
+whole call ("shortlist move 9: none such"). A play named by id is the same
+candidate as the same play given to sim_add, if that one was neither challenged
+off nor given a bonus, and from then on it is known by its id. A play added by
+id has its static equity on the sim's position. Each throws out_of_memory where
+its answer or the sim's new candidates do not fit.
 
 sim_set(handle, request) changes a live sim's plies or what the opponent holds.
 The results so far stay, and the change counts from the next iteration on. The

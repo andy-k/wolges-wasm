@@ -5,6 +5,8 @@ use wasm_bindgen::prelude::*;
 
 use wolges::*;
 
+mod shortlist;
+
 macro_rules! console_log {
     ($($t:tt)*) => (web_sys::console::log_1(&format_args!($($t)*).to_string().into()))
 }
@@ -1505,6 +1507,7 @@ fn do_prune_pays(req_str: &str) -> Result<bool, String> {
 // how many this is. A new sim holds no candidates.
 #[derive(serde::Deserialize)]
 struct SimNewRequest {
+    shortlist: Option<u32>,
     rack: Vec<u8>,
     #[serde(rename = "board")]
     board_tiles: Vec<Vec<i8>>,
@@ -1618,6 +1621,9 @@ struct SimStepRequest {
     prune_z: Option<f64>,
     prune_decided: Option<f64>,
     against: Option<SimPlay>,
+    against_id: Option<u32>,
+    #[serde(default)]
+    compact: bool,
     // the sim's cap from this step on, in MiB, as sim_new's max_memory_mb
     #[serde(default)]
     max_memory_mb: Option<usize>,
@@ -1690,6 +1696,7 @@ struct SimPly {
 // parts (the change in spread in points alone, and the leaves left: the mover's
 // less the opponent's), the chance to win, and each ply's
 struct SimCandidate {
+    id: Option<u32>,
     play: movegen::Play,
     challenged_off: bool,
     static_equity: f32,
@@ -1711,6 +1718,7 @@ struct SimCandidate {
 // to the game's end), its seed, which part of how many it is, its iterations so
 // far, and its candidates
 struct Sim {
+    shortlist: Option<shortlist::Shared>,
     game_config: std::sync::Arc<CachedRules>,
     kwg: std::sync::Arc<CachedKwg>,
     klv: std::sync::Arc<CachedKlv>,
@@ -1993,9 +2001,9 @@ impl Sim {
         Ok(stepped)
     }
 
-    fn report(&self, stepped: u64, against: Option<&HeldPlay>) -> SimReport<'_> {
+    fn report(&self, stepped: u64, against: Option<usize>, compact: bool) -> SimReport<'_> {
         let weight = self.simmer.win_prob_weightage();
-        let other = against.and_then(|held| self.candidates.iter().find(|c| held.is(c)));
+        let other = against.and_then(|i| self.candidates.get(i));
         // every ply of the sim's is reported, one no rollout has reached yet as
         // an empty one; a sim to the game's end, every ply a rollout reached
         let listed = self.plies.unwrap_or_else(|| {
@@ -2010,6 +2018,7 @@ impl Sim {
             stepped,
             candidates: SimCandidatesJson {
                 candidates: &self.candidates,
+                compact,
                 listed,
                 weight,
                 other,
@@ -2022,6 +2031,7 @@ impl Sim {
 // the sim holds it; other: the candidate compared against
 struct SimCandidatesJson<'a> {
     candidates: &'a [SimCandidate],
+    compact: bool,
     listed: usize,
     weight: f64,
     other: Option<&'a SimCandidate>,
@@ -2030,10 +2040,12 @@ struct SimCandidatesJson<'a> {
 impl serde::Serialize for SimCandidatesJson<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.candidates.iter().map(|c| SimCandidateReport {
-            play: kibitzer::JsonPlayRefWithEquity {
+            id: c.id.filter(|_| self.compact),
+            static_equity: c.id.filter(|_| self.compact).map(|_| c.static_equity),
+            play: (!self.compact || c.id.is_none()).then(|| kibitzer::JsonPlayRefWithEquity {
                 equity: c.static_equity,
                 play: (&c.play).into(),
-            },
+            }),
             challenged_off: c.challenged_off,
             state: c.state.name(),
             n: c.objective.count() as u64,
@@ -2233,7 +2245,12 @@ struct SimAgainst {
 // with a play to compare against, itself less that play
 #[derive(serde::Serialize)]
 struct SimCandidateReport<'a> {
-    play: kibitzer::JsonPlayRefWithEquity<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    static_equity: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    play: Option<kibitzer::JsonPlayRefWithEquity<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     challenged_off: bool,
     state: &'static str,
@@ -2314,6 +2331,13 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
         .map_err(err_to_str)?;
+    let shortlist = shortlist::attach(
+        req.shortlist,
+        &req.rules,
+        &kwg,
+        &kibitzer.board_tiles,
+        &req.rack,
+    )?;
     // the seat to move holds its rack, and the others are dealt in turn from
     // the tiles unseen, a full rack each while enough are left
     let mut left = (kibitzer.available_tally.iter())
@@ -2420,6 +2444,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     );
     let pristine = simmer.prepared_state().clone();
     let sim = Sim {
+        shortlist,
         game_config,
         kwg,
         klv,
@@ -4519,20 +4544,29 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
         sim.memory = memory;
     }
     // the play to compare against, checked before any step
-    let against = match &req.against {
-        Some(sim_play) => {
+    let against = match (&req.against, req.against_id) {
+        (Some(_), Some(_)) => return Err("give against or against_id, not both".into()),
+        (Some(sim_play), None) => {
             let held = sim.held(sim_play).map_err(|e| format!("against: {e}"))?;
-            if !sim.candidates.iter().any(|c| held.is(c)) {
-                return Err("against: not in the sim".into());
-            }
-            Some(held)
+            Some(
+                sim.candidates
+                    .iter()
+                    .position(|c| held.is(c))
+                    .ok_or("against: not in the sim")?,
+            )
         }
-        None => None,
+        (None, Some(id)) => Some(
+            sim.candidates
+                .iter()
+                .position(|c| c.id == Some(id))
+                .ok_or("against_id: not in the sim")?,
+        ),
+        (None, None) => None,
     };
     let stepped = sim.step(req.iterations.unwrap_or(u64::MAX), pruning, || {
         deadline.is_some_and(|deadline| now() >= deadline)
     })?;
-    try_json_kept(&sim.game_config, &sim.report(stepped, against.as_ref()))?
+    try_json_kept(&sim.game_config, &sim.report(stepped, against, req.compact))?
         .ok_or_else(|| OUT_OF_MEMORY.into())
 }
 
@@ -4570,29 +4604,14 @@ fn do_sim_change(handle: u32, plays_str: &str, change: SimChange) -> Result<Stri
     for held in held {
         let at = sim.candidates.iter().position(|c| held.is(c));
         let was = at.map_or("absent", |at| sim.candidates[at].state.name());
-        match (change, at) {
-            (SimChange::Add, None) => sim.candidates.push(SimCandidate {
-                play: held.play.clone(),
-                challenged_off: held.challenged_off,
-                static_equity: held.static_equity,
-                state: SimState::Running,
-                first_iter: sim.iterations + 1,
-                wins: Vec::new(),
-                equities: Vec::new(),
-                objective: stats::Stats::new(),
-                equity: stats::Stats::new(),
-                spread: stats::Stats::new(),
-                leaves: stats::Stats::new(),
-                win: stats::Stats::new(),
-                plies: Vec::new(),
-            }),
-            (SimChange::Remove, Some(at)) => {
-                sim.candidates.remove(at);
-            }
-            (SimChange::Pause, Some(at)) => sim.candidates[at].state = SimState::Paused,
-            (SimChange::Resume, Some(at)) => sim.candidates[at].state = SimState::Running,
-            _ => {}
-        }
+        sim.change_candidate(
+            change,
+            at,
+            None,
+            &held.play,
+            held.challenged_off,
+            held.static_equity,
+        );
         answer.push(SimChanged {
             play: kibitzer::JsonPlayWithEquity {
                 equity: held.static_equity,
@@ -4628,6 +4647,136 @@ pub fn sim_pause(sim: u32, plays_str: String) -> Result<String, JsValue> {
 #[wasm_bindgen]
 pub fn sim_resume(sim: u32, plays_str: String) -> Result<String, JsValue> {
     Ok(do_sim_change(sim, &plays_str, SimChange::Resume)?)
+}
+
+impl Sim {
+    fn change_candidate(
+        &mut self,
+        change: SimChange,
+        at: Option<usize>,
+        id: Option<u32>,
+        play: &movegen::Play,
+        challenged_off: bool,
+        static_equity: f32,
+    ) {
+        match (change, at) {
+            (SimChange::Add, None) => self.candidates.push(SimCandidate {
+                id,
+                play: play.clone(),
+                challenged_off,
+                static_equity,
+                state: SimState::Running,
+                first_iter: self.iterations + 1,
+                wins: Vec::new(),
+                equities: Vec::new(),
+                objective: stats::Stats::new(),
+                equity: stats::Stats::new(),
+                spread: stats::Stats::new(),
+                leaves: stats::Stats::new(),
+                win: stats::Stats::new(),
+                plies: Vec::new(),
+            }),
+            (SimChange::Remove, Some(at)) => {
+                self.candidates.remove(at);
+            }
+            (SimChange::Pause, Some(at)) => self.candidates[at].state = SimState::Paused,
+            (SimChange::Resume, Some(at)) => self.candidates[at].state = SimState::Running,
+            _ => {}
+        }
+    }
+
+    fn equity_of_registered_play(
+        &self,
+        ps: &mut play_scorer::PlayScorer,
+        play: &movegen::Play,
+    ) -> f32 {
+        let score = match play {
+            movegen::Play::Place { score, .. } => score.raw(),
+            movegen::Play::Exchange { .. } => 0,
+        };
+        let equity = ps.compute_equity(
+            &movegen::BoardSnapshot {
+                board_tiles: &self.game_state.board_tiles,
+                game_config: &self.game_config,
+                kwg: &self.kwg.kwg,
+                anagrams: None,
+                rack_lengths: None,
+                klv: &self.klv.klv,
+            },
+            &self.game_state,
+            play,
+            move_filter::LEAVE_SCALE_DENOM,
+            score,
+        );
+        equity as f32 / equity::SCALE as f32
+    }
+}
+
+// return the previous state of each id in request order, from 0 for absent to
+// 3 for pruned. Check all the ids before making any change.
+fn do_sim_change_ids(handle: u32, ids: &[u32], change: SimChange) -> Result<Vec<u8>, String> {
+    let mut sims = SIMS.lock().map_err(err_to_str)?;
+    let sim = sims.live.get_mut(&handle).ok_or_else(|| no_sim(handle))?;
+    let shared = shortlist::attached(&sim.shortlist)?.clone();
+    let shortlist = shared.lock().map_err(err_to_str)?;
+    for &id in ids {
+        shortlist.play(id)?;
+    }
+    let mut before = Vec::new();
+    before
+        .try_reserve_exact(ids.len())
+        .map_err(|_| OUT_OF_MEMORY)?;
+    let rules = sim.game_config.clone();
+    let mut room = if matches!(change, SimChange::Add) && !ids.is_empty() {
+        sim.candidates
+            .try_reserve(ids.len())
+            .map_err(|_| OUT_OF_MEMORY)?;
+        Some(Taken::<PlayScoreRoom>::from(&rules.play_score_rooms)?)
+    } else {
+        None
+    };
+    for &id in ids {
+        let play = shortlist.play(id)?;
+        let at = sim.candidates.iter().position(|c| {
+            c.id == Some(id) || (c.id.is_none() && !c.challenged_off && c.play == *play)
+        });
+        before.push(at.map_or(0, |i| match sim.candidates[i].state {
+            SimState::Running => 1,
+            SimState::Paused => 2,
+            SimState::Pruned => 3,
+        }));
+        let static_equity = match at {
+            Some(i) => {
+                sim.candidates[i].id = Some(id);
+                sim.candidates[i].static_equity
+            }
+            None => room.as_mut().map_or(0.0, |room| {
+                sim.equity_of_registered_play(&mut room.ps, play)
+            }),
+        };
+        sim.change_candidate(change, at, Some(id), play, false, static_equity);
+    }
+    Ok(before)
+}
+
+#[wasm_bindgen]
+pub fn sim_add_ids(sim: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_sim_change_ids(sim, ids, SimChange::Add)?)
+}
+
+#[wasm_bindgen]
+pub fn sim_remove_ids(sim: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_sim_change_ids(sim, ids, SimChange::Remove)?)
+}
+
+#[wasm_bindgen]
+pub fn sim_pause_ids(sim: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_sim_change_ids(sim, ids, SimChange::Pause)?)
+}
+
+#[wasm_bindgen]
+pub fn sim_resume_ids(sim: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_sim_change_ids(sim, ids, SimChange::Resume)?)
 }
 
 // a sim let go, with the tables it holds
@@ -4721,7 +4870,7 @@ fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
             },
         );
     }
-    serde_json::to_string(&sim.report(0, None)).map_err(err_to_str)
+    serde_json::to_string(&sim.report(0, None, false)).map_err(err_to_str)
 }
 
 fn do_sim_free(handle: u32) -> Result<(), String> {
@@ -6732,6 +6881,111 @@ mod tests {
     // S before CAT, making SCAT
     const SCAT: &str = r#"{"action":"play","down":false,"lane":7,"idx":5,"word":[19,0,0,0]}"#;
 
+    #[test]
+    fn sim_and_shortlist_keep_the_same_moves_by_id() {
+        let lexicon = "sim-shortlist";
+        tiny_lexicon(lexicon);
+        let board = cat_board();
+        let position = serde_json::json!({
+            "rack": [T, A, S, E],
+            "board": report(&board),
+            "lexicon": lexicon,
+            "rules": "CrosswordGame",
+        });
+        let shortlist = shortlist::do_new(&position.to_string()).unwrap();
+        let candidates = format!("[{CATS},{PASS}]");
+
+        let bad = format!(
+            r#"[{PASS},{{"action":"play","down":false,"lane":7,"idx":6,"word":[0,0,0,-128]}}]"#
+        );
+        assert!(shortlist::do_add(shortlist, &bad).is_err());
+        assert_eq!(
+            report(&shortlist::do_plays(shortlist).unwrap()),
+            serde_json::json!([])
+        );
+        let ids = shortlist::do_add(shortlist, &candidates).unwrap();
+        assert_eq!(ids, [0, 1]);
+        assert_eq!(
+            shortlist::do_add(shortlist, &format!("[{PASS},{CATS},{PASS}]")).unwrap(),
+            [1, 0, 1]
+        );
+        let canonical = report(&shortlist::do_plays(shortlist).unwrap());
+
+        let mut request = position;
+        request["rack"] = serde_json::json!([S, E, A, T]);
+        request["leave"] = serde_json::json!("noleave");
+        request["scores"] = serde_json::json!([0, 0]);
+        request["turn"] = serde_json::json!(0);
+        request["zero_turns"] = serde_json::json!(0);
+        request["pass_turns"] = serde_json::json!(0);
+        request["plies"] = serde_json::json!(2);
+        request["seed"] = serde_json::json!(7);
+        let legacy = do_sim_new(&request.to_string()).unwrap();
+        do_sim_change(legacy, &candidates, SimChange::Add).unwrap();
+
+        request["shortlist"] = serde_json::json!(shortlist);
+        let sim = do_sim_new(&request.to_string()).unwrap();
+        assert!(do_sim_change_ids(sim, &[ids[0], u32::MAX], SimChange::Add).is_err());
+        assert_eq!(
+            do_sim_change_ids(sim, &ids, SimChange::Add).unwrap(),
+            [0, 0]
+        );
+        assert!(do_sim_change_ids(sim, &[ids[0], u32::MAX], SimChange::Pause).is_err());
+        assert_eq!(
+            do_sim_change_ids(sim, &ids, SimChange::Pause).unwrap(),
+            [1, 1]
+        );
+        assert_eq!(
+            do_sim_change_ids(sim, &ids, SimChange::Resume).unwrap(),
+            [2, 2]
+        );
+
+        let plain = r#"{"iterations":2,"prune":false}"#;
+        let actual = report(&do_sim_step(sim, plain, || 0.0).unwrap());
+        assert_eq!(actual, report(&do_sim_step(legacy, plain, || 0.0).unwrap()));
+        let mut compact = report(
+            &do_sim_step(
+                sim,
+                r#"{"iterations":0,"prune":false,"compact":true,"against_id":1}"#,
+                || 0.0,
+            )
+            .unwrap(),
+        );
+        for (i, candidate) in compact["candidates"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            let full = &actual["candidates"][i]["play"];
+            assert_eq!(candidate["id"], ids[i]);
+            let body = candidate.as_object_mut().unwrap();
+            assert!(!body.contains_key("play"));
+            assert_eq!(body["static_equity"].as_f64(), full["equity"].as_f64());
+            assert_eq!(canonical[i]["action"], full["action"]);
+            assert!(body.contains_key("against"));
+        }
+
+        request["rack"] = serde_json::json!([S, E, A]);
+        assert!(
+            do_sim_new(&request.to_string())
+                .unwrap_err()
+                .contains("differ")
+        );
+        shortlist::do_free(shortlist).unwrap();
+        assert!(shortlist::do_plays(shortlist).is_err());
+        assert_eq!(
+            do_sim_change_ids(sim, &ids, SimChange::Remove).unwrap(),
+            [1, 1]
+        );
+        assert_eq!(
+            do_sim_change_ids(sim, &ids, SimChange::Remove).unwrap(),
+            [0, 0]
+        );
+        do_sim_free(sim).unwrap();
+        do_sim_free(legacy).unwrap();
+    }
+
     // a sim of CAT's board with CATS and a pass as its candidates
     fn cat_sim(lexicon: &str) -> u32 {
         let sim = sim_of(lexicon, &cat_board(), "");
@@ -8341,6 +8595,7 @@ mod tests {
     // chances to win and equities
     fn rolled(wins: &[f64], equities: &[f64]) -> SimCandidate {
         let mut candidate = SimCandidate {
+            id: None,
             play: SimPlay::Exchange {
                 tiles: Box::new([]),
             }
