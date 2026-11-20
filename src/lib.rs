@@ -915,15 +915,17 @@ impl serde::Serialize for ScoredPlaysJson<'_, '_> {
             word_ends,
         } = &mut *scoring;
         for json_play in self.plays {
-            let play = movegen::Play::from(json_play);
-            let adjusted_play = match ps.validate_play(board_snapshot, game_state, &play) {
+            let adjusted = decode_json_play(json_play).and_then(|play| {
+                ps.validate_play(board_snapshot, game_state, &play)
+                    .map(|adjusted| (play, adjusted))
+                    .map_err(|err| err.to_string())
+            });
+            let (play, adjusted_play) = match adjusted {
                 Err(err) => {
-                    seq.serialize_element(&ScoredPlayRef::Error {
-                        error: err.to_string(),
-                    })?;
+                    seq.serialize_element(&ScoredPlayRef::Error { error: err })?;
                     continue;
                 }
-                Ok(adjusted_play) => adjusted_play,
+                Ok(plays) => plays,
             };
             let is_canonical = adjusted_play.is_none();
             let mut canonical_play = adjusted_play.unwrap_or(play);
@@ -1263,6 +1265,47 @@ pub fn infer(req_str: String) -> Result<String, JsValue> {
     Ok(do_infer(&req_str)?)
 }
 
+// inference knows the observed play, but not the rack that made it. Check
+// coordinates and tile codes before the inference scores and tallies it.
+fn check_infer_play(rules: &CachedRules, play: &movegen::Play) -> Result<(), String> {
+    match play {
+        movegen::Play::Exchange { tiles } => {
+            let rack_size = rules.rack_size() as usize;
+            if tiles.len() > rack_size {
+                return Err(format!("play: at most {rack_size} tiles can be exchanged"));
+            }
+        }
+        movegen::Play::Place {
+            down,
+            lane,
+            idx,
+            word,
+            ..
+        } => {
+            let dim = rules.board_layout().dim();
+            let (lanes, width) = if *down {
+                (dim.cols, dim.rows)
+            } else {
+                (dim.rows, dim.cols)
+            };
+            if !(0..lanes).contains(lane)
+                || !(0..width).contains(idx)
+                || word.is_empty()
+                || word.len() > (width - *idx) as usize
+            {
+                return Err("play: word is outside the board".into());
+            }
+            if word
+                .iter()
+                .any(|&tile| (tile & 0x7f) >= rules.alphabet().len())
+            {
+                return Err("play: tile is outside the alphabet".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn do_infer(req_str: &str) -> Result<String, String> {
     let req = serde_json::from_str::<InferRequest>(req_str).map_err(err_to_str)?;
     if let SimPlay::Play {
@@ -1279,6 +1322,8 @@ fn do_infer(req_str: &str) -> Result<String, String> {
         klv,
         game_config,
     } = tables(&req.lexicon, &req.leave, &req.rules)?;
+    let play = req.play.to_play().map_err(|err| format!("play: {err}"))?;
+    check_infer_play(&game_config, &play)?;
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
@@ -1312,7 +1357,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
             klv: &klv.klv,
         },
         &req.rack,
-        &req.play.to_play(),
+        &play,
         req.fuzz,
         1,
     )
@@ -1323,7 +1368,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     let count = leaves.len();
     // the tiles unseen after the play: those it placed are on the board
     let mut unseen = kibitzer.available_tally.clone();
-    if let movegen::Play::Place { word, .. } = req.play.to_play() {
+    if let movegen::Play::Place { word, .. } = play {
         for &tile in word.iter().filter(|&&tile| tile != 0) {
             let tile = if tile & 0x80 != 0 { 0 } else { tile as usize };
             unseen[tile] = unseen[tile].saturating_sub(1);
@@ -1581,8 +1626,8 @@ enum SimPlay {
 }
 
 impl SimPlay {
-    fn to_play(&self) -> movegen::Play {
-        (&match self {
+    fn to_play(&self) -> Result<movegen::Play, String> {
+        decode_json_play(&match self {
             Self::Exchange { tiles } => kibitzer::JsonPlay::Exchange {
                 tiles: tiles.clone(),
             },
@@ -1600,7 +1645,6 @@ impl SimPlay {
                 score: 0,
             },
         })
-            .into()
     }
 }
 
@@ -1858,7 +1902,7 @@ impl Sim {
         };
         let mut taken = Taken::<PlayScoreRoom>::from(&self.game_config.play_score_rooms)?;
         let ps = &mut taken.ps;
-        let play = sim_play.to_play();
+        let play = sim_play.to_play()?;
         let mut play = ps
             .validate_play(board_snapshot, &self.game_state, &play)
             .map_err(|e| e.to_string())?
@@ -5587,7 +5631,8 @@ impl Endgame {
                     .ok_or_else(|| format!("draws_of: shortlist move {id} has no draws"))
             }
             DrawsOf::Play(play) => {
-                let (at, total) = self.draws_place(&(&play).into());
+                let decoded = decode_json_play(&play).map_err(|e| format!("draws_of: {e}"))?;
+                let (at, total) = self.draws_place(&decoded);
                 match at {
                     Some(i) => Ok(i),
                     None => Err(format!(
@@ -5893,6 +5938,18 @@ impl Endgame {
     }
 }
 
+fn decode_json_play(play: &kibitzer::JsonPlay) -> Result<movegen::Play, String> {
+    if let kibitzer::JsonPlay::Play { word, score, .. } = play {
+        if word.contains(&i8::MIN) {
+            return Err("invalid blank tile".into());
+        }
+        if score.checked_mul(equity::SCALE).is_none() {
+            return Err("score out of range".into());
+        }
+    }
+    Ok(play.into())
+}
+
 fn decode_root_plays(
     requested: &[kibitzer::JsonPlay],
     field: &str,
@@ -5902,15 +5959,7 @@ fn decode_root_plays(
         .try_reserve_exact(requested.len())
         .map_err(|_| OUT_OF_MEMORY)?;
     for (i, play) in requested.iter().enumerate() {
-        if let kibitzer::JsonPlay::Play { word, score, .. } = play {
-            if word.contains(&i8::MIN) {
-                return Err(format!("{field}[{i}]: invalid blank tile"));
-            }
-            if score.checked_mul(equity::SCALE).is_none() {
-                return Err(format!("{field}[{i}]: score out of range"));
-            }
-        }
-        plays.push(play.into());
+        plays.push(decode_json_play(play).map_err(|err| format!("{field}[{i}]: {err}"))?);
     }
     Ok(plays)
 }
@@ -6947,6 +6996,68 @@ mod tests {
     const SCAT: &str = r#"{"action":"play","down":false,"lane":7,"idx":5,"word":[19,0,0,0]}"#;
 
     #[test]
+    fn analysis_refuses_malformed_plays_before_scoring() {
+        let lexicon = "bad-analysis-plays";
+        let sim = sim_of(lexicon, &cat_board(), "");
+        let bad = serde_json::json!({
+            "action":"play", "down":false, "lane":7, "idx":6,
+            "word":[0, 0, 0, -128], "score":0,
+        });
+        let err = do_sim_change(sim, &format!("[{bad}]"), SimChange::Add).unwrap_err();
+        assert!(err.contains("invalid blank tile"), "{err}");
+        do_sim_free(sim).unwrap();
+
+        let mut request = serde_json::json!({
+            "rack":[S, E, A, T], "board":report(&cat_board()),
+            "lexicon":lexicon, "leave":"noleave", "rules":"CrosswordGame",
+            "play":bad, "fuzz":3.0,
+        });
+        let err = do_infer(&request.to_string()).unwrap_err();
+        assert!(err.contains("invalid blank tile"), "{err}");
+        for (play, error) in [
+            (
+                serde_json::json!({
+                    "action":"play", "down":false, "lane":-1, "idx":6, "word":[A,S],
+                }),
+                "outside the board",
+            ),
+            (
+                serde_json::json!({
+                    "action":"play", "down":true, "lane":7, "idx":14, "word":[A,S],
+                }),
+                "outside the board",
+            ),
+            (
+                serde_json::json!({
+                    "action":"play", "down":false, "lane":7, "idx":6, "word":[127,S],
+                }),
+                "outside the alphabet",
+            ),
+            (
+                serde_json::json!({
+                    "action":"exchange", "tiles":[0,0,0,0,0,0,0,0],
+                }),
+                "at most 7",
+            ),
+        ] {
+            request["play"] = play;
+            let err = do_infer(&request.to_string()).unwrap_err();
+            assert!(err.contains(error), "{err}");
+        }
+
+        let mut bad_score = bad.clone();
+        bad_score["word"] = serde_json::json!([0, 0, 0, S]);
+        bad_score["score"] = serde_json::json!(i32::MAX);
+        request["plays"] = serde_json::json!([bad, bad_score, report(PASS)]);
+        let kwg = CACHED_KWG.read().unwrap()[lexicon].clone();
+        let score = serde_json::from_value::<ScoreRequest>(request).unwrap();
+        let result = report(&do_play_score(score, &kwg).unwrap());
+        assert_eq!(result[0]["error"], "invalid blank tile");
+        assert_eq!(result[1]["error"], "score out of range");
+        assert_eq!(result[2]["result"], "scored");
+    }
+
+    #[test]
     fn sim_and_shortlist_keep_the_same_moves_by_id() {
         let lexicon = "sim-shortlist";
         tiny_lexicon(lexicon);
@@ -7427,7 +7538,8 @@ mod tests {
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
         let play = serde_json::from_str::<SimPlay>(LATE_CATS)
             .unwrap()
-            .to_play();
+            .to_play()
+            .unwrap();
         let mut wolges = infer::kept_leaves_lean(
             &mut infer::InferTables::new(&game_config, &klv.klv).unwrap(),
             &mut movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config).unwrap(),
@@ -8664,7 +8776,8 @@ mod tests {
             play: SimPlay::Exchange {
                 tiles: Box::new([]),
             }
-            .to_play(),
+            .to_play()
+            .unwrap(),
             challenged_off: false,
             static_equity: 0.0,
             state: SimState::Running,

@@ -193,20 +193,15 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
     for (i, requested) in requested.iter().enumerate() {
         let play = (|| {
             if let SimPlay::Play {
-                word,
                 bonus,
                 challenged_off,
                 ..
             } = requested
+                && (*bonus != 0 || *challenged_off)
             {
-                if *bonus != 0 || *challenged_off {
-                    return Err("expected a play without challenge adjustments".into());
-                }
-                if word.contains(&i8::MIN) {
-                    return Err("invalid blank tile".into());
-                }
+                return Err("expected a play without challenge adjustments".into());
             }
-            let play = requested.to_play();
+            let play = requested.to_play()?;
             if let movegen::Play::Exchange { tiles } = &play
                 && tiles.len() > shortlist.position.bag.len()
             {

@@ -215,6 +215,11 @@ placement has these fields:
 An answer's play gives the word from its first square to its last, and its
 score as scored. The second example places an S after CAT to make CATS.
 
+A placement whose word holds -128 is no play, and neither is one whose score,
+where a call reads it, is past 2147483 points either way. play_score answers
+such a play as an error, "invalid blank tile" or "score out of range", and
+every other call that takes a play refuses it.
+
 A valued play is a play with its equity, in points, before its other fields:
 
   {"equity":5.25,"action":"play","down":true,"lane":8,"idx":6,"word":[1,0],
@@ -503,7 +508,10 @@ No leave is inferred when the bag before the move is empty, when the move's
 draw empties it, or when the move is an exchange of one or more tiles and the
 bag holds too few tiles to exchange. The bag before the move is the tiles the
 watcher could not see less a full rack. While that bag holds tiles, a move that
-places tiles the watcher holds or the board has is refused.
+places tiles the watcher holds or the board has is refused. A move that is no
+move on the board is refused whatever the bag holds: an exchange of more than 7
+tiles, or a placement whose lane or idx is off the board, whose word is empty
+or runs past the board's edge, or whose word holds a tile outside the alphabet.
 
 infer keeps the tables it makes for the last rules and leave table it was asked
 about, until it is asked about others or that leave table is loaded again or
