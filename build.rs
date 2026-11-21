@@ -12,14 +12,8 @@ use std::process::Command;
 // what a build is made of: an uncommitted change to any of these makes it
 // dirty, wolges's too, which git sees as one when wolges is checked out at a
 // commit other than the one this commit pins, or a file of it is edited
-const BUILT_FROM: [&str; 6] = [
-    ".cargo",
-    "Cargo.lock",
-    "Cargo.toml",
-    "build.rs",
-    "src",
-    "wolges",
-];
+const BUILT_FROM: &[&str] = &[".cargo", "Cargo.lock", "Cargo.toml", "build.rs", "src"];
+const WOLGES: &str = "wolges";
 
 // git's output, trimmed, when it succeeds; git takes no optional lock, so git
 // status leaves the index as it was
@@ -41,6 +35,34 @@ fn git(args: &[&str]) -> Option<String> {
 fn rerun_if_changed(path: &Path) {
     if path.exists() {
         println!("cargo::rerun-if-changed={}", path.display());
+    }
+}
+
+// watch source files individually so ignored data cannot invalidate a build
+fn watch_inputs(repo: &str, own_repo: bool) {
+    let root = Path::new(repo);
+    if own_repo {
+        let mut args = vec![
+            "-C",
+            repo,
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(BUILT_FROM);
+        args.push(".gitignore");
+        if let Some(files) = git(&args) {
+            for file in files.split_terminator('\0') {
+                rerun_if_changed(&root.join(file));
+            }
+            return;
+        }
+    }
+    for file in BUILT_FROM {
+        rerun_if_changed(&root.join(file));
     }
 }
 
@@ -68,14 +90,15 @@ fn main() {
         }
         // wolges's own HEAD too, in its git directory: wolges checked out at
         // another commit makes this build dirty
-        if let Some(git_dir) = git(&["-C", "wolges", "rev-parse", "--git-dir"]) {
+        let wolges_repo = git(&["-C", WOLGES, "rev-parse", "--show-prefix"])
+            .is_some_and(|prefix| prefix.is_empty());
+        if wolges_repo && let Some(git_dir) = git(&["-C", WOLGES, "rev-parse", "--git-dir"]) {
             for file in ["HEAD", "logs/HEAD", "reftable/tables.list"] {
-                rerun_if_changed(&Path::new("wolges").join(&git_dir).join(file));
+                rerun_if_changed(&Path::new(WOLGES).join(&git_dir).join(file));
             }
         }
-        for path in BUILT_FROM {
-            rerun_if_changed(Path::new(path));
-        }
+        watch_inputs(".", true);
+        watch_inputs(WOLGES, wolges_repo);
         (|| {
             let time = git(&[
                 "log",
@@ -86,6 +109,7 @@ fn main() {
             let sha = git(&["rev-parse", "--short", "HEAD"])?;
             let mut status = vec!["status", "--porcelain", "--untracked-files=no", "--"];
             status.extend(BUILT_FROM);
+            status.push(WOLGES);
             let dirty = if git(&status)?.is_empty() {
                 ""
             } else {
