@@ -2915,15 +2915,15 @@ fn try_json_kept(
 ) -> Result<Option<String>, String> {
     let mut taken = Taken::<Vec<u8>>::from(&rules.answers)?;
     let mut writer = TryWriter(std::mem::take(&mut *taken));
+    let previous_len = writer.0.len();
     writer.0.clear();
     let written = serde_json::to_writer(&mut writer, value);
     *taken = writer.0;
-    // the buffer kept within twice the answer just written, so that one
-    // large answer does not hold its room for good; one refused keeps the room
-    // it grew, for the smaller answer written in its place
-    if written.is_ok() && taken.capacity() / 2 > taken.len() {
-        let len = taken.len();
-        taken.shrink_to(len);
+    // a refused write keeps the room it grew for the smaller answer written in
+    // its place.
+    let keep = taken.len().max(previous_len);
+    if written.is_ok() && taken.capacity() / 2 > keep {
+        taken.shrink_to(keep);
     }
     match written {
         Ok(()) => {
@@ -6773,6 +6773,22 @@ fn prune_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_answer_pool_retains_the_previous_size_until_it_stays_small() {
+        let rules = CachedRules::new(game_config::make_english_game_config()).unwrap();
+        let ordinary = "reply".repeat(1024);
+        assert!(try_json_kept(&rules, &ordinary).unwrap().is_some());
+        let capacity = || rules.answers.lock().unwrap()[0].capacity();
+        let large = capacity();
+        assert_eq!(try_json_kept(&rules, &2).unwrap().as_deref(), Some("2"));
+        assert_eq!(capacity(), large);
+        assert!(try_json_kept(&rules, &ordinary).unwrap().is_some());
+        assert_eq!(capacity(), large);
+        assert!(try_json_kept(&rules, &2).unwrap().is_some());
+        assert!(try_json_kept(&rules, &2).unwrap().is_some());
+        assert!(capacity() < large);
+    }
 
     // analyze takes the exchanges the rack's player has made, none if not
     // given, as wolges's i16 (a count past it is refused as the request is
