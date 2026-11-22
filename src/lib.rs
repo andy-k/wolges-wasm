@@ -4769,6 +4769,7 @@ impl Sim {
 // return the previous state of each id in request order, from 0 for absent to
 // 3 for pruned. Check all the ids before making any change.
 fn do_sim_change_ids(handle: u32, ids: &[u32], change: SimChange) -> Result<Vec<u8>, String> {
+    use std::hash::BuildHasher;
     let mut sims = SIMS.lock().map_err(err_to_str)?;
     let sim = sims.live.get_mut(&handle).ok_or_else(|| no_sim(handle))?;
     let shared = shortlist::attached(&sim.shortlist)?.clone();
@@ -4789,11 +4790,48 @@ fn do_sim_change_ids(handle: u32, ids: &[u32], change: SimChange) -> Result<Vec<
     } else {
         None
     };
+    // each candidate's place by its id, and by its play's hash for one added
+    // by play (no id, not challenged off), made once a call; the candidates
+    // removed are taken out after the last id, so no place moves before then
+    let hasher = fash::MyHasherDefault::default();
+    let mut by_id = fash::MyHashMap::<u32, usize>::default();
+    let mut by_hash = fash::MyHashMap::<u64, usize>::default();
+    let mut removed = Vec::new();
+    let places = sim.candidates.len() + ids.len();
+    if by_id.try_reserve(places).is_err()
+        || by_hash.try_reserve(places).is_err()
+        || removed.try_reserve_exact(places).is_err()
+    {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    for (at, c) in sim.candidates.iter().enumerate() {
+        match c.id {
+            Some(id) => {
+                by_id.entry(id).or_insert(at);
+            }
+            None if !c.challenged_off => {
+                by_hash.entry(hasher.hash_one(&c.play)).or_insert(at);
+            }
+            None => {}
+        }
+    }
+    removed.resize(sim.candidates.len(), false);
+    let by_play = |c: &SimCandidate, play: &movegen::Play| {
+        c.id.is_none() && !c.challenged_off && c.play == *play
+    };
     for &id in ids {
         let play = shortlist.play(id)?;
-        let at = sim.candidates.iter().position(|c| {
-            c.id == Some(id) || (c.id.is_none() && !c.challenged_off && c.play == *play)
-        });
+        let of_play = match by_hash.get(&hasher.hash_one(play)) {
+            Some(&at) if by_play(&sim.candidates[at], play) => Some(at),
+            // another play has its hash, or it has an id now: found by reading
+            Some(_) => (sim.candidates.iter()).position(|c| by_play(c, play)),
+            None => None,
+        };
+        let at = match (by_id.get(&id).copied(), of_play) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .filter(|&at| !removed[at]);
         before.push(at.map_or(0, |i| match sim.candidates[i].state {
             SimState::Running => 1,
             SimState::Paused => 2,
@@ -4802,13 +4840,26 @@ fn do_sim_change_ids(handle: u32, ids: &[u32], change: SimChange) -> Result<Vec<
         let static_equity = match at {
             Some(i) => {
                 sim.candidates[i].id = Some(id);
+                by_id.entry(id).or_insert(i);
                 sim.candidates[i].static_equity
             }
             None => room.as_mut().map_or(0.0, |room| {
                 sim.equity_of_registered_play(&mut room.ps, play)
             }),
         };
-        sim.change_candidate(change, at, Some(id), play, false, static_equity);
+        match (change, at) {
+            (SimChange::Remove, Some(at)) => removed[at] = true,
+            (SimChange::Add, None) => {
+                by_id.insert(id, sim.candidates.len());
+                removed.push(false);
+                sim.change_candidate(change, at, Some(id), play, false, static_equity);
+            }
+            _ => sim.change_candidate(change, at, Some(id), play, false, static_equity),
+        }
+    }
+    if removed.contains(&true) {
+        let mut taken_out = removed.iter();
+        sim.candidates.retain(|_| !taken_out.next().unwrap());
     }
     Ok(before)
 }
@@ -7185,6 +7236,49 @@ mod tests {
         );
         let plays = report(&shortlist::do_plays(shortlist).unwrap());
         assert_eq!(plays.as_array().unwrap().len(), 3, "{plays}");
+        shortlist::do_free(shortlist).unwrap();
+    }
+
+    // an id given twice in one call is changed once, the second time found as
+    // the first left it: added, then running; removed, then absent. A removal
+    // keeps the others in their order, and an id removed may be added again
+    #[test]
+    fn a_sim_changes_an_id_given_twice_once() {
+        let lexicon = "sim-ids-twice";
+        tiny_lexicon(lexicon);
+        let request = serde_json::json!({
+            "rack": [S, E, A, T], "board": report(&cat_board()), "lexicon": lexicon,
+            "rules": "CrosswordGame", "leave": "noleave", "scores": [0, 0], "turn": 0,
+            "zero_turns": 0, "pass_turns": 0, "plies": 2, "seed": 7,
+        });
+        let shortlist = shortlist::do_new(&request.to_string()).unwrap();
+        let swap = format!(r#"{{"action":"exchange","tiles":[{T}]}}"#);
+        let ids = shortlist::do_add(shortlist, &format!("[{CATS},{PASS},{swap}]")).unwrap();
+        let mut request = request;
+        request["shortlist"] = serde_json::json!(shortlist);
+        let sim = do_sim_new(&request.to_string()).unwrap();
+        let change = |ids: &[u32], change| do_sim_change_ids(sim, ids, change).unwrap();
+        let (cats, pass, swap) = (ids[0], ids[1], ids[2]);
+        assert_eq!(
+            change(&[cats, cats, pass, swap], SimChange::Add),
+            [0, 1, 0, 0]
+        );
+        assert_eq!(change(&[pass, pass, swap], SimChange::Remove), [1, 0, 1]);
+        assert_eq!(change(&[cats, pass, swap], SimChange::Pause), [1, 0, 0]);
+        assert_eq!(change(&[swap, cats], SimChange::Add), [0, 2]);
+        let answer = report(
+            &do_sim_step(
+                sim,
+                r#"{"iterations":0,"prune":false,"compact":true}"#,
+                || 0.0,
+            )
+            .unwrap(),
+        );
+        let order = (answer["candidates"].as_array().unwrap().iter())
+            .map(|candidate| candidate["id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, [serde_json::json!(cats), serde_json::json!(swap)]);
+        do_sim_free(sim).unwrap();
         shortlist::do_free(shortlist).unwrap();
     }
 
