@@ -567,10 +567,7 @@ and threats_new:
 
 The opponent's rack is 7 tiles, or all the tiles unseen when fewer. The tiles
 the asking player would draw stay unseen, so a board with the asking player's
-play on it asks what may come after that play. Given an inference that holds no
-leaves, threats and threats_new weigh no rack: racks is 0, and so are
-expected_best, bingo where given, each play's chance, and each square's chance,
-expected, and reach.
+play on it asks what may come after that play.
 
 The racks are weighed the likeliest first, and without a time limit every rack
 is counted exactly. threats lists every play first, whatever its time. In half

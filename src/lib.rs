@@ -3748,14 +3748,15 @@ fn threats_in_room(
         opponent_rack,
         unseen,
     )?;
-    // each leave the opponent may keep, with its weight, read where it is held
-    let leaves = match &opponent {
-        OpponentLeaves::Listed(listed) if listed.is_empty() => 1,
+    // each leave the opponent may keep, with its weight, read where it is held;
+    // none (no kept leaves, or an inference holding none) deals the whole rack
+    let held = match &opponent {
         OpponentLeaves::Listed(listed) => listed.len(),
         OpponentLeaves::Inferred(packed) => packed.len(),
     };
+    let leaves = held.max(1);
     let leave = |i: usize| match &opponent {
-        OpponentLeaves::Listed(listed) if listed.is_empty() => (&[][..], 1.0),
+        _ if held == 0 => (&[][..], 1.0),
         OpponentLeaves::Listed(listed) => (&listed[i].0[..], listed[i].1),
         OpponentLeaves::Inferred(packed) => (packed.leave(i), packed.weight(i)),
     };
@@ -11151,6 +11152,32 @@ mod tests {
             assert_near(&square["chance"], 35.0 / 36.0);
         }
         assert_eq!(ask(), answer);
+    }
+
+    // an inference holding no leaves (infer's answer once the bag is empty)
+    // deals the opponent the whole rack, as no kept leaves do
+    #[test]
+    fn threats_given_an_inference_holding_no_leaves_deal_the_whole_rack() {
+        let _one = one_infer_test();
+        tiny_lexicon("tiny-infer-late");
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let racks = rack.iter().chain(&others).copied().collect::<Vec<_>>();
+        let inference = report(
+            &do_infer(&format!(
+                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer-late","leave":"noleave","rules":"CrosswordGame","play":{PASS},"fuzz":{},"list":{}}}"#,
+                late_board(&racks),
+                infer::FUZZ,
+                u32::MAX
+            ))
+            .unwrap(),
+        );
+        assert_eq!(inference["count"], 0);
+        let handle = inference["handle"].as_u64().unwrap() as u32;
+        let (unseen, rack) = ([S, S, B, D, F, G, H, I, J], [0, 0, I, I, I, I, I]);
+        let answer = threats_of(&unseen, &rack, &format!(r#","inferred":{handle}"#));
+        assert_eq!(answer["racks"], 29);
+        assert_eq!(answer, threats_of(&unseen, &rack, ""));
+        do_infer_free(handle).unwrap();
     }
 
     // the opponent known to hold an S: every rack holds one, so every play is
