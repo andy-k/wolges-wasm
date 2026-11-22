@@ -225,7 +225,7 @@ A valued play is a play with its equity, in points, before its other fields:
   {"equity":5.25,"action":"play","down":true,"lane":8,"idx":6,"word":[1,0],
    "score":2}
 
-A valued play's equity is written as its 32-bit float prints itself: the fewest
+A valued play's equity is written as its 64-bit float prints itself: the fewest
 digits that read back as the same number, and a whole number without a
 fraction.
 
