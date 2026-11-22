@@ -64,7 +64,7 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     CACHED_KLV.write().unwrap().insert(
         "noleave".into(),
-        CachedKlv::new(Klv::empty().map_err(err_to_str)?)?.into(),
+        CachedKlv::new(Klv::empty().map_err(wolges_err)?)?.into(),
     );
     // each game is made once: its WordSmog form is its CrosswordGame one made
     // jumbled (GameConfig::jumbled). So each alphabet and board is built once.
@@ -151,7 +151,7 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
                 game_config::Op::Sim,
                 game_config::Op::Endgame,
             ] {
-                game_config.supports(op).map_err(err_to_str)?;
+                game_config.supports(op).map_err(wolges_err)?;
             }
         }
         let mut cached = CACHED_GAME_CONFIG.write().unwrap();
@@ -163,6 +163,15 @@ pub fn do_this_on_startup() -> Result<(), JsValue> {
 
 fn err_to_str<T: std::fmt::Debug>(x: T) -> String {
     format!("{x:?}")
+}
+
+// a wolges error as its message, which Debug would quote; memory it was
+// refused, by the allocator or by a cap, is out_of_memory
+fn wolges_err(err: wolges::error::BoxAnyError) -> String {
+    if err.is::<std::collections::TryReserveError>() || err.is::<endgame::Refused>() {
+        return OUT_OF_MEMORY.into();
+    }
+    err.to_string()
 }
 
 // tile numbering follows alphabet order (not necessarily unicode order).
@@ -311,7 +320,7 @@ impl CachedRules {
         Ok(Self {
             game_config,
             movegens: Default::default(),
-            no_leaves: Klv::empty().map_err(err_to_str)?,
+            no_leaves: Klv::empty().map_err(wolges_err)?,
             analyze_rooms: Default::default(),
             play_score_rooms: Default::default(),
             answers: Default::default(),
@@ -328,7 +337,7 @@ impl CachedRules {
                 movegen.reset_for_another_kwg();
                 movegen
             }
-            None => Movegen::try_new(&self.game_config).map_err(err_to_str)?,
+            None => Movegen::try_new(&self.game_config).map_err(wolges_err)?,
         };
         Ok(Lent {
             rules: self,
@@ -347,7 +356,7 @@ impl CachedRules {
                 movegen.reset_for_another_kwg();
                 Ok(movegen)
             }
-            None => Movegen::try_new(&self.game_config).map_err(err_to_str),
+            None => Movegen::try_new(&self.game_config).map_err(wolges_err),
         }
     }
 
@@ -551,7 +560,7 @@ pub fn precache_kwg(
 ) -> Result<(), JsValue> {
     let value = js_bytes(value)?;
     let graph = Kwg::from_reader::<kwg::Node22>(value.length() as usize, js_pieces(&value))
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     forget_late_kwg(&key)?;
     CACHED_KWG
         .write()
@@ -567,7 +576,7 @@ pub fn precache_kbwg(
 ) -> Result<(), JsValue> {
     let value = js_bytes(value)?;
     let graph = Kwg::from_reader::<kwg::Node24>(value.length() as usize, js_pieces(&value))
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     forget_late_kwg(&key)?;
     CACHED_KWG
         .write()
@@ -584,7 +593,7 @@ pub fn precache_klv(
     let value = js_bytes(value)?;
     let table = CachedKlv::new(
         Klv::from_reader::<kwg::Node22>(value.length() as usize, js_pieces(&value))
-            .map_err(err_to_str)?,
+            .map_err(wolges_err)?,
     )?;
     Ok(cache_klv(key, table)?)
 }
@@ -599,7 +608,7 @@ pub fn precache_kblv2(
     let value = js_bytes(value)?;
     let table = CachedKlv::new(
         Klv::from_reader::<kwg::Node24>(value.length() as usize, js_pieces(&value))
-            .map_err(err_to_str)?,
+            .map_err(wolges_err)?,
     )?;
     Ok(cache_klv(key, table)?)
 }
@@ -679,7 +688,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
     let kibitzer = &mut room.kibitzer;
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
 
     let mut move_generator = game_config.lend()?;
     let board_snapshot = &movegen::BoardSnapshot {
@@ -802,7 +811,7 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
     let kibitzer = &mut room.kibitzer;
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     game_state
         .board_tiles
         .copy_from_slice(&kibitzer.board_tiles);
@@ -1058,7 +1067,7 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &[], &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let dim = game_config.board_layout().dim();
     // the cross sets wolges's move generator reads: for each square, the letters
     // that make the run of tiles down through it a word and those that make the
@@ -1327,7 +1336,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let mut move_generator = game_config.lend()?;
     let mut cached = CACHED_INFER.lock().map_err(err_to_str)?;
     let tables = match &mut *cached {
@@ -1335,7 +1344,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
         slot => {
             // the set held goes before the next is made, never two at once
             *slot = None;
-            let tables = infer::InferTables::new(&game_config, &klv.klv).map_err(err_to_str)?;
+            let tables = infer::InferTables::new(&game_config, &klv.klv).map_err(wolges_err)?;
             &mut slot
                 .insert(HeldInfer {
                     rules: req.rules.clone(),
@@ -1361,7 +1370,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
         req.fuzz,
         1,
     )
-    .map_err(err_to_str)?;
+    .map_err(wolges_err)?;
     drop(cached);
     leaves.normalize();
     let listed = likeliest(&leaves, req.list);
@@ -1525,7 +1534,7 @@ fn do_prune_pays(req_str: &str) -> Result<bool, String> {
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &[], &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let off_board = (kibitzer.available_tally.iter())
         .map(|&count| count as usize)
         .sum::<usize>();
@@ -1841,13 +1850,13 @@ fn rollout(
     } else {
         simmer.simulate_lean(game_config, kwg, no_tables, klv, play)
     }
-    .map_err(err_to_str)?;
-    let final_spread = simmer.final_equity_spread().map_err(err_to_str)?;
+    .map_err(wolges_err)?;
+    let final_spread = simmer.final_equity_spread().map_err(wolges_err)?;
     let win = simmer.compute_win_prob(game_ended, final_spread, None);
     let spread = final_spread
         .checked_sub(simmer.initial_score_spread)
         .ok_or("score overflow")?;
-    let (points, leaves) = simmer.final_spread_and_leaves().map_err(err_to_str)?;
+    let (points, leaves) = simmer.final_spread_and_leaves().map_err(wolges_err)?;
     let points = points
         .checked_sub(simmer.initial_score_spread)
         .ok_or("score overflow")?;
@@ -2374,7 +2383,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let shortlist = shortlist::attach(
         req.shortlist,
         &req.rules,
@@ -2472,7 +2481,7 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         .seed
         .unwrap_or_else(|| RNG.with(|rng| rng.borrow_mut().next_u64()));
     let mut simmer = simmer::Simmer::with_generator(&game_config, game_config.own_generator()?)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let packed = inferred.map(|leaves| simmer::KeptLeaves {
         seat: opponent as u8,
         leaves,
@@ -3726,7 +3735,7 @@ fn threats_in_room(
     }
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     if let Some(unseen) = req.unseen {
         if !req.rack.is_empty() {
             return Err("rack, unseen: give one or the other".into());
@@ -5435,7 +5444,7 @@ impl EndgameGraph {
     fn run_letters(&self) -> Result<kwg::RunLetters<'_>, String> {
         match self {
             Self::Pruned(graph) => Ok(graph.run_letters()),
-            Self::Lexicon(lexicon, none) => none.of(&lexicon.kwg).map_err(err_to_str),
+            Self::Lexicon(lexicon, none) => none.of(&lexicon.kwg).map_err(wolges_err),
         }
     }
 }
@@ -5459,7 +5468,7 @@ macro_rules! step_solver {
                 $endgame.game_config.own_generator()?,
             ),
         }
-        .map_err(err_to_str)?
+        .map_err(wolges_err)?
         .with_root_moves($endgame.root_moves.as_ref())
     };
 }
@@ -5506,7 +5515,7 @@ impl Endgame {
         let found = solver.peg_bag_rows(progress, play, rows, &limits);
         self.table = Some(solver.take_table());
         self.solver = Some(solver.into_kept());
-        found.map_err(err_to_str)
+        found.map_err(wolges_err)
     }
 
     // with tiles in the bag, the answer's candidates at the places given, best
@@ -5694,7 +5703,7 @@ impl Endgame {
         let answer = if let Some(progress) = self.peg_bag.as_mut() {
             let peg = solver.resume_peg_best(progress, &limits, 1);
             let peg = peg
-                .map_err(err_to_str)
+                .map_err(wolges_err)
                 .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
             let peg = match peg {
                 Ok(peg) => peg,
@@ -5733,7 +5742,7 @@ impl Endgame {
         } else if let Some(progress) = self.peg.as_mut() {
             let peg = solver.resume_peg_one_in_bag_best(progress, &limits, 1);
             let peg = peg
-                .map_err(err_to_str)
+                .map_err(wolges_err)
                 .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
             let peg = match peg {
                 Ok(peg) => peg,
@@ -5800,7 +5809,7 @@ impl Endgame {
                 Err(e) => {
                     self.table = Some(solver.take_table());
                     self.solver = Some(solver.into_kept());
-                    return Err(err_to_str(e));
+                    return Err(wolges_err(e));
                 }
             };
             self.nodes += solver.searched();
@@ -5897,7 +5906,7 @@ impl Endgame {
         self.nodes += solver.searched();
         self.table = Some(solver.take_table());
         self.solver = Some(solver.into_kept());
-        let valued = valued.map_err(err_to_str)?;
+        let valued = valued.map_err(wolges_err)?;
         let candidates = (valued.iter())
             .filter_map(|first| {
                 let value = points(first.value?);
@@ -6053,7 +6062,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &req.rack, &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let shortlist = shortlist::attach(
         req.shortlist,
         &req.rules,
@@ -6133,7 +6142,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 &state,
                 plays,
             )
-            .map_err(err_to_str)?,
+            .map_err(wolges_err)?,
         )
     } else {
         None
@@ -6160,7 +6169,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 },
                 limit.as_ref(),
             )
-            .map_err(err_to_str)?
+            .map_err(wolges_err)?
             .ok_or(OUT_OF_MEMORY)?;
             Some(progress.with_root_moves(root_moves.take()))
         }
@@ -6602,7 +6611,7 @@ fn pruned_graph_within(
     lexicon: &CachedKwg,
     memory: &endgame::MemoryLimit,
 ) -> Result<Option<Kwg>, String> {
-    let empty_klv = Klv::empty().map_err(err_to_str)?;
+    let empty_klv = Klv::empty().map_err(wolges_err)?;
     let mut words = Vec::<bites::Bites>::new();
     let mut refused = false;
     let pruned = game_config.lend()?.gen_remaining_words_within(
@@ -6634,14 +6643,14 @@ fn pruned_graph_within(
     let bytes = match builder.build_for_game_within(game_config, &words, Some(memory)) {
         Ok(bytes) => bytes,
         Err(e) if e.is::<endgame::Refused>() => return Ok(None),
-        Err(e) => return Err(err_to_str(e)),
+        Err(e) => return Err(wolges_err(e)),
     };
     // as many nodes as the bytes hold, and room for an empty lexicon's two
     let mut graph = kwg::Kwg(Vec::new());
     if endgame::room_in(Some(memory), &mut graph.0, (bytes.len() / 4).max(2)).is_err() {
         return Ok(None);
     }
-    graph.refill_from_bytes(bytes).map_err(err_to_str)?;
+    graph.refill_from_bytes(bytes).map_err(wolges_err)?;
     drop(builder);
     drop(words);
     Ok(Some(graph))
@@ -6694,7 +6703,7 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &[], &req.board_tiles)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let memory = limit.as_ref();
     let mut words = Vec::<bites::Bites>::new();
     let mut refused = false;
@@ -6730,7 +6739,7 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
     let bytes = match builder.build_for_game_within(&game_config, &words, memory) {
         Ok(bytes) => bytes,
         Err(e) if e.is::<endgame::Refused>() => return Err(OUT_OF_MEMORY.into()),
-        Err(e) => return Err(err_to_str(e)),
+        Err(e) => return Err(wolges_err(e)),
     };
     let mut out = Vec::new();
     endgame::room_in(memory, &mut out, bytes.len()).map_err(|_| OUT_OF_MEMORY)?;
@@ -6766,9 +6775,9 @@ fn prune_into(
         .refill_from_bytes(
             build::Builder::default()
                 .build_for_game(game_config, &words)
-                .map_err(err_to_str)?,
+                .map_err(wolges_err)?,
         )
-        .map_err(err_to_str)
+        .map_err(wolges_err)
 }
 
 #[cfg(test)]
@@ -9358,27 +9367,27 @@ mod tests {
         let rack = [S, E, A, T];
         let others = [A, T, E];
         for (root, error) in [
-            ("[]", "expected"),
+            ("[]", "root_moves: expected 1 to 65534 plays"),
             (
                 r#"[{"action":"exchange","tiles":[19]}]"#,
-                "exchange is unavailable",
+                "root_moves[0]: exchange is unavailable",
             ),
             (
                 r#"[{"action":"exchange","tiles":[]},{"action":"exchange","tiles":[]}]"#,
-                "duplicate",
+                "root_moves[1]: duplicate play",
             ),
             (
                 r#"[{"action":"play","down":false,"lane":2,"idx":5,"word":[-128,0],"score":0}]"#,
-                "invalid blank",
+                "root_moves[0]: invalid blank tile",
             ),
             (
                 r#"[{"action":"play","down":false,"lane":2,"idx":5,"word":[19,0],"score":2147483647}]"#,
-                "score out of range",
+                "root_moves[0]: score out of range",
             ),
         ] {
             let more = format!(r#","root_moves":{root}"#);
             let refused = endgame_of("tiny-end-root-invalid", &rack, &others, &more).unwrap_err();
-            assert!(refused.contains(error), "{refused}");
+            assert_eq!(refused, error);
         }
     }
 
@@ -9912,6 +9921,12 @@ mod tests {
                 r#","part":[0,2]"#
             )
             .is_err()
+        );
+        // a part past the last is refused with wolges's message, unquoted
+        let more = r#","model":"random_draws","exchanges":[0,0],"part":[2,2]"#;
+        assert_eq!(
+            endgame_of("tiny-end-parts", &rack, &others, more).unwrap_err(),
+            "part: k below n, found 2 of 2"
         );
     }
 

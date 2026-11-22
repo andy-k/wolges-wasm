@@ -2,7 +2,7 @@
 
 use super::{
     CACHED_GAME_CONFIG, CACHED_KWG, CachedKwg, CachedRules, OUT_OF_MEMORY, PlayScoreRoom, SimPlay,
-    Taken, equity, err_to_str, fash, game_state, kibitzer, movegen, wasm_bindgen,
+    Taken, equity, err_to_str, fash, game_state, kibitzer, movegen, wasm_bindgen, wolges_err,
 };
 use std::sync::{Arc, LazyLock, Mutex};
 use wasm_bindgen::JsValue;
@@ -134,7 +134,7 @@ pub(crate) fn do_new(req_str: &str) -> Result<u32, String> {
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&rules, &req.rack, &req.board)
-        .map_err(err_to_str)?;
+        .map_err(wolges_err)?;
     let unseen: usize = kibitzer.available_tally.iter().map(|&n| n as usize).sum();
     let opponent_tiles = (rules.num_players() - 1) as usize * rack_size;
     let mut position = game_state::GameState::new(&rules);
@@ -209,7 +209,7 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
             }
             let mut play = scorer
                 .validate_play(snapshot, &shortlist.position, &play)
-                .map_err(err_to_str)?
+                .map_err(wolges_err)?
                 .unwrap_or(play);
             if !scorer.words_are_valid(snapshot, &play) {
                 return Err("play makes an invalid word".into());
