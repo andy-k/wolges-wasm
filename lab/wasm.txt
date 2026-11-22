@@ -1,0 +1,950 @@
+THE WASM'S CALLS: REQUESTS AND ANSWERS
+
+wolges-wasm builds wolges into a WebAssembly module with JavaScript bindings.
+This file describes each function the module exports: what it takes, what it
+does, and what it answers. Most calls take a request as a JSON string and
+answer a JSON string; the others take or answer numbers, strings, booleans, and
+byte arrays, as each call says. Scores, equities, and values in answers are in
+points.
+
+
+LOADING THE MODULE AND THE FIRST CALLS
+
+The package is built for bundlers (pkg) and for pages that load the module
+themselves (pkg-web). With pkg-web, the default export is an async function
+that loads the module, and it must finish before any other call.
+
+Loading runs the module's start function, do_this_on_startup, once; a page does
+not call it. It sends the message of any panic to the console, makes the 28
+rules named under RULES below, and loads an empty leave table under the name
+noleave. No call makes rules.
+
+A page's first calls load its tables: precache_kwg or precache_kbwg loads a
+lexicon, and precache_klv or precache_kblv2 a leave table, each under a name
+the page chooses. Requests then name the tables they use in their lexicon,
+leave, and rules fields. A table may be loaded, replaced, or evicted between
+any two calls.
+
+Calls run one at a time, each to its end, on the thread that makes it. The
+calls that search for long (threats, threats_step, sim_step, and endgame_step)
+take a time to run, in milliseconds, so that a page can do that work a step at
+a time. Their time is read on performance.now, or on Date.now where there is no
+performance.now.
+
+
+HOW A CALL FAILS
+
+A call that cannot do what it is asked throws a JavaScript string saying why;
+it is not an Error object. Many messages start with the request field at fault
+and end with what was found, as in "turn: must be >= 0 and < 2, found 3".
+
+A request that is not JSON, lacks a required field, or gives a field a value of
+the wrong type is refused with the JSON reader's message, which says what is
+wrong, naming the field only when it is missing, and gives the line and column
+where the text failed. A whole number must be whole and within its field's
+range.
+
+A request field a call does not read is ignored, so a play from an answer may
+be passed back with fields the request does not take. An optional field may be
+left out. A field whose type is given as "or null" takes null too, and for an
+optional field null is the same as leaving it out, unless the field says what
+null means; other fields refuse null.
+
+These messages are the ones a page may want to tell apart:
+
+  out_of_memory: the call could not get the memory it needed (MEMORY below).
+  missing kwg, missing klv, missing game_config: no lexicon, leave table, or
+    rules is loaded under the name the request gives.
+  sim 7: none such, or freed (and the same for inference, threats, and
+    endgame): the handle is not live (HANDLES below).
+
+A panic or an allocation failure the module does not catch reaches the page as
+a WebAssembly RuntimeError instead of a thrown string, the panic's message
+going to the console. The instance should not be used after one.
+
+
+HANDLES
+
+Some objects outlive the call that makes them. A call that makes one answers
+its handle, a whole number, and later calls name it:
+
+  inference: made by infer and infer_import; read by infer_export and by the
+    inferred field of sim_new, sim_set, threats, and threats_new; freed by
+    infer_free.
+  threats question: made by threats_new; stepped by threats_step; freed by
+    threats_free.
+  sim: made by sim_new; changed by sim_add, sim_remove, sim_pause, sim_resume,
+    and sim_set; stepped by sim_step; freed by sim_free.
+  endgame: made by endgame_new; stepped by endgame_step; its table taken by a
+    later endgame_new (warm_from); freed by endgame_free.
+
+Each kind numbers its handles from 1 and never gives a number twice. An object
+lives, with all it holds, until its free call; nothing else frees it. A handle
+that was freed or never given is refused with "<kind> <number>: none such, or
+freed", the kind being inference, threats, sim, or endgame. Named in a
+request's inferred or warm_from field, the message starts with the field's
+name, as in: inferred: inference 7: none such, or freed. A second free of a
+handle is refused the same way. After 4294967295 handles of a kind, making
+another is refused.
+
+An object holds the tables it was made with. Loading another table under the
+same name, or evicting the name, changes no live object; only later requests
+read the new table, or are refused. A sim given an inference holds its leaves,
+whether or not the inference is freed.
+
+Handles belong to the module instance that made them. An inference moves to
+another instance as bytes, by infer_export in one and infer_import in the
+other.
+
+
+MEMORY
+
+memory_held() answers the bytes the module's allocator holds now, as a number.
+The module keeps some working memory from one call to the next, so it does not
+fall all the way back when a request is done.
+
+sim_new, sim_step, endgame_new, and build_kbwg take max_memory_mb, a cap in MiB
+on the module's memory while they run; it is 1 or more, and 0 is refused. The
+cap counts the module's whole linear memory, which grows but never shrinks, not
+memory_held. Without a cap, a call grows its memory until the browser refuses
+it more.
+
+A call that cannot get the memory it needs throws "out_of_memory", or, for a
+step, says out_of_memory: true in its answer; each call's section says which,
+and what a later call can do.
+
+
+SHARED SHAPES
+
+Each of these is the same in every call that takes or answers it.
+
+
+TILES AND RACKS
+
+A tile is a number. 0 is the blank, and the letters count up from 1 in the
+order of the rules' alphabet: in English, 1 is A and 26 is Z. Each other
+alphabet numbers its letters in the order of its file in wolges's
+src/alphabets, one letter a line after the blank.
+
+A rack is a JSON array of tiles in any order, a blank as 0. Every tile must be
+in the rules' alphabet, and a rack and a board together may hold no more of a
+tile than the rules' set has.
+
+Throughout, the tiles unseen are those of the rules' set that are not on the
+board and not on the rack given.
+
+
+BOARDS
+
+A board is a JSON array of its rows, top to bottom, each a JSON array of its
+squares, left to right: 15 rows of 15 on the standard board, and 21 rows of 21
+on the super board. Rows and columns count from 0 at the top left. An empty
+square is 0. A square holding a tile holds its letter, or, for a blank played
+as a letter, that letter negated: -1 is a blank played as A. A board of the
+wrong size, or with a tile the alphabet lacks, is refused.
+
+
+RULES
+
+A request's rules field names one of the 28 rules the module makes as it loads:
+
+  CrosswordGame and WordSmog: English on the standard board.
+  CrosswordGameSuper and WordSmogSuper: English on the super board, with its
+    larger set.
+  CrosswordGame/catalan and WordSmog/catalan, and the same for dutch, french,
+    german, italian, norwegian, polish, slovene, spanish, and swedish: that
+    language on the standard board.
+  CrosswordGameSuper/catalan and WordSmogSuper/catalan, and the same for
+    german: that language on the super board, with its larger set.
+
+Each WordSmog name plays the set and board of its CrosswordGame twin under the
+jumbled rules, where the tiles of a word may lie in any order. All 28 are for
+two players, a rack of 7 tiles, and a 50-point bonus for a play of all 7.
+
+The rules differ in how a game ends and in exchanges. Most end a game when a
+player goes out or after six scoreless turns in a row. German ends it after
+four passes in a row and never by scoreless turns. Polish ends it after four
+passes or six scoreless turns, does not count an exchange as scoreless, and
+allows three exchanges a player. Spanish ends it after four passes or twelve
+scoreless turns, counts a play challenged off the board as a pass, never ends a
+game on an empty board by scoreless turns, and allows an exchange while the bag
+holds a tile. Under the others an exchange needs 7 tiles in the bag.
+
+
+LEXICONS AND LEAVE TABLES
+
+A lexicon is a word graph loaded under a name by precache_kwg or precache_kbwg;
+a request names it in its lexicon field. Under CrosswordGame rules it is the
+graph of the words; under WordSmog rules it is the graph of each word's tiles
+in tile order, as wolges builds for jumbled play.
+
+A leave table values the tiles a play keeps. It is loaded under a name by
+precache_klv or precache_kblv2, and a request names it in its leave field. The
+table named noleave, loaded at the start, values every leave at 0.
+
+A request whose lexicon or leave table holds a tile its rules lack is refused,
+with a message such as: lexicon: has tiles the "CrosswordGame" rules do not
+have.
+
+
+PLAYS
+
+A play is a JSON object whose action field says what it is:
+
+  {"action":"exchange","tiles":[3,9,9]}
+  {"action":"play","down":false,"lane":7,"idx":6,"word":[0,0,0,19],"score":6}
+
+An exchange gives up its tiles, and an exchange of no tiles is a pass. A
+placement has these fields:
+
+  down: true for a play down a column, false for one across a row.
+  lane: the row of an across play, or the column of a down play.
+  idx: the column of an across play's first square, or the row of a down
+    play's.
+  word: each square of the word from its first: 0 for a square that already
+    holds a tile, a letter for a tile placed, and a letter negated for a blank
+    placed as it.
+  score: the play's score, in points.
+
+An answer's play gives the word from its first square to its last, and its
+score as scored. The second example places an S after CAT to make CATS.
+
+A valued play is a play with its equity, in points, before its other fields:
+
+  {"equity":5.25,"action":"play","down":true,"lane":8,"idx":6,"word":[1,0],
+   "score":2}
+
+A valued play's equity is written as its 32-bit float prints itself: the fewest
+digits that read back as the same number, and a whole number without a
+fraction.
+
+
+STATIC EQUITY
+
+A play's static equity is its value on the board alone. While the bag holds
+tiles, it is the play's score and the leave table's value of the tiles it
+keeps, less 0.7 points for each vowel a play on an empty board places beside a
+premium square in a lane next to its own. With an empty bag, it is the score
+less 10 points and twice the points of the tiles kept, or, for a play that goes
+out, the score and twice the points of the opponent's tiles.
+
+
+SIM PLAYS
+
+infer and the sim calls take a play as a sim play: a play as above whose score
+may be left out and is counted again, and whose placement may give two more
+fields:
+
+  bonus: whole number, optional (0 if left out). Points added to the play's
+    score, as a challenge's bonus.
+  challenged_off: true or false, optional (false if left out). The play was
+    challenged off the board: it scores nothing, its tiles go back on the rack,
+    and its turn counts as a scoreless one, or as a pass where the rules say.
+
+A play an answer gives may be passed as a sim play as it is.
+
+
+WEIGHTED LEAVES
+
+A weighted leave is a leave a player may have kept, and its weight:
+
+  {"tiles":[5,19],"weight":0.25}
+
+Both fields are required: tiles is a rack, and weight a number.
+
+
+WHAT THE OPPONENT HOLDS
+
+sim_new, sim_set, threats, and threats_new take what the opponent holds in one
+of three fields, never in two of them. The opponent is the player after the one
+to move.
+
+  known: rack, optional ([] if left out). Tiles the opponent is known to hold.
+  kept: array of weighted leaves, optional ([] if left out). Leaves the
+    opponent may have kept, each as likely as its weight: the opponent's rack
+    holds one of them, and the rest of the rack is dealt. Each weight is 0 or
+    more, and they sum to a finite number above 0. A leave of weight 0 is never
+    on the rack.
+  inferred: inference handle or null, optional. The leaves of that inference,
+    taken as kept.
+
+The rest of the opponent's rack is dealt from the tiles unseen; with none of
+the three given, all of it is. Each leave must fit the opponent's rack and be
+among the tiles unseen. A leave or a list that does not is refused, the message
+naming it, as in: kept[2]: weight must be 0 or more.
+
+
+STATISTICS
+
+A statistic of rollouts is an object {"mean":m,"variance":v}: the mean and the
+sample variance, which is 0 under two samples. A statistic over fewer rollouts
+than its candidate's gives its own count too, {"n":n,"mean":m,"variance":v},
+but for a ply's score, whose count is its ply's n.
+
+The statistics of a sim run in parts (sim_new's part and parts) pool into the
+whole sim's: n is the sum of the parts' n, the mean is the parts' means
+weighted by their n, and the variance is the sum over the parts of n - 1 times
+the part's variance plus n times the square of the part's mean less the pooled
+mean, all over the pooled n less 1.
+
+
+WHICH BUILD IS LOADED
+
+version() answers a string naming the commits the module was built from, in the
+form "wolges-wasm <commit> <target> wolges <commit> <target>". A commit is its
+time in UTC and its short hash joined by a hyphen, as in
+20261121T201554Z-20f8ed9, with -dirty after it for a build with uncommitted
+changes, or unknown where git could not tell. The target is the one the build
+was for, wasm32-unknown-unknown.
+
+
+A SIM'S PRUNING BOUND
+
+stitched_z(iterations, alpha) takes two numbers and answers one: the prune_z
+for a step of a sim with no set count of iterations, after the iterations it
+has run. Used at every look, it keeps to at most alpha the chance that the sim
+ever prunes its best candidate behind a given other one, however long it runs.
+iterations is a whole number of at least 1 and below 2^64, and alpha is above 0
+and below 1; other values are refused. The answer is
+
+  1.7 * sqrt(ln(ln(2 * iterations)) + 0.72 * ln(5.2 / alpha))
+
+
+LOADING AND EVICTING TABLES
+
+precache_kwg(name, bytes) loads a lexicon from bytes, a Uint8Array holding a
+kwg file, under name, a string, in place of any lexicon loaded under it.
+precache_kbwg(name, bytes) does the same from a kbwg file, whose layout holds
+graphs too large for a kwg's; build_kbwg makes such files. Both answer
+undefined.
+
+precache_klv(name, bytes) loads a leave table from a klv or klv2 file whose
+leaves' graph is in the kwg layout, under name, in place of any leave table
+loaded under it. precache_kblv2(name, bytes) does the same from a file whose
+leaves' graph is in the kbwg layout. Both answer undefined. A table holding a
+value past 1073741823 thousandths of a point either way is refused.
+
+Each refuses a value that is not a Uint8Array with "not a Uint8Array", and
+bytes that do not make a whole graph or table with a message saying what is
+wrong. A refused load leaves the name as it was.
+
+evict_kwg(name) and evict_klv(name) forget the lexicon or the leave table
+loaded under name, and answer true if one was. A later request naming it is
+refused with missing kwg or missing klv. Loading or evicting a name also lets
+go of what the module made from its table for later requests: a sim's pruned
+lexicon, and infer's tables. Objects made with a table keep it (HANDLES above).
+
+
+PRUNED LEXICONS
+
+A search late in a game runs faster on the graph of the lexicon's words its
+board can still take, whatever the racks. sim_new and endgame_new make that
+graph themselves. A page that runs several searches on one board can make it
+once.
+
+prune_pays(request) answers true or false: whether a graph pruned for the board
+pays for this many searches on it, as sim_new decides it for itself. The
+request:
+
+  rules: string, required.
+  board: board, required.
+  uses: whole number, 1 or more, required. How many searches will run on the
+    pruned graph.
+
+It answers true when the bag, which is the tiles off the board less a full rack
+for each player, holds at most 25 tiles for one use, or 28 for more, and at
+most 18 and 22 while a blank is off the board.
+
+build_kbwg(request) answers a Uint8Array: the lexicon's graph pruned for the
+board, in the kbwg layout, the graph sim_new and endgame_new would make for
+that board. The request:
+
+  lexicon, rules: strings, required.
+  board: board, required.
+  max_memory_mb: whole number or null, optional. A cap on memory while the
+    graph is made (MEMORY above).
+
+Under a cap, a graph that does not fit throws out_of_memory. Load the bytes
+with precache_kbwg and name them in sim_new or endgame_new with pruned true;
+the search then takes the graph as it is.
+
+
+LISTING A RACK'S BEST PLAYS
+
+analyze(request) answers the plays a rack can make on a board, the best first,
+as a JSON array of valued plays. The request:
+
+  rack: rack, required. The tiles of the player to move.
+  board: board, required.
+  count: whole number, required. The most plays to list; 0 lists none.
+  lexicon, leave, rules: strings, required.
+  exchanges: whole number from 0 to 32767, optional (0 if left out). How many
+    times the player to move has exchanged; rules that limit exchanges offer
+    none past the limit.
+
+A play's equity is its static equity (STATIC EQUITY above). The bag is read
+from the board: it is the tiles not on the board less a full rack for each
+player. Exchanges are listed while the bag holds enough to exchange, and a pass
+only when no other play is possible. Plays of equal equity come in no set
+order, so another count may end its list with another of them. Under WordSmog
+rules, plays that place the same tiles on the same squares for the same score
+and equity are listed once.
+
+analyze throws out_of_memory where the list does not fit.
+
+
+SCORING PLAYS
+
+play_score(request) checks and scores plays a rack might make on a board. The
+request:
+
+  rack, board, lexicon, leave, rules: as analyze takes them, required.
+  plays: array of plays, required. A placement must give a score, which is
+    counted again.
+
+The answer is a JSON array with one entry for each play, in the order given. A
+play that is no play on the board for the rack answers why:
+
+  {"result":"error","error":"cannot place a tile not on rack"}
+
+Any other play answers its score and equity:
+
+  {"result":"scored","canonical":true,"valid":false,"invalid_words":[[20,5]],
+   "equity":-1.25,"action":"play","down":true,"lane":8,"idx":7,"word":[0,5],
+   "score":2}
+
+  canonical: false when the play was written otherwise than the scorer writes
+    it: an exchange with its tiles out of tile order, or a play of one tile
+    written down where it makes a word across. The answer gives the play as the
+    scorer writes it.
+  valid: true when every word the play makes is in the lexicon.
+  invalid_words: the words the play makes that the lexicon lacks, each as its
+    tiles, a blank as the letter it plays.
+  equity and the play's own fields: the play as a valued play, its score
+    counted again, and its equity its static equity (STATIC EQUITY above).
+
+The opponent's rack holds the tiles unseen first in tile order, a full rack of
+them, and the bag holds the rest, so the bag is empty when 7 or fewer tiles are
+unseen. An exchange is checked against that bag.
+
+play_score throws out_of_memory where its answer does not fit.
+
+
+THE LETTERS EACH SQUARE TAKES
+
+hooks(request) answers, for each empty square beside a tile, the letters a tile
+placed there may be, to make a word with the tiles beside it. The request:
+
+  board: board, required.
+  lexicon, rules: strings, required.
+
+The answer lists the squares row by row:
+
+  {"squares":[{"row":6,"col":7,"across":null,"down":[20]},
+   {"row":7,"col":5,"across":[19],"down":null}]}
+
+  row, col: the square.
+  across: the letters that make the run of tiles across through the square a
+    word; null where no tile is beside it across, and [] where tiles are but no
+    letter makes a word.
+  down: the same for the run of tiles down through the square.
+
+A letter is listed as its tile; a blank may play as any of them. Under WordSmog
+rules, the run and the letter make a word in any order.
+
+
+INFERRING A LEAVE
+
+infer(request) infers the leaves the player who just moved may have kept, from
+that move, as wolges's sims infer them, and answers a JSON object holding the
+new inference's handle. The request:
+
+  rack: rack, required. The rack of the player who watched the move: [] for one
+    who saw no rack.
+  board: board, required. The board before the move.
+  lexicon, leave, rules: strings, required.
+  play: sim play, required. The move. An exchange's tiles are read only for how
+    many there are. A bonus or a play challenged off is refused.
+  fuzz: number, 0 or more, required. How fast, in points of equity, a rack that
+    could have made the move grows less likely as its best play beats the move
+    by more: past the least that any such rack's best play beats the move by,
+    each fuzz points more divides the rack's weight by e. At 0, only the racks
+    whose best play beats the move by that least are kept.
+  list: whole number, optional (0 if left out). How many of the likeliest
+    leaves to list.
+
+The answer:
+
+  {"handle":1,"count":2,"leaves":[{"tiles":[5,19],"weight":0.75}],
+   "tiles":[{"held":0.125,"prior":0.11},...]}
+
+  handle: the inference's handle, made even when it holds no leaves.
+  count: how many leaves it holds. Their weights sum to 1.
+  leaves: the likeliest leaves, as many as list asks, the likeliest first, and
+    leaves of equal weight in the order of their tiles.
+  tiles: one entry for each tile of the alphabet in tile order, the blank
+    first. held is the chance that the opponent's rack, after the move and its
+    draw, holds one or more of the tile, the kept leave taken by the
+    inference's weights and the rest of the rack dealt from the tiles unseen
+    less that leave. prior is the same chance with the whole rack dealt from
+    the tiles unseen. With no leaves, held is prior.
+
+The tiles unseen here are those the watcher cannot see after the move: not on
+the board, not placed by the move, and not on the watcher's rack. The rack
+counted is 7 tiles, or all of them when fewer.
+
+No leave is inferred when the bag before the move is empty, when the move's
+draw empties it, or when the move is an exchange of one or more tiles and the
+bag holds too few tiles to exchange. The bag before the move is the tiles the
+watcher could not see less a full rack. While that bag holds tiles, a move that
+places tiles the watcher holds or the board has is refused.
+
+infer keeps the tables it makes for the last rules and leave table it was asked
+about, until it is asked about others or that leave table is loaded again or
+evicted.
+
+infer_free(handle) frees an inference and answers undefined. A sim given the
+inference keeps its leaves.
+
+infer_export(handle) answers a Uint8Array of the inference's leaves, for
+infer_import in another instance: the count of leaves, then the count of their
+tiles in all, each a 32-bit little-endian whole number; a byte for each leave's
+length; every leave's tiles one after another; and each leave's weight, a
+64-bit little-endian float; all in the order held. An inference too large to
+write so is refused.
+
+infer_import(bytes) takes such a Uint8Array and answers the handle of a new
+inference holding its leaves, freed by infer_free. Bytes whose counts do not
+add up are refused with "infer_import: the bytes do not add up". A weight below
+0 or not finite is refused with "infer_import: a leave's weight must be finite
+and 0 or more", and weights whose sum is not finite with "infer_import: the
+leaves' weights must sum to a finite total". The weights are taken as they are.
+
+infer_export and infer_import throw out_of_memory where the leaves do not fit.
+
+
+WHAT THE OPPONENT MAY PLAY NEXT
+
+threats(request) answers what the opponent may play next on a board, by score
+alone, with no leave read, each rack the opponent may hold weighed by its
+chance. threats_new(request) makes the same question as a threats object and
+answers its handle. threats_step(handle, request) weighs it a step at a time,
+and threats_free(handle) frees it and answers undefined. The request of threats
+and threats_new:
+
+  board: board, required. The board as the opponent will find it.
+  lexicon, rules: strings, required.
+  rack: rack, optional ([] if left out), 7 tiles at most. The rack of the
+    player asking, whose tiles the opponent cannot hold.
+  unseen: array of whole numbers or null, optional. The tiles unseen as a count
+    of each tile in tile order, the blank first, one count for each tile of the
+    alphabet; in place of rack, never with it.
+  known, kept, inferred: what the opponent holds (WHAT THE OPPONENT HOLDS
+    above); kept may also be named leaves.
+  count: whole number or null, optional. How many of the best plays to list;
+    all of them if left out.
+  ms: number, 0 or more, or null, optional. A time to run, in milliseconds, the
+    listing of the plays included; no limit if left out. threats_new does not
+    read it.
+  seed: whole number from 0 to 2^64 - 1, or null, optional. The seed of the
+    racks drawn when the time runs out; a random one if left out.
+  square: [row, col] or null, optional. List only the plays that place a tile
+    on that square. A square off the board is refused.
+
+The opponent's rack is 7 tiles, or all the tiles unseen when fewer. The tiles
+the asking player would draw stay unseen, so a board with the asking player's
+play on it asks what may come after that play. Given an inference that holds no
+leaves, threats and threats_new weigh no rack: racks is 0, and so are
+expected_best, bingo where given, each play's chance, and each square's chance,
+expected, and reach.
+
+The racks are weighed the likeliest first, and without a time limit every rack
+is counted exactly. threats lists every play first, whatever its time. In half
+the time left it counts the likeliest racks exactly, and in the rest it draws
+racks at random from those left, each as likely as its chance, reading the time
+once every 16 racks. Each sum is then the exact sum over the racks counted plus
+an unbiased estimate of the rest's from the racks drawn. With the same racks
+counted, the same seed draws the same racks.
+
+The answer:
+
+  racks: how many distinct racks the opponent may hold.
+  count: how many plays the opponent may make of the tiles unseen. Under
+    WordSmog rules, the same tiles on the same squares count as one play,
+    whatever their order, and plays lists one of them.
+  expected_best: the expected score of the opponent's best play, a rack with no
+    play counting 0.
+  bingo: the chance that the opponent holds a play of all 7 tiles; null when
+    the opponent's rack holds fewer.
+  covered: the chance that the racks counted exactly hold; 1 when every rack is
+    counted.
+  samples: how many racks were drawn; 0 when every rack is counted.
+  list_ms: the milliseconds listing the plays has taken so far.
+  exact: true once every play is listed and every rack counted.
+  walked: how far the listing of the plays has got, from 0 to 1.
+  plays: the best plays, the best first, and plays of equal score in the order
+    of down (across first), lane, idx, and word. Each is a play with two more
+    fields: tiles, the tiles it places in tile order, a blank as 0, and chance,
+    the chance that the opponent's rack holds them.
+  squares: the board row by row, null where a tile is, and for each empty
+    square an object: best, the best score of a play placing a tile there, 0 if
+    none does; chance, the chance that the opponent holds a play placing a tile
+    there that scores best; expected, the expected score of the opponent's best
+    play placing a tile there, a rack with none counting 0; and reach, the
+    chance that the opponent holds any play placing a tile there.
+  out_of_memory: true, given only when part of the question did not fit in
+    memory.
+
+threats and threats_new throw out_of_memory when the question does not fit in
+memory. An answer that does not fit comes with no plays and out_of_memory true.
+Once the listing of the plays has run out of memory, later steps list no more.
+
+The request of threats_step:
+
+  ms: number, 0 or more, or null, optional. The time to run, in milliseconds.
+    Left out, the step lists every play and counts every rack, and its answer
+    is exact. 0 weighs nothing more and answers from what was weighed.
+  count: whole number or null, optional. How many of the best plays to list in
+    this answer; threats_new's count if left out.
+  square: [row, col] or null, optional. List only the plays that place a tile
+    on that square, in this answer.
+
+A step first lists the plays not yet listed, within its time. Once every play
+is listed, it counts racks exactly for the first half of its time and draws
+racks for the rest, as threats does. Its answer is threats's, exact once every
+rack is counted. While the plays are still being listed, its plays are the best
+found so far and its chances are 0. A square off the board is refused.
+
+A threats object holds its lexicon, its rules, and all it has listed and
+weighed, until threats_free.
+
+
+SIMS
+
+sim_new(request) makes a sim of a position and answers its handle. A sim rolls
+out each of its candidate plays many times, each time dealing the opponent a
+rack and playing on, and reports how each candidate fares. It holds no
+candidates when made: sim_add gives it some, and sim_step runs it. The request
+of sim_new:
+
+  rack: rack, required, 7 tiles at most. The rack of the player to move.
+  board: board, required.
+  lexicon, leave, rules: strings, required.
+  scores: array of whole numbers, required. Each player's score, in points,
+    seat 0 first: one for each player, each within 2147483 points.
+  turn: whole number, required. The seat to move: 0 or 1.
+  zero_turns: whole number from 0 to 65535, required. The scoreless turns in a
+    row so far.
+  pass_turns: whole number from 0 to 65535, required. The passes in a row so
+    far.
+  plies: whole number or null, required. How many plies each rollout plays
+    after its candidate; null plays every ply to the game's end.
+  known, kept, inferred: what the opponent holds (WHAT THE OPPONENT HOLDS
+    above).
+  opponents_pass: true or false, optional (false if left out). Every player but
+    the one to move passes on each of its turns in a rollout.
+  seed: whole number from 0 to 2^64 - 1, or null, optional. The seed the
+    rollouts' draws come from; a random one if left out.
+  part, parts: whole numbers, optional (0 and 1 if left out). For a sim run in
+    parts, which part of how many this is; part is below parts.
+  max_memory_mb: whole number or null, optional. A cap on memory while the sim
+    runs (MEMORY above).
+  pruned: true or false, optional (false if left out). The lexicon is already
+    this board's pruned graph (build_kbwg), taken as it is.
+
+The player to move holds rack. The opponent is dealt a full rack from the tiles
+unseen, or all of them when fewer, and the bag holds the rest.
+
+A rollout plays its candidate and then plies more plies, each player making the
+play of the best static equity, and past them it plays on to the game's end
+once the bag holds a rack's tiles or fewer. A rollout that stops before the
+game ends values each player's last leave by the leave table, or, with an empty
+bag, each rack as the cost of keeping it. A rollout whose game ends has a
+chance to win of 1, 0.5, or 0 by its final spread; one that stops before has a
+chance estimated from its spread and the tiles left.
+
+The seed alone makes a sim's draws. Every running candidate of an iteration is
+rolled out on the same draws. A sim's results are the same however its steps
+divide its iterations, and a candidate's rollouts do not depend on the other
+candidates. Sims of the same position and seed, with the same parts and each
+part from 0 to parts - 1, run between them the iterations of one sim, and their
+statistics pool into its own (STATISTICS above).
+
+Under a cap, a sim that has no room for its pruned lexicon rolls out on the
+lexicon itself.
+
+sim_step(handle, request) runs a sim for a count of iterations, a time, or
+both, and answers how its candidates stand. The request:
+
+  iterations: whole number or null, optional. The most iterations to run; 0
+    runs none and answers the sim as it is.
+  ms: number, 0 or more, or null, optional. The most milliseconds to run, the
+    clock read before each iteration. A step gives iterations, ms, or both, and
+    with both it stops at whichever ends first.
+  prune: true or false, required. Whether the step prunes.
+  prune_every: whole number, 1 or more, or null; required to prune. The step
+    prunes every prune_every of the sim's iterations.
+  prune_z: number, 0 or more, or null; required to prune. How many standard
+    errors, split over the candidates still running, a candidate must be behind
+    the leader to be pruned.
+  prune_decided: number from 0 to 0.5, or null; required to prune. A chance to
+    win within prune_decided of 1 or of 0 has its game won or lost.
+  against: sim play or null, optional. A candidate of the sim to compare each
+    candidate with.
+  max_memory_mb: whole number or null, optional. The sim's cap from this step
+    on, in place of the one before; left out or null, the cap stays as it was.
+
+When the step prunes, each running candidate behind the leader is pruned: it is
+no longer rolled out, and its rollouts stay. The leader is, of the running
+candidates, the won one of the highest equity where any game is won, the one of
+the highest equity where every game is lost, and otherwise the one of the
+highest chance to win. A candidate is behind when its difference from the
+leader, on the iterations both ran, which must number 2 or more, stays below 0
+at the top of its interval of prune_z standard errors split over the candidates
+still running, taken as Student's t for those iterations: its difference in the
+chance to win, or in equity where both games are won or both lost.
+
+The answer:
+
+  {"iterations":40,"stepped":40,"candidates":[...]}
+
+  iterations: the sim's iterations in all.
+  stepped: the iterations this step ran.
+  candidates: the candidates in the order they joined, each as below.
+  out_of_memory: true, given only when the sim has run out of memory. It then
+    runs no more iterations.
+
+Each candidate:
+
+  play: the candidate as a valued play, its score counted again, with its
+    bonus, and its equity its static equity.
+  challenged_off: true, given only for a play challenged off.
+  state: "running", "paused", or "pruned".
+  n: how many times the candidate was rolled out.
+  win: the statistic of its rollouts' chance to win.
+  equity: the statistic of its rollouts' change in spread, in points, with the
+    leaves counted: the score and the last leave's value of the player to move
+    less the opponent's at the rollout's end, less the spread at its start.
+  spread: the part of equity in points alone.
+  leaves: the part of equity in leaves: the value of the leave the player to
+    move last kept less the opponent's.
+  objective: the statistic of the rollouts' objective, which is equity plus the
+    chance to win times a weight: 10000 while the tiles unseen are no more than
+    7 times plies, falling in a straight line to 10 at twice that.
+  plies: one entry for each ply after the candidate, the first the opponent's
+    reply: n, how many rollouts reached it; score, the statistic of the score
+    made on it, in points; and bingo, the share of them whose play placed all 7
+    tiles. With plies given, there are as many entries as plies, an empty one
+    for a ply no rollout reached; with null, as many as the longest rollout
+    reached.
+  against: given only when the step names a play against: this candidate less
+    that play on the iterations both ran, in win, equity, and objective, each a
+    statistic with its own n.
+
+sim_step throws out_of_memory where its answer does not fit.
+
+sim_add(handle, plays), sim_remove(handle, plays), sim_pause(handle, plays),
+and sim_resume(handle, plays) change a sim's candidates between steps. plays is
+a JSON array of sim plays. Every play is checked first, as play_score checks
+one, and a play that is no play on the position refuses the whole call, the
+message naming it, as in: plays[1]: word is not whole word. A word the lexicon
+lacks stands, as a phony no one challenged would. A play challenged off with a
+bonus is refused.
+
+  sim_add: plays not in the sim join it, running, rolled out from the next
+    iteration on. A play already in the sim stays as it is.
+  sim_remove: plays in the sim leave it, with their rollouts.
+  sim_pause: plays in the sim stop being rolled out, and keep their rollouts; a
+    pruned one becomes paused.
+  sim_resume: paused or pruned plays in the sim are rolled out again from the
+    next iteration on.
+
+Each answers a JSON array with one entry for each play, in the order given:
+
+  [{"play":{"equity":-5.5,"action":"exchange","tiles":[]},"was":"absent"}]
+
+  play: the play as the sim holds it, a valued play with its static equity.
+  challenged_off: true, given only for a play challenged off.
+  was: where the play stood before the change: "absent", "running", "paused",
+    or "pruned".
+
+The plays change in the order given, so a play given twice finds itself the
+second time. A play's static equity is its equity as play_score gives it, on
+the sim's position, with its bonus added; a play challenged off has a pass's. A
+play challenged off is a candidate apart from the same play standing. A play of
+one tile is one candidate whichever way it is written.
+
+sim_set(handle, request) changes a live sim's plies or what the opponent holds.
+The results so far stay, and the change counts from the next iteration on. The
+request:
+
+  plies: whole number or null, optional. As sim_new takes it, null playing
+    every ply to the game's end; left out, the plies stay as they were.
+  known, kept, inferred: what the opponent holds, as sim_new takes it, in place
+    of what it held before; each may also be null, as if left out, and with all
+    three left out it stays as it was. known [] deals the opponent a whole
+    rack.
+
+The leaves are checked against the tiles the sim holds unseen and the
+opponent's rack in the sim. A refused change changes nothing. The answer is
+sim_step's with stepped 0.
+
+sim_free(handle) frees a sim, with all it holds, and answers undefined.
+
+
+ENDGAMES
+
+endgame_new(request) makes an endgame of a position, for endgame_step to solve,
+and answers its handle. The bag holds the tiles unseen less a full rack, and
+the opponent holds the rest. With an empty bag the solve is exact play to the
+game's end. With tiles in the bag, the search weighs every way the tiles unseen
+may lie between the opponent's rack and the bag. The request:
+
+  rack: rack, required, 1 to 7 tiles, and 7 when the bag holds a tile.
+  board: board, required.
+  lexicon, rules: strings, required.
+  scores: array of 2 whole numbers, required. Each seat's score, in points,
+    seat 0 first; each, and their difference, within 2147483 points.
+  turn: whole number, required. The seat to move: 0 or 1.
+  zero_turns, pass_turns: whole numbers from 0 to 65535, required. The
+    scoreless turns and the passes in a row so far.
+  max_memory_mb: whole number or null, optional. A cap on memory while the
+    endgame solves (MEMORY above). Without one, the solver's table grows until
+    the browser refuses it more.
+  reserve_mb: whole number or null, optional. The MiB of the solver's table
+    made at the first step; left out or 0, the table grows from its smallest.
+    Under a cap it is at most half the cap, and at most half the room the cap
+    leaves at the first step. It is not read when warm_from brings a table.
+  pruned: true or false, optional (false if left out). The lexicon is already
+    this board's pruned graph (build_kbwg), taken as it is.
+  model: string or null; required with two or more tiles in the bag, and not
+    read otherwise. What each player knows once the first move is made:
+    "info_sets", each player to move choosing blind over what it cannot see
+    until the bag empties; or "random_draws", the first move alone blind, both
+    racks then known, and each draw weighed over the tiles it may bring.
+  exchanges: array of 2 whole numbers, each 0 or more, or null; required with
+    two or more tiles in the bag, and not read otherwise. The exchanges each
+    seat has made, seat 0 first.
+  warm_from: endgame handle or null, optional. A live endgame of the same rules
+    and lexicon names, whose solver table this one takes; that endgame's later
+    steps start with an empty table. The bag may hold tiles in either.
+  part: [k, n] or null, optional; only with two or more tiles in the bag. Part
+    k of n: the search values only the ways the tiles may lie whose place is k
+    more than a multiple of n, so that n endgames, one for each part, value
+    each way once between them. k is below n. A candidate's draws from all n
+    parts, weighed by their counts, are the whole search's.
+  estimates: true or false, optional (false if left out); only with two or more
+    tiles in the bag. The search's early passes value every move fast where a
+    line still leaves tiles in the bag, each such value an estimate and the
+    answer then not exact, and its later passes make them exact.
+
+endgame_new refuses an empty rack, a rack that is not full while the bag holds
+a tile, a position whose opponent holds no tiles, model or exchanges left out
+with two or more tiles in the bag, and part or estimates with fewer. Under a
+cap, an endgame with two or more tiles in the bag whose ways the tiles may lie
+do not fit throws out_of_memory.
+
+An endgame holds its rules, the lexicon pruned for its board (under a cap
+without room for the prune, the lexicon itself), and its solver's table from
+step to step.
+
+endgame_step(handle, request) solves the endgame for a time and answers where
+it stands. The request:
+
+  ms: number, 0 or more, required. The most milliseconds to solve; 0 solves
+    nothing and answers the last answer. An exact answer stays: a later step
+    solves nothing more.
+  first_moves_ms: number, 0 or more, or null, optional; only with an empty bag.
+    After solving, value every first move as well, on the table the steps kept,
+    in at most this many milliseconds more; the answer's candidates then list
+    them.
+  draws_of: whole number, play, or null, optional; only with two or more tiles
+    in the bag. The candidate whose draws to give, by its place in the answer's
+    candidates, or by its play as the answer gives it.
+  draws_range: [from, to] or null, optional; only with draws_of. The draws from
+    place from to before place to.
+  candidates_range: [from, to] or null, optional. Give only the candidates from
+    place from to before place to, and candidates_total; a place past the last
+    reads as the last.
+  brief: true or false, optional (false if left out). Give only the answer's
+    state, with no line, tiles, or candidates; never with draws_of or
+    candidates_range.
+
+The fields that shape the answer do not change the solve.
+
+The answer:
+
+  bag: how many tiles the bag holds.
+  steps: how many steps solved.
+  nodes: the positions the steps searched.
+  exact: true when the answer is the endgame's own: the solve has finished.
+  play: the play to make; null before a step valued one.
+  value: the play's gain for the player to move over the opponent from now to
+    the game's end, in points, and with tiles in the bag its mean over the ways
+    the tiles may lie. Left out before a step valued a play.
+  spread: the lead the player to move then ends the game with, in points;
+    before a value, the lead now.
+  depth: the depth of the deepest pass the answer is of; with tiles in the bag,
+    127 for a pass to the game's end.
+  line: with an empty bag, the play and the replies that follow it, each an
+    object of play and value, value being the gain of that ply's player over
+    the other from there to the game's end, in points.
+  win: with tiles in the bag, the share of the ways the tiles may lie that the
+    play wins, a tie counting half; left out with value.
+  tiles: with one tile in the bag, an object of tile, count, and value for each
+    tile the bag may hold: how many of it are unseen, and the play's gain if it
+    is the one in the bag.
+  candidates: with tiles in the bag, every play the search valued, the best
+    first. With an empty bag, the first moves first_moves_ms valued, the best
+    first; left out before, and left out again by a later step whose solve
+    gives a new answer.
+  endgames: with tiles in the bag, the endgames searched.
+  moves: with tiles in the bag, [valued, of]: the moves the pass under way has
+    valued, of all it values; left out before the search began.
+  part: [k, n], given only for a part of more than one.
+  out_of_memory: true when max_memory_mb stopped the step short of exact or
+    refused it room, so that the search has no room to go on; false otherwise.
+  out_of_memory_in: given only with out_of_memory: "moves" when the cap refused
+    room for an empty bag's moves, and "draws" when it stopped the draws that
+    draws_of asked for.
+
+Each candidate:
+
+  play: the play.
+  win: the share of the ways the tiles may lie that it wins, a tie counting
+    half; with an empty bag, 1, 0.5, or 0 by the lead it ends with.
+  value: its gain, in points, as the answer's value is the answer's play's.
+  tiles: with one tile in the bag, as the answer's tiles, for this play.
+  deals: with two or more tiles in the bag, the deals its value counts.
+  draws: given only for draws_of's candidate: for each way the tiles may lie,
+    an object of tiles, the bag's tiles; count, the deals that give them;
+    value, the play's gain then; and win, its chance to win then. With
+    "random_draws", drawn lists the same for each draw the play makes there.
+  draws_total: with draws, how many ways there are in all; draws_range pages
+    them.
+  exact: true when its value is exact.
+
+With candidates_range the answer also gives candidates_total, how many
+candidates there are, and, when draws_of's candidate is not in the range,
+drawn: that candidate with its draws, and index, its place.
+
+With one tile in the bag, under rules that allow an exchange while the bag
+holds a tile (Spanish), the search values each tile as if the player to move
+knew it is the one in the bag: the answer gives win, value, and tiles, but its
+play stays null and its candidates empty.
+
+A step's answer takes the last one's place when it is better: with an empty
+bag, when the last had no play, or the step's is exact, deeper, or worth more
+at the same depth; with tiles in the bag, always, as the search goes on from
+where it stopped. The depth never falls.
+
+endgame_step refuses ms left out ("endgame_step: give ms"), first_moves_ms with
+tiles in the bag, draws_of with fewer than two tiles in the bag or naming no
+candidate, brief with draws_of or candidates_range, and draws_range without
+draws_of. It refuses all but ms after the step's solve, which stands. A step
+throws when the rules let scoreless turns go on without end in the position,
+the message saying it is not solvable. When the cap stopped the draws that
+draws_of asked for, the answer comes as without draws_of, with out_of_memory
+true and out_of_memory_in "draws".
+
+endgame_free(handle) frees an endgame, with its table, and answers undefined.
