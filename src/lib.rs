@@ -963,7 +963,7 @@ impl serde::Serialize for ScoredPlaysJson<'_, '_> {
                     ends: word_ends,
                 },
                 json_play_with_equity: kibitzer::JsonPlayRefWithEquity {
-                    equity: recounted_equity as f32 / equity::SCALE as f32,
+                    equity: recounted_equity as f64 / equity::SCALE as f64,
                     play: (&canonical_play).into(),
                 },
             })?;
@@ -1752,7 +1752,7 @@ struct SimCandidate {
     id: Option<u32>,
     play: movegen::Play,
     challenged_off: bool,
-    static_equity: f32,
+    static_equity: f64,
     state: SimState,
     first_iter: u64,
     wins: Vec<f64>,
@@ -1873,7 +1873,7 @@ fn rollout(
 // it was challenged off the board, which makes it a candidate of its own
 struct HeldPlay {
     play: movegen::Play,
-    static_equity: f32,
+    static_equity: f64,
     challenged_off: bool,
 }
 
@@ -1939,7 +1939,7 @@ impl Sim {
         );
         Ok(HeldPlay {
             play,
-            static_equity: equity as f32 / equity::SCALE as f32,
+            static_equity: equity as f64 / equity::SCALE as f64,
             challenged_off,
         })
     }
@@ -1983,11 +1983,10 @@ impl Sim {
                 break;
             }
             self.simmer.restore_prepared(&self.pristine);
-            self.simmer.reseed(iteration_seed(
-                self.seed,
-                (self.part + 1).wrapping_add(self.parts.wrapping_mul(iteration - 1)),
-            ));
-            self.simmer.prepare_iteration();
+            let sim_iter = (self.part + 1).wrapping_add(self.parts.wrapping_mul(iteration - 1));
+            self.simmer.reseed(iteration_seed(self.seed, sim_iter));
+            self.simmer
+                .prepare_iteration(Some(move_picker::stratum_at(self.seed, sim_iter)));
             self.rows.clear();
             self.played.clear();
             for candidate in &self.candidates {
@@ -2301,7 +2300,7 @@ struct SimCandidateReport<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    static_equity: Option<f32>,
+    static_equity: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     play: Option<kibitzer::JsonPlayRefWithEquity<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -4711,7 +4710,7 @@ impl Sim {
         id: Option<u32>,
         play: &movegen::Play,
         challenged_off: bool,
-        static_equity: f32,
+        static_equity: f64,
     ) {
         match (change, at) {
             (SimChange::Add, None) => self.candidates.push(SimCandidate {
@@ -4743,7 +4742,7 @@ impl Sim {
         &self,
         ps: &mut play_scorer::PlayScorer,
         play: &movegen::Play,
-    ) -> f32 {
+    ) -> f64 {
         let score = match play {
             movegen::Play::Place { score, .. } => score.raw(),
             movegen::Play::Exchange { .. } => 0,
@@ -4762,7 +4761,7 @@ impl Sim {
             move_filter::LEAVE_SCALE_DENOM,
             score,
         );
-        equity as f32 / equity::SCALE as f32
+        equity as f64 / equity::SCALE as f64
     }
 }
 
@@ -5593,7 +5592,7 @@ impl Endgame {
             return (progress.answer_moves(places).iter())
                 .map(|valued| EndgameCandidate {
                     play: peg_play(&valued.play),
-                    win: valued.win_pct as f64,
+                    win: valued.win_pct,
                     value: points(valued.expected_margin) - lead,
                     tiles: Some(
                         (progress.hypotheses(Some(valued.row)))
@@ -5842,7 +5841,7 @@ impl Endgame {
                 spread: lead + value.unwrap_or(0.0),
                 depth: Some(peg.depth),
                 line: None,
-                win: valued.then_some(peg.win_pct as f64),
+                win: valued.then_some(peg.win_pct),
                 tiles: Some(
                     (progress.hypotheses(peg.row))
                         .map(|(tile, count, margin)| EndgameBagTile {
@@ -7692,7 +7691,8 @@ mod tests {
             for iteration in 9..=28 {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
-                sim.simmer.prepare_iteration();
+                sim.simmer
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
                 let rack = &sim.simmer.prepared_state().players[1].rack;
                 for (tile, count) in [(E, 2), (0, 1)] {
                     assert!(
@@ -8074,7 +8074,8 @@ mod tests {
             (iterations.map(|iteration| {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
-                sim.simmer.prepare_iteration();
+                sim.simmer
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
                 sim.simmer.prepared_state().players[1].rack.clone()
             }))
             .collect::<Vec<_>>()
@@ -8162,7 +8163,8 @@ mod tests {
             for iteration in iterations {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
-                sim.simmer.prepare_iteration();
+                sim.simmer
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
                 let rack = &sim.simmer.prepared_state().players[1].rack;
                 let es = rack.iter().filter(|&&t| t == E).count() >= 2;
                 let blank = rack.contains(&0);
@@ -8726,7 +8728,8 @@ mod tests {
             for iteration in 1..=20 {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
-                sim.simmer.prepare_iteration();
+                sim.simmer
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
                 let rack = &sim.simmer.prepared_state().players[1].rack;
                 assert_eq!(rack.len(), 7);
                 for (tile, count) in [(E, 2), (0, 1)] {
