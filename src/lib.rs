@@ -2939,14 +2939,22 @@ impl Interned {
     }
 }
 
-struct TryWriter(Vec<u8>);
+// a list written as there is room for it; once a growth is refused, each write
+// after it is let go, so that the refusal makes no error to report
+struct TryWriter {
+    list: Vec<u8>,
+    refused: bool,
+}
 
 impl std::io::Write for TryWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .try_reserve(buf.len())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-        self.0.extend_from_slice(buf);
+        if !self.refused {
+            if self.list.try_reserve(buf.len()).is_ok() {
+                self.list.extend_from_slice(buf);
+            } else {
+                self.refused = true;
+            }
+        }
         Ok(buf.len())
     }
 
@@ -2963,13 +2971,20 @@ fn try_json_kept(
     value: &impl serde::Serialize,
 ) -> Result<Option<String>, String> {
     let mut taken = Taken::<Vec<u8>>::from(&rules.answers)?;
-    let mut writer = TryWriter(std::mem::take(&mut *taken));
-    let previous_len = writer.0.len();
-    writer.0.clear();
+    let mut writer = TryWriter {
+        list: std::mem::take(&mut *taken),
+        refused: false,
+    };
+    let previous_len = writer.list.len();
+    writer.list.clear();
     let written = serde_json::to_writer(&mut writer, value);
-    *taken = writer.0;
+    let refused = writer.refused;
+    *taken = writer.list;
     // a refused write keeps the room it grew for the smaller answer written in
     // its place.
+    if refused {
+        return Ok(None);
+    }
     let keep = taken.len().max(previous_len);
     if written.is_ok() && taken.capacity() / 2 > keep {
         taken.shrink_to(keep);
@@ -2984,7 +2999,6 @@ fn try_json_kept(
             json.push_str(text);
             Ok(Some(json))
         }
-        Err(e) if e.is_io() => Ok(None),
         Err(e) => Err(err_to_str(e)),
     }
 }
@@ -2994,11 +3008,14 @@ fn try_json_kept(
 // writing it grows nothing; the rules keep no buffer till the next answer
 fn json_in_kept_room(rules: &CachedRules, value: &impl serde::Serialize) -> Result<String, String> {
     let mut taken = Taken::<Vec<u8>>::from(&rules.answers)?;
-    let mut writer = TryWriter(std::mem::take(&mut *taken));
-    writer.0.clear();
+    let mut writer = TryWriter {
+        list: std::mem::take(&mut *taken),
+        refused: false,
+    };
+    writer.list.clear();
     match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => String::from_utf8(writer.0).map_err(err_to_str),
-        Err(e) if e.is_io() => Err(OUT_OF_MEMORY.into()),
+        Ok(()) if writer.refused => Err(OUT_OF_MEMORY.into()),
+        Ok(()) => String::from_utf8(writer.list).map_err(err_to_str),
         Err(e) => Err(err_to_str(e)),
     }
 }
