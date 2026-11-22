@@ -7125,6 +7125,33 @@ mod tests {
         assert_eq!(result[2]["result"], "scored");
     }
 
+    // a play added again, in the same call or a later one, answers the id it
+    // has, a new one the next id
+    #[test]
+    fn a_shortlist_answers_a_play_added_again_by_its_id() {
+        let lexicon = "shortlist-again";
+        tiny_lexicon(lexicon);
+        let position = serde_json::json!({
+            "rack": [T, A, S, E],
+            "board": report(&cat_board()),
+            "lexicon": lexicon,
+            "rules": "CrosswordGame",
+        });
+        let shortlist = shortlist::do_new(&position.to_string()).unwrap();
+        let swap = format!(r#"{{"action":"exchange","tiles":[{T}]}}"#);
+        assert_eq!(
+            shortlist::do_add(shortlist, &format!("[{swap},{swap},{CATS}]")).unwrap(),
+            [0, 0, 1]
+        );
+        assert_eq!(
+            shortlist::do_add(shortlist, &format!("[{CATS},{PASS},{swap},{PASS}]")).unwrap(),
+            [1, 2, 0, 2]
+        );
+        let plays = report(&shortlist::do_plays(shortlist).unwrap());
+        assert_eq!(plays.as_array().unwrap().len(), 3, "{plays}");
+        shortlist::do_free(shortlist).unwrap();
+    }
+
     #[test]
     fn sim_and_shortlist_keep_the_same_moves_by_id() {
         let lexicon = "sim-shortlist";

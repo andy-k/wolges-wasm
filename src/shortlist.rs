@@ -4,6 +4,7 @@ use super::{
     CACHED_GAME_CONFIG, CACHED_KWG, CachedKwg, CachedRules, OUT_OF_MEMORY, PlayScoreRoom, SimPlay,
     Taken, equity, err_to_str, fash, game_state, kibitzer, movegen, wasm_bindgen, wolges_err,
 };
+use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock, Mutex};
 use wasm_bindgen::JsValue;
 
@@ -25,6 +26,7 @@ pub(crate) struct Shortlist {
     kwg: Arc<CachedKwg>,
     position: game_state::GameState,
     plays: Vec<movegen::Play>,
+    first_id_of_hash: fash::MyHashMap<u64, u32>,
 }
 
 #[derive(Default)]
@@ -161,6 +163,7 @@ pub(crate) fn do_new(req_str: &str) -> Result<u32, String> {
             kwg,
             position,
             plays: Vec::new(),
+            first_id_of_hash: Default::default(),
         })),
     );
     Ok(handle)
@@ -186,8 +189,11 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
     };
     let mut room = Taken::<PlayScoreRoom>::from(&shortlist.rules.play_score_rooms)?;
     let scorer = &mut room.ps;
-    let mut added = Vec::new();
+    let mut plays = Vec::new();
     let mut ids = Vec::new();
+    plays
+        .try_reserve_exact(requested.len())
+        .map_err(|_| OUT_OF_MEMORY)?;
     ids.try_reserve_exact(requested.len())
         .map_err(|_| OUT_OF_MEMORY)?;
     for (i, requested) in requested.iter().enumerate() {
@@ -221,29 +227,37 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
             Ok::<_, String>(play)
         })()
         .map_err(|e| format!("plays[{i}]: {e}"))?;
-
-        let id = shortlist
-            .plays
-            .iter()
-            .chain(added.iter())
-            .position(|p| *p == play);
-        let id = match id {
-            Some(id) => id,
-            None => {
-                let id = shortlist.plays.len() + added.len();
-                added.try_reserve(1).map_err(|_| OUT_OF_MEMORY)?;
-                added.push(play);
-                id
-            }
-        };
-        ids.push(u32::try_from(id).map_err(|_| "too many shortlist moves")?);
+        plays.push(play);
     }
     drop(room);
-    shortlist
-        .plays
-        .try_reserve(added.len())
-        .map_err(|_| OUT_OF_MEMORY)?;
-    shortlist.plays.extend(added);
+    // room for every play to be new, so that adding them cannot stop half done
+    if (shortlist.plays.len().checked_add(plays.len())).is_none_or(|len| len > u32::MAX as usize) {
+        return Err("too many shortlist moves".into());
+    }
+    let shortlist = &mut *shortlist;
+    if shortlist.plays.try_reserve(plays.len()).is_err()
+        || shortlist.first_id_of_hash.try_reserve(plays.len()).is_err()
+    {
+        return Err(OUT_OF_MEMORY.into());
+    }
+    let hasher = fash::MyHasherDefault::default();
+    for play in plays {
+        let hash = hasher.hash_one(&play);
+        let held = match shortlist.first_id_of_hash.get(&hash) {
+            Some(&id) if shortlist.plays[id as usize] == play => Some(id),
+            // another play has its hash: it is held if it is found by reading
+            Some(_) => (0..)
+                .zip(&shortlist.plays)
+                .find_map(|(id, held)| (*held == play).then_some(id)),
+            None => None,
+        };
+        ids.push(held.unwrap_or_else(|| {
+            let id = shortlist.plays.len() as u32;
+            shortlist.first_id_of_hash.entry(hash).or_insert(id);
+            shortlist.plays.push(play);
+            id
+        }));
+    }
     Ok(ids)
 }
 
