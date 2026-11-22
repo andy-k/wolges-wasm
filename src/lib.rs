@@ -5951,12 +5951,33 @@ impl Endgame {
             .collect::<Vec<_>>();
         if self.keep_first_moves {
             let kept = self.answer.candidates.get_or_insert_default();
-            kept.try_reserve(candidates.len())
-                .map_err(|_| OUT_OF_MEMORY)?;
+            // each kept move's place by its play's hash, made once a step
+            let hasher = fash::MyHasherDefault::default();
+            let mut place_of_hash = fash::MyHashMap::<u64, usize>::default();
+            if kept.try_reserve(candidates.len()).is_err()
+                || (place_of_hash.try_reserve(kept.len() + candidates.len())).is_err()
+            {
+                return Err(OUT_OF_MEMORY.into());
+            }
+            for (at, old) in kept.iter().enumerate() {
+                place_of_hash
+                    .entry(json_play_hash(&hasher, &old.play))
+                    .or_insert(at);
+            }
             for candidate in candidates {
-                match kept.iter_mut().find(|old| old.play == candidate.play) {
-                    Some(old) if !old.exact || candidate.exact => *old = candidate,
-                    None => kept.push(candidate),
+                let hash = json_play_hash(&hasher, &candidate.play);
+                let at = match place_of_hash.get(&hash) {
+                    Some(&at) if kept[at].play == candidate.play => Some(at),
+                    // another play has its hash: it is kept if it is found
+                    Some(_) => kept.iter().position(|old| old.play == candidate.play),
+                    None => None,
+                };
+                match at {
+                    Some(at) if !kept[at].exact || candidate.exact => kept[at] = candidate,
+                    None => {
+                        place_of_hash.entry(hash).or_insert(kept.len());
+                        kept.push(candidate);
+                    }
                     _ => {}
                 }
             }
@@ -6001,6 +6022,21 @@ fn root_moves_refusal(err: wolges::error::BoxAnyError, field: &str) -> String {
     match message.strip_prefix("root_moves") {
         Some(rest) => format!("{field}{rest}"),
         None => message,
+    }
+}
+
+// a play's hash by what its JSON holds, equal plays hashing alike
+fn json_play_hash(hasher: &fash::MyHasherDefault, play: &kibitzer::JsonPlay) -> u64 {
+    use std::hash::BuildHasher;
+    match play {
+        kibitzer::JsonPlay::Exchange { tiles } => hasher.hash_one((0u8, tiles)),
+        kibitzer::JsonPlay::Play {
+            down,
+            lane,
+            idx,
+            word,
+            score,
+        } => hasher.hash_one((1u8, down, lane, idx, word, score)),
     }
 }
 
