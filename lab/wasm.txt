@@ -1077,8 +1077,9 @@ draws_of, a priority of one or more plays with an empty bag but no
 first_moves_ms, and one where the search values each tile as if it were known
 (one tile in the bag under Spanish rules without root_moves or root_ids). A
 priority play whose word holds -128 or whose score is past 2147483 points
-either way is refused, as for root_moves. It refuses brief, draws_range, and
-draws_of after the step's solve, which stands. A step throws out_of_memory
+either way is refused, as for root_moves. Of these, only draws_of naming no
+candidate is refused after the step's solve, which stands; the others are
+refused before it, the endgame unchanged. A step throws out_of_memory
 where its priority, or the first-move values it keeps, do not fit, and it
 throws when the rules let scoreless turns go on without end in the position,
 the message saying it is not solvable. When the cap stopped the draws that

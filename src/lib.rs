@@ -5130,6 +5130,14 @@ struct EndgameStepRequest {
     brief: bool,
 }
 
+// the candidate draws_of names, as read before the step's solve: its index, or
+// its play with the id or the JSON that named it
+enum DrawsNamed {
+    Index(usize),
+    Id(u32, movegen::Play),
+    Play(String, movegen::Play),
+}
+
 // the candidate draws_of names, by one of these
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
@@ -5628,28 +5636,40 @@ impl Endgame {
         json.map_err(err_to_str)
     }
 
-    // the place in the answer's candidates of the one draws_of names
-    fn place_of(&self, draws_of: DrawsOf) -> Result<usize, String> {
-        match draws_of {
-            DrawsOf::Index(i) => Ok(i),
+    // the candidate draws_of names, read as far as the step's solve cannot
+    // change it: refused with fewer than two tiles in the bag, its play taken
+    // from the shortlist or decoded
+    fn draws_named(&self, draws_of: DrawsOf) -> Result<DrawsNamed, String> {
+        if self.peg_bag.is_none() {
+            return Err("draws_of: only with two or more in the bag".into());
+        }
+        Ok(match draws_of {
+            DrawsOf::Index(i) => DrawsNamed::Index(i),
             DrawsOf::Id { id } => {
                 let shared = shortlist::attached(&self.shortlist)?;
                 let shortlist = shared.lock().map_err(err_to_str)?;
-                let play = shortlist.play(id)?;
-                self.draws_place(play)
-                    .0
-                    .ok_or_else(|| format!("draws_of: shortlist move {id} has no draws"))
+                DrawsNamed::Id(id, shortlist.play(id)?.clone())
             }
             DrawsOf::Play(play) => {
                 let decoded = decode_json_play(&play).map_err(|e| format!("draws_of: {e}"))?;
-                let (at, total) = self.draws_place(&decoded);
-                match at {
-                    Some(i) => Ok(i),
-                    None => Err(format!(
-                        "draws_of: {} is no candidate of the {total} with draws",
-                        serde_json::to_string(&play).map_err(err_to_str)?
-                    )),
-                }
+                DrawsNamed::Play(serde_json::to_string(&play).map_err(err_to_str)?, decoded)
+            }
+        })
+    }
+
+    // the place in the answer's candidates of the one draws_of names
+    fn place_of(&self, named: DrawsNamed) -> Result<usize, String> {
+        match named {
+            DrawsNamed::Index(i) => Ok(i),
+            DrawsNamed::Id(id, play) => self
+                .draws_place(&play)
+                .0
+                .ok_or_else(|| format!("draws_of: shortlist move {id} has no draws")),
+            DrawsNamed::Play(json, play) => {
+                let (at, total) = self.draws_place(&play);
+                at.ok_or_else(|| {
+                    format!("draws_of: {json} is no candidate of the {total} with draws")
+                })
             }
         }
     }
@@ -6402,6 +6422,22 @@ fn do_endgame_step(
             );
         }
     }
+    // the answer asked for, checked before the step's solve, so that a step
+    // refused for it changes nothing
+    if req.brief {
+        if req.draws_of.is_some() {
+            return Err("brief: no draws come with it, so not with draws_of".into());
+        }
+        if req.candidates_range.is_some() {
+            return Err("brief: no candidates come with it, so not with candidates_range".into());
+        }
+    }
+    if req.draws_of.is_none() && req.draws_range.is_some() {
+        return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
+    }
+    let draws_of = (req.draws_of)
+        .map(|draws_of| endgame.draws_named(draws_of))
+        .transpose()?;
     let inline = (req.priority.as_ref())
         .map(|plays| decode_root_plays(plays, "priority"))
         .transpose()?;
@@ -6424,12 +6460,6 @@ fn do_endgame_step(
         endgame.value_first_moves(ms, clock, memory, priority)?;
     }
     if req.brief {
-        if req.draws_of.is_some() {
-            return Err("brief: no draws come with it, so not with draws_of".into());
-        }
-        if req.candidates_range.is_some() {
-            return Err("brief: no candidates come with it, so not with candidates_range".into());
-        }
         let a = &endgame.answer;
         let brief = EndgameBrief {
             bag: a.bag,
@@ -6449,10 +6479,7 @@ fn do_endgame_step(
         };
         return serde_json::to_string(&brief).map_err(err_to_str);
     }
-    let Some(draws_of) = req.draws_of else {
-        if req.draws_range.is_some() {
-            return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
-        }
+    let Some(draws_of) = draws_of else {
         if let Some(range) = req.candidates_range {
             return endgame.answer_page(range, None);
         }
@@ -9411,6 +9438,35 @@ mod tests {
             let refused = endgame_of("tiny-end-root-invalid", &rack, &others, &more).unwrap_err();
             assert_eq!(refused, error);
         }
+    }
+
+    // a step refused for the answer it asks for is refused before its solve,
+    // so the endgame is as it was
+    #[test]
+    fn a_refused_step_leaves_its_endgame_unsolved() {
+        let (rack, others) = ([S, E, A, T], [A, T, E]);
+        let handle = endgame_of("tiny-end-refused-step", &rack, &others, "").unwrap();
+        for (request, error) in [
+            (
+                r#"{"ms":60000,"draws_of":0}"#,
+                "draws_of: only with two or more in the bag",
+            ),
+            (
+                r#"{"ms":60000,"draws_range":[0,1]}"#,
+                "draws_range: it pages draws_of's rows, so give draws_of",
+            ),
+            (
+                r#"{"ms":60000,"brief":true,"candidates_range":[0,1]}"#,
+                "brief: no candidates come with it, so not with candidates_range",
+            ),
+        ] {
+            let refused = do_endgame_step(handle, request, ticking, held_bytes).unwrap_err();
+            assert_eq!(refused, error);
+        }
+        let unsolved = endgame_step(handle, r#"{"ms":0}"#);
+        assert_eq!(unsolved["exact"], false, "{unsolved}");
+        assert_eq!(endgame_step(handle, r#"{"ms":60000}"#)["exact"], true);
+        do_endgame_free(handle).unwrap();
     }
 
     // an empty bag asked for every first move's value: each exact, best first,
