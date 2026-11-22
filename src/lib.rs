@@ -379,6 +379,22 @@ impl CachedRules {
         }
     }
 
+    // own_generator's, one made within memory (none: no limit): none where it
+    // has no room
+    fn own_generator_within(
+        &self,
+        memory: Option<endgame::MemoryLimit>,
+    ) -> Result<Option<Movegen>, String> {
+        let free = self.movegens.lock().map_err(err_to_str)?.pop();
+        match free {
+            Some(mut movegen) => {
+                movegen.reset_for_another_kwg();
+                Ok(Some(movegen))
+            }
+            None => Movegen::try_new_within(&self.game_config, memory).map_err(wolges_err),
+        }
+    }
+
     // a generator lent and taken (Lent::take) given back, free for the next
     // request; it is kept only when no other is free, as a page's requests come
     // one at a time, so that the rules hold one free generator's memory at most
@@ -5597,9 +5613,10 @@ impl EndgameGraph {
     }
 }
 
-// a step's solver: the one earlier steps kept, else one made
+// a step's solver: the one earlier steps kept, else one made within the step's
+// cap, none where it has no room
 macro_rules! step_solver {
-    ($endgame: expr) => {
+    ($endgame: expr, $memory: expr) => {
         match $endgame.solver.take() {
             Some(kept) => endgame::EndgameSolver::with_kept(
                 &$endgame.game_config,
@@ -5607,17 +5624,29 @@ macro_rules! step_solver {
                 &$endgame.arm_tables,
                 $endgame.kwg.run_letters()?,
                 kept,
-            ),
-            None => endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
-                &$endgame.game_config,
-                $endgame.game_config.graphs($endgame.kwg.kwg())?,
-                &$endgame.arm_tables,
-                $endgame.kwg.run_letters()?,
-                $endgame.game_config.own_generator()?,
-            ),
+            )
+            .map(Some),
+            None => match $endgame.game_config.own_generator_within($memory)? {
+                Some(movegen) => endgame::EndgameSolver::<
+                    kwg::Node24,
+                    kwg::Node24,
+                    true,
+                    u32,
+                    false,
+                    false,
+                >::with_generator_within(
+                    &$endgame.game_config,
+                    $endgame.game_config.graphs($endgame.kwg.kwg())?,
+                    &$endgame.arm_tables,
+                    $endgame.kwg.run_letters()?,
+                    movegen,
+                    (&$endgame.game_config.no_leaves, $memory),
+                ),
+                None => Ok(None),
+            },
         }
         .map_err(wolges_err)?
-        .with_root_moves($endgame.root_moves.as_ref())
+        .map(|solver| solver.with_root_moves($endgame.root_moves.as_ref()))
     };
 }
 
@@ -5654,7 +5683,11 @@ impl Endgame {
         let Some(progress) = self.peg_bag.as_mut() else {
             return Err("draws_of: only with two or more in the bag".into());
         };
-        let mut solver = step_solver!(self);
+        let Some(mut solver) = step_solver!(self, cap) else {
+            return Ok(Err(endgame::PegBagRowsMissing::Stopped {
+                out_of_memory: true,
+            }));
+        };
         if let Some(table) = self.table.take()
             && solver.give_table(table).is_err()
         {
@@ -5845,7 +5878,11 @@ impl Endgame {
         priority: &[movegen::Play],
     ) -> Result<(), String> {
         let cap = self.cap(memory);
-        let mut solver = (step_solver!(self)).with_root_priority(priority);
+        let Some(solver) = step_solver!(self, cap) else {
+            self.answer.out_of_memory = true;
+            return Ok(());
+        };
+        let mut solver = solver.with_root_priority(priority);
         match self.table.take() {
             Some(table) => {
                 if solver.give_table(table).is_err() {
@@ -6035,7 +6072,11 @@ impl Endgame {
         priority: &[movegen::Play],
     ) -> Result<(), String> {
         let cap = self.cap(memory);
-        let mut solver = (step_solver!(self)).with_root_priority(priority);
+        let Some(solver) = step_solver!(self, cap) else {
+            self.answer.out_of_memory = true;
+            return Ok(());
+        };
+        let mut solver = solver.with_root_priority(priority);
         match self.table.take() {
             Some(table) => {
                 if solver.give_table(table).is_err() {
