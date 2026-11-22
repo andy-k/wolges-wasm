@@ -773,7 +773,8 @@ The answer:
   stepped: the iterations this step ran.
   candidates: the candidates in the order they joined, each as below.
   out_of_memory: true, given only when the sim has run out of memory. It then
-    runs no more iterations.
+    runs no more iterations. Under max_memory_mb the step's rollouts grow
+    within the cap; an iteration refused room is not counted.
 
 Each candidate:
 

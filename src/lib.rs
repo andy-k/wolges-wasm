@@ -1993,6 +1993,8 @@ impl Sim {
         let rack_size = self.game_config.rack_size();
         let mut stepped = 0;
         let memory = self.memory;
+        // the rollouts grow within the step's cap
+        self.simmer.begin_within(memory);
         while stepped < max
             && !self.out_of_memory
             && self.candidates.iter().any(|c| c.state == SimState::Running)
@@ -2027,6 +2029,9 @@ impl Sim {
                 .map_err(wolges_err)?;
             self.rows.clear();
             self.played.clear();
+            // each rollout's row and plies kept within the cap; an iteration
+            // whose rollouts were refused room is out of memory, uncounted
+            let mut refused = false;
             let graphs = self.game_config.graphs(&self.kwg.kwg)?;
             for candidate in &self.candidates {
                 if candidate.state != SimState::Running {
@@ -2042,9 +2047,28 @@ impl Sim {
                 )?;
                 let played = self.simmer.plies_played();
                 let num_plies = self.plies.map_or(played.len(), |p| played.len().min(p));
+                if self.simmer.out_of_memory()
+                    || endgame::room_in(memory.as_ref(), &mut self.played, num_plies).is_err()
+                    || endgame::room_in(memory.as_ref(), &mut self.rows, 1).is_err()
+                {
+                    refused = true;
+                    break;
+                }
                 self.played.extend_from_slice(&played[..num_plies]);
                 self.rows
                     .push((objective, spread, win, points, leaves, num_plies));
+            }
+            if refused
+                || !(self.candidates.iter_mut())
+                    .filter(|c| c.state == SimState::Running)
+                    .zip(&self.rows)
+                    .all(|(c, row)| {
+                        let more = row.5.saturating_sub(c.plies.len());
+                        endgame::room_in(memory.as_ref(), &mut c.plies, more).is_ok()
+                    })
+            {
+                self.out_of_memory = true;
+                break;
             }
             let mut row = self.rows.iter();
             let mut at = 0;
