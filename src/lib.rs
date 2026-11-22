@@ -5974,6 +5974,16 @@ fn decode_root_plays(
     Ok(plays)
 }
 
+// a refusal of wolges's root move check, naming the field the plays came in
+// (wolges names them root_moves)
+fn root_moves_refusal(err: wolges::error::BoxAnyError, field: &str) -> String {
+    let message = wolges_err(err);
+    match message.strip_prefix("root_moves") {
+        Some(rest) => format!("{field}{rest}"),
+        None => message,
+    }
+}
+
 // a move of a search with a tile in the bag, as the page reads it (a pass as an
 // exchange of no tiles)
 fn peg_play(play: &endgame::PegMove) -> kibitzer::JsonPlay {
@@ -6113,6 +6123,11 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     };
     let mut rack = req.rack;
     rack.sort_unstable();
+    let root_field = if req.root_ids.is_some() {
+        "root_ids"
+    } else {
+        "root_moves"
+    };
     let root_plays = match (req.root_moves, req.root_ids) {
         (Some(requested), None) => Some(decode_root_plays(&requested, "root_moves")?),
         (None, Some(ids)) => Some(shortlist::copy_plays(
@@ -6142,7 +6157,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 &state,
                 plays,
             )
-            .map_err(wolges_err)?,
+            .map_err(|err| root_moves_refusal(err, root_field))?,
         )
     } else {
         None
@@ -9205,6 +9220,13 @@ mod tests {
         assert_eq!(one["play"], *play);
         assert_eq!(one["candidates"].as_array().unwrap().len(), 1);
         do_endgame_free(fixed).unwrap();
+        // a refused root id is named by its place in root_ids
+        request["root_ids"] = serde_json::json!([ids[1], ids[1]]);
+        assert_eq!(
+            do_endgame_new(&request.to_string(), none_held).unwrap_err(),
+            "root_ids[1]: duplicate play"
+        );
+        request["root_ids"] = serde_json::json!([ids[0]]);
         do_endgame_free(reference).unwrap();
         let resumed = do_sim_new(&request.to_string()).unwrap();
         assert_eq!(

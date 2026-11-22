@@ -940,10 +940,9 @@ words of the lexicon, a placement must give its score as scored, an exchange
 must be one the bag and the player's exchanges so far allow, and no play may be
 given twice, the same or written another way. A play that fails refuses the
 endgame with a message that names it, as in root_moves[1]: wrong score; a play
-given by root_ids is named root_moves[i] too, i its place in root_ids. A word
-holding -128 ("invalid blank tile") or a score past 2147483 points either way
-("score out of range") refuses it too, its message naming the play in the same
-way.
+given by root_ids is named root_ids[i], i its place in root_ids. A word holding
+-128 ("invalid blank tile") or a score past 2147483 points either way ("score
+out of range") refuses it too, its message naming the play in the same way.
 root_ids is refused for an endgame with no shortlist ("no shortlist attached")
 or with an id the shortlist lacks ("shortlist move 9: none such").
 
