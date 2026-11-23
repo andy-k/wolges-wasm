@@ -299,6 +299,8 @@ type Movegen = movegen::KurniaMoveGenerator<u32, false, false>;
 // and the buffers answers are written in (try_json_kept)
 struct CachedRules {
     game_config: game_config::GameConfig,
+    // the lexicon a request names is the kad of jumbled rules, else the kwg
+    lexicon_is_kad: bool,
     movegens: std::sync::Mutex<Vec<Movegen>>,
     no_leaves: Klv,
     analyze_rooms: std::sync::Mutex<Vec<AnalyzeRoom>>,
@@ -318,6 +320,10 @@ impl std::ops::Deref for CachedRules {
 impl CachedRules {
     fn new(game_config: game_config::GameConfig) -> Result<Self, String> {
         Ok(Self {
+            lexicon_is_kad: matches!(
+                game_config.game_rules(),
+                game_config::GameRules::Jumbled | game_config::GameRules::JumbledWoadwage
+            ),
             game_config,
             movegens: Default::default(),
             no_leaves: Klv::empty().map_err(wolges_err)?,
@@ -326,6 +332,19 @@ impl CachedRules {
             answers: Default::default(),
             threats_rooms: Default::default(),
         })
+    }
+
+    // the graphs a lexicon gives move generation under these rules
+    fn graphs<'a>(
+        &self,
+        lexicon: &'a Kwg,
+    ) -> Result<movegen::KwgForMovegen<'a, kwg::Node24>, String> {
+        let (kwg, kad) = if self.lexicon_is_kad {
+            (None, Some(lexicon))
+        } else {
+            (Some(lexicon), None)
+        };
+        movegen::KwgForMovegen::new(&self.game_config, kwg, kad).map_err(wolges_err)
     }
 
     // a free generator, reset for any word graph (each request may name
@@ -694,7 +713,7 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg: &kwg.kwg,
+        graphs: game_config.graphs(&kwg.kwg)?,
         anagrams: None,
         rack_lengths: None,
         klv: &klv.klv,
@@ -730,29 +749,39 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
                 }
             }
         };
-        move_generator.gen_moves_filtered_lean_walked::<movegen::OncePerScore, _, _>(
-            &movegen::GenMovesParams {
-                board_snapshot,
-                rack: &req.rack,
-                max_gen: req.max_gen,
-                num_exchanges_by_this_player: req.exchanges,
-                pass_policy: movegen::PassPolicy::OnlyWhenForced,
-                dynamic_leaves: None,
-            },
-            movegen::PlacePredicate::AcceptAll,
-            klv::AdjustLeave::Identity,
-            match game_config.game_rules() {
-                game_config::GameRules::Classic => movegen::EquityPredicate::AcceptAll,
-                game_config::GameRules::Jumbled => movegen::EquityPredicate::Dyn(&mut dedup),
-            },
-        );
+        move_generator
+            .gen_moves_filtered_lean_walked::<movegen::OncePerScore, _, _>(
+                &movegen::GenMovesParams {
+                    board_snapshot,
+                    rack: &req.rack,
+                    max_gen: req.max_gen,
+                    num_exchanges_by_this_player: req.exchanges,
+                    pass_policy: movegen::PassPolicy::OnlyWhenForced,
+                    dynamic_leaves: None,
+                },
+                movegen::PlacePredicate::AcceptAll,
+                klv::AdjustLeave::Identity,
+                match game_config.game_rules() {
+                    game_config::GameRules::Classic | game_config::GameRules::Woadwage => {
+                        movegen::EquityPredicate::AcceptAll
+                    }
+                    game_config::GameRules::Jumbled | game_config::GameRules::JumbledWoadwage => {
+                        movegen::EquityPredicate::Dyn(&mut dedup)
+                    }
+                },
+            )
+            .map_err(wolges_err)?;
     }
     let plays = &move_generator.plays;
 
     if false {
         console_log!("found {} moves", plays.len());
         for play in plays.iter() {
-            console_log!("{} {}", play.equity, play.play.fmt(board_snapshot));
+            console_log!(
+                "{} {}",
+                play.equity,
+                play.play.fmt(board_snapshot).map_err(wolges_err)?
+            );
         }
     }
 
@@ -840,7 +869,7 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
     let board_snapshot = &movegen::BoardSnapshot {
         board_tiles: &kibitzer.board_tiles,
         game_config: &game_config,
-        kwg: &kwg.kwg,
+        graphs: game_config.graphs(&kwg.kwg)?,
         anagrams: None,
         rack_lengths: None,
         klv: &klv.klv,
@@ -942,13 +971,15 @@ impl serde::Serialize for ScoredPlaysJson<'_, '_> {
             if let movegen::Play::Place { ref mut score, .. } = canonical_play {
                 *score = equity::Equity::new(recounted_score);
             }
-            let recounted_equity = ps.compute_equity(
-                board_snapshot,
-                game_state,
-                &canonical_play,
-                move_filter::LEAVE_SCALE_DENOM,
-                recounted_score,
-            );
+            let recounted_equity = ps
+                .compute_equity(
+                    board_snapshot,
+                    game_state,
+                    &canonical_play,
+                    move_filter::LEAVE_SCALE_DENOM,
+                    recounted_score,
+                )
+                .map_err(serde::ser::Error::custom)?;
             words.clear();
             word_ends.clear();
             ps.find_invalid_words(board_snapshot, &canonical_play, |word| {
@@ -1077,7 +1108,7 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
         &movegen::BoardSnapshot {
             board_tiles: &kibitzer.board_tiles,
             game_config: &game_config,
-            kwg: &kwg.kwg,
+            graphs: game_config.graphs(&kwg.kwg)?,
             anagrams: None,
             rack_lengths: None,
             klv: &game_config.no_leaves,
@@ -1360,15 +1391,18 @@ fn do_infer(req_str: &str) -> Result<String, String> {
         &movegen::BoardSnapshot {
             board_tiles: &kibitzer.board_tiles,
             game_config: &game_config,
-            kwg: &kwg.kwg,
+            graphs: game_config.graphs(&kwg.kwg)?,
             anagrams: None,
             rack_lengths: None,
             klv: &klv.klv,
         },
         &req.rack,
         &play,
-        req.fuzz,
-        1,
+        infer::InferOptions {
+            fuzz: req.fuzz,
+            threads: 1,
+            weigh_passes: false,
+        },
     )
     .map_err(wolges_err)?;
     drop(cached);
@@ -1799,6 +1833,7 @@ fn sim_memory(max_memory_mb: Option<usize>) -> Result<Option<endgame::MemoryLimi
         mb => Ok(mb.map(|mb| endgame::MemoryLimit {
             bytes: mb.saturating_mul(1 << 20),
             held: page_memory,
+            reserved: None,
         })),
     }
 }
@@ -1839,20 +1874,20 @@ fn iteration_seed(seed: u64, iteration: u64) -> u64 {
 fn rollout(
     simmer: &mut simmer::Simmer<simmer::DefaultRng, u32, false, false>,
     game_config: &game_config::GameConfig,
-    kwg: &Kwg,
+    graphs: movegen::KwgForMovegen<'_, kwg::Node24>,
     klv: &Klv,
     play: &movegen::Play,
     challenged_off: bool,
 ) -> Result<(f64, i32, f64, i32, i32), String> {
     let no_tables = &anagrams::ArmTables::None;
     let game_ended = if challenged_off {
-        simmer.simulate_lean_challenged_off(game_config, kwg, no_tables, klv)
+        simmer.simulate_lean_challenged_off(game_config, graphs, no_tables, klv)
     } else {
-        simmer.simulate_lean(game_config, kwg, no_tables, klv, play)
+        simmer.simulate_lean(game_config, graphs, no_tables, klv, play)
     }
     .map_err(wolges_err)?;
     let final_spread = simmer.final_equity_spread().map_err(wolges_err)?;
-    let win = simmer.compute_win_prob(game_ended, final_spread, None);
+    let win = (simmer.compute_win_prob(game_ended, final_spread, None)).map_err(wolges_err)?;
     let spread = final_spread
         .checked_sub(simmer.initial_score_spread)
         .ok_or("score overflow")?;
@@ -1904,7 +1939,7 @@ impl Sim {
         let board_snapshot = &movegen::BoardSnapshot {
             board_tiles: &self.game_state.board_tiles,
             game_config: &self.game_config,
-            kwg: &self.kwg.kwg,
+            graphs: self.game_config.graphs(&self.kwg.kwg)?,
             anagrams: None,
             rack_lengths: None,
             klv: &self.klv.klv,
@@ -1930,13 +1965,15 @@ impl Sim {
         let pass = movegen::Play::Exchange {
             tiles: [][..].into(),
         };
-        let equity = ps.compute_equity(
-            board_snapshot,
-            &self.game_state,
-            if challenged_off { &pass } else { &play },
-            move_filter::LEAVE_SCALE_DENOM,
-            score,
-        );
+        let equity = ps
+            .compute_equity(
+                board_snapshot,
+                &self.game_state,
+                if challenged_off { &pass } else { &play },
+                move_filter::LEAVE_SCALE_DENOM,
+                score,
+            )
+            .map_err(wolges_err)?;
         Ok(HeldPlay {
             play,
             static_equity: equity as f64 / equity::SCALE as f64,
@@ -1986,9 +2023,11 @@ impl Sim {
             let sim_iter = (self.part + 1).wrapping_add(self.parts.wrapping_mul(iteration - 1));
             self.simmer.reseed(iteration_seed(self.seed, sim_iter));
             self.simmer
-                .prepare_iteration(Some(move_picker::stratum_at(self.seed, sim_iter)));
+                .prepare_iteration(Some(move_picker::stratum_at(self.seed, sim_iter)))
+                .map_err(wolges_err)?;
             self.rows.clear();
             self.played.clear();
+            let graphs = self.game_config.graphs(&self.kwg.kwg)?;
             for candidate in &self.candidates {
                 if candidate.state != SimState::Running {
                     continue;
@@ -1996,7 +2035,7 @@ impl Sim {
                 let (objective, spread, win, points, leaves) = rollout(
                     &mut self.simmer,
                     &self.game_config,
-                    &self.kwg.kwg,
+                    graphs,
                     &self.klv.klv,
                     &candidate.play,
                     candidate.challenged_off,
@@ -2485,15 +2524,17 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
         seat: opponent as u8,
         leaves,
     });
-    simmer.prepare(
-        &game_config,
-        &game_state,
-        &simmer::SimChoices {
-            packed: packed.as_slice(),
-            opponents_pass: req.opponents_pass,
-            ..simmer::SimChoices::new(req.plies.unwrap_or(usize::MAX), true, &known)
-        },
-    );
+    simmer
+        .prepare(
+            &game_config,
+            &game_state,
+            &simmer::SimChoices {
+                packed: packed.as_slice(),
+                opponents_pass: req.opponents_pass,
+                ..simmer::SimChoices::new(req.plies.unwrap_or(usize::MAX), true, &known)
+            },
+        )
+        .map_err(wolges_err)?;
     let pristine = simmer.prepared_state().clone();
     let sim = Sim {
         shortlist,
@@ -4001,7 +4042,7 @@ impl Threats {
         let board_snapshot = movegen::BoardSnapshot {
             board_tiles: &self.board_tiles,
             game_config: &self.game_config,
-            kwg: &self.kwg.kwg,
+            graphs: self.game_config.graphs(&self.kwg.kwg)?,
             anagrams: None,
             rack_lengths: None,
             klv: &self.game_config.no_leaves,
@@ -4742,26 +4783,28 @@ impl Sim {
         &self,
         ps: &mut play_scorer::PlayScorer,
         play: &movegen::Play,
-    ) -> f64 {
+    ) -> Result<f64, String> {
         let score = match play {
             movegen::Play::Place { score, .. } => score.raw(),
             movegen::Play::Exchange { .. } => 0,
         };
-        let equity = ps.compute_equity(
-            &movegen::BoardSnapshot {
-                board_tiles: &self.game_state.board_tiles,
-                game_config: &self.game_config,
-                kwg: &self.kwg.kwg,
-                anagrams: None,
-                rack_lengths: None,
-                klv: &self.klv.klv,
-            },
-            &self.game_state,
-            play,
-            move_filter::LEAVE_SCALE_DENOM,
-            score,
-        );
-        equity as f64 / equity::SCALE as f64
+        let equity = ps
+            .compute_equity(
+                &movegen::BoardSnapshot {
+                    board_tiles: &self.game_state.board_tiles,
+                    game_config: &self.game_config,
+                    graphs: self.game_config.graphs(&self.kwg.kwg)?,
+                    anagrams: None,
+                    rack_lengths: None,
+                    klv: &self.klv.klv,
+                },
+                &self.game_state,
+                play,
+                move_filter::LEAVE_SCALE_DENOM,
+                score,
+            )
+            .map_err(wolges_err)?;
+        Ok(equity as f64 / equity::SCALE as f64)
     }
 }
 
@@ -4842,9 +4885,10 @@ fn do_sim_change_ids(handle: u32, ids: &[u32], change: SimChange) -> Result<Vec<
                 by_id.entry(id).or_insert(i);
                 sim.candidates[i].static_equity
             }
-            None => room.as_mut().map_or(0.0, |room| {
-                sim.equity_of_registered_play(&mut room.ps, play)
-            }),
+            None => match room.as_mut() {
+                Some(room) => sim.equity_of_registered_play(&mut room.ps, play)?,
+                None => 0.0,
+            },
         };
         match (change, at) {
             (SimChange::Remove, Some(at)) => removed[at] = true,
@@ -4964,15 +5008,17 @@ fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
             None => {}
         }
         let opponents_pass = sim.simmer.opponents_pass();
-        sim.simmer.prepare(
-            &sim.game_config,
-            &sim.pristine,
-            &simmer::SimChoices {
-                packed: &packed,
-                opponents_pass,
-                ..simmer::SimChoices::new(sim.plies.unwrap_or(usize::MAX), true, &[])
-            },
-        );
+        sim.simmer
+            .prepare(
+                &sim.game_config,
+                &sim.pristine,
+                &simmer::SimChoices {
+                    packed: &packed,
+                    opponents_pass,
+                    ..simmer::SimChoices::new(sim.plies.unwrap_or(usize::MAX), true, &[])
+                },
+            )
+            .map_err(wolges_err)?;
     }
     serde_json::to_string(&sim.report(0, None, false)).map_err(err_to_str)
 }
@@ -5308,7 +5354,7 @@ struct EndgameBagDraw {
 struct EndgameCandidate {
     play: kibitzer::JsonPlay,
     win: f64,
-    value: f64,
+    value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tiles: Option<Vec<EndgameBagTile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5513,14 +5559,14 @@ macro_rules! step_solver {
         match $endgame.solver.take() {
             Some(kept) => endgame::EndgameSolver::with_kept(
                 &$endgame.game_config,
-                $endgame.kwg.kwg(),
+                $endgame.game_config.graphs($endgame.kwg.kwg())?,
                 &$endgame.arm_tables,
                 $endgame.kwg.run_letters()?,
                 kept,
             ),
             None => endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &$endgame.game_config,
-                $endgame.kwg.kwg(),
+                $endgame.game_config.graphs($endgame.kwg.kwg())?,
                 &$endgame.arm_tables,
                 $endgame.kwg.run_letters()?,
                 $endgame.game_config.own_generator()?,
@@ -5567,6 +5613,7 @@ impl Endgame {
             memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
                 bytes,
                 held: memory,
+                reserved: None,
             }),
             clock: Some(clock),
         };
@@ -5593,7 +5640,7 @@ impl Endgame {
                 .map(|valued| EndgameCandidate {
                     play: peg_play(&valued.play),
                     win: valued.win_pct,
-                    value: points(valued.expected_margin) - lead,
+                    value: Some(points(valued.expected_margin) - lead),
                     tiles: Some(
                         (progress.hypotheses(Some(valued.row)))
                             .map(|(tile, count, margin)| EndgameBagTile {
@@ -5616,7 +5663,7 @@ impl Endgame {
             .map(|valued| EndgameCandidate {
                 play: (&valued.play).into(),
                 win: valued.win_pct,
-                value: points(valued.expected_margin) - lead,
+                value: (valued.expected_margin).map(|margin| points(margin) - lead),
                 tiles: None,
                 draws: None,
                 deals: Some(deals),
@@ -5765,6 +5812,7 @@ impl Endgame {
             memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
                 bytes,
                 held: memory,
+                reserved: None,
             }),
             clock: Some(clock),
         };
@@ -5887,7 +5935,9 @@ impl Endgame {
                 self.finished = Some((solved.depth, value));
             }
             let mut line = Vec::new();
-            solver.collect_pv(self.turn, &mut line);
+            solver
+                .collect_pv(self.turn, &mut line)
+                .map_err(wolges_err)?;
             let value = solved.value.map(points);
             EndgameAnswer {
                 part: None,
@@ -5955,6 +6005,7 @@ impl Endgame {
             memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
                 bytes,
                 held: memory,
+                reserved: None,
             }),
             clock: Some(clock),
         };
@@ -5990,7 +6041,7 @@ impl Endgame {
                     } else {
                         0.5
                     },
-                    value,
+                    value: Some(value),
                     tiles: None,
                     draws: None,
                     deals: None,
@@ -6031,7 +6082,10 @@ impl Endgame {
                     _ => {}
                 }
             }
-            kept.sort_by(|a, b| b.value.total_cmp(&a.value));
+            kept.sort_by(|a, b| match (b.value, a.value) {
+                (Some(b), Some(a)) => b.total_cmp(&a),
+                (b, a) => b.is_some().cmp(&a.is_some()),
+            });
         } else {
             self.answer.candidates = Some(candidates);
         }
@@ -6173,6 +6227,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     let limit = max_memory.map(|bytes| endgame::MemoryLimit {
         bytes,
         held: memory,
+        reserved: None,
     });
 
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -6255,7 +6310,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 &movegen::BoardSnapshot {
                     board_tiles: &state.board_tiles,
                     game_config: &game_config,
-                    kwg: &kwg.kwg,
+                    graphs: game_config.graphs(&kwg.kwg)?,
                     anagrams: None,
                     rack_lengths: None,
                     klv: &game_config.no_leaves,
@@ -6291,7 +6346,9 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 limit.as_ref(),
             )
             .map_err(wolges_err)?
-            .ok_or(OUT_OF_MEMORY)?;
+            .ok_or(OUT_OF_MEMORY)?
+            .without_cuts()
+            .map_err(wolges_err)?;
             Some(progress.with_root_moves(root_moves.take()))
         }
         None if req.estimates => {
@@ -6380,7 +6437,12 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 .ok_or_else(|| format!("warm_from: {}", no_endgame(from)))?
                 .table
                 .take()
-                .map(|table| table.for_another_graph(kwg.kwg()));
+                .map(|table| {
+                    game_config
+                        .graphs(kwg.kwg())
+                        .map(|graphs| table.for_another_graph(graphs))
+                })
+                .transpose()?;
             (game_config, kwg, arm_tables, table)
         }
         None => (
@@ -6746,7 +6808,7 @@ fn pruned_graph_within(
         &movegen::BoardSnapshot {
             board_tiles,
             game_config,
-            kwg: &lexicon.kwg,
+            graphs: game_config.graphs(&lexicon.kwg)?,
             anagrams: None,
             rack_lengths: None,
             klv: &empty_klv,
@@ -6826,6 +6888,7 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
         mb => mb.map(|mb| endgame::MemoryLimit {
             bytes: mb.saturating_mul(1 << 20),
             held: memory,
+            reserved: None,
         }),
     };
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -6840,7 +6903,7 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
         &movegen::BoardSnapshot {
             board_tiles: &kibitzer.board_tiles,
             game_config: &game_config,
-            kwg: &kwg.kwg,
+            graphs: game_config.graphs(&kwg.kwg)?,
             anagrams: None,
             rack_lengths: None,
             klv: &game_config.no_leaves,
@@ -6886,17 +6949,19 @@ fn prune_into(
 ) -> Result<(), String> {
     let mut words = Vec::<bites::Bites>::new();
     let mut generator = game_config.lend()?;
-    generator.gen_remaining_words(
-        &movegen::BoardSnapshot {
-            board_tiles,
-            game_config,
-            kwg: &lexicon.kwg,
-            anagrams: None,
-            rack_lengths: None,
-            klv: &game_config.no_leaves,
-        },
-        |word: &[u8]| words.push(word.into()),
-    );
+    generator
+        .gen_remaining_words(
+            &movegen::BoardSnapshot {
+                board_tiles,
+                game_config,
+                graphs: game_config.graphs(&lexicon.kwg)?,
+                anagrams: None,
+                rack_lengths: None,
+                klv: &game_config.no_leaves,
+            },
+            |word: &[u8]| words.push(word.into()),
+        )
+        .map_err(wolges_err)?;
     generator.let_go_of_prune();
     drop(generator);
     graph
@@ -7042,7 +7107,7 @@ mod tests {
                 build::BuildContent::DawgOnly,
                 build::BuildLayout::Wolges,
                 build::BuildOrder::Sorted,
-                &build::make_alphagrams(&words),
+                &build::make_alphagrams(&words).unwrap(),
             )
         } else {
             build::build(
@@ -7692,7 +7757,8 @@ mod tests {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
                 sim.simmer
-                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)))
+                    .unwrap();
                 let rack = &sim.simmer.prepared_state().players[1].rack;
                 for (tile, count) in [(E, 2), (0, 1)] {
                     assert!(
@@ -7771,7 +7837,7 @@ mod tests {
             &movegen::BoardSnapshot {
                 board_tiles: &kibitzer.board_tiles,
                 game_config: &game_config,
-                kwg: &kwg.kwg,
+                graphs: game_config.graphs(&kwg.kwg).unwrap(),
                 anagrams: None,
                 rack_lengths: None,
                 klv: &klv.klv,
@@ -8075,7 +8141,8 @@ mod tests {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
                 sim.simmer
-                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)))
+                    .unwrap();
                 sim.simmer.prepared_state().players[1].rack.clone()
             }))
             .collect::<Vec<_>>()
@@ -8098,14 +8165,16 @@ mod tests {
         {
             let mut sims = SIMS.lock().unwrap();
             let sim = sims.live.get_mut(&from_list).unwrap();
-            sim.simmer.prepare(
-                &sim.game_config,
-                &sim.pristine,
-                &simmer::SimChoices {
-                    packed: &[simmer::KeptLeaves::listed(1, &listed)],
-                    ..simmer::SimChoices::new(sim.plies.unwrap_or(usize::MAX), true, &[])
-                },
-            );
+            sim.simmer
+                .prepare(
+                    &sim.game_config,
+                    &sim.pristine,
+                    &simmer::SimChoices {
+                        packed: &[simmer::KeptLeaves::listed(1, &listed)],
+                        ..simmer::SimChoices::new(sim.plies.unwrap_or(usize::MAX), true, &[])
+                    },
+                )
+                .unwrap();
         }
         let racks = dealt(from_handle, 1..=20);
         assert_eq!(dealt(from_list, 1..=20), racks);
@@ -8164,7 +8233,8 @@ mod tests {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
                 sim.simmer
-                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)))
+                    .unwrap();
                 let rack = &sim.simmer.prepared_state().players[1].rack;
                 let es = rack.iter().filter(|&&t| t == E).count() >= 2;
                 let blank = rack.contains(&0);
@@ -8462,13 +8532,14 @@ mod tests {
                     &movegen::BoardSnapshot {
                         board_tiles,
                         game_config: &game_config,
-                        kwg: &kwg.kwg,
+                        graphs: game_config.graphs(&kwg.kwg).unwrap(),
                         anagrams: None,
                         rack_lengths: None,
                         klv: &Klv::empty().unwrap(),
                     },
                     |word: &[u8]| words.push(word.into()),
-                );
+                )
+                .unwrap();
             fields(
                 &Kwg::from_bytes_alloc(&build::build_for_game(&game_config, &words).unwrap())
                     .unwrap(),
@@ -8559,13 +8630,14 @@ mod tests {
                 &movegen::BoardSnapshot {
                     board_tiles,
                     game_config: &game_config,
-                    kwg: &kwg.kwg,
+                    graphs: game_config.graphs(&kwg.kwg).unwrap(),
                     anagrams: None,
                     rack_lengths: None,
                     klv: &Klv::empty().unwrap(),
                 },
                 |word: &[u8]| remaining.push(word.into()),
-            );
+            )
+            .unwrap();
         let has_word = |graph: &Kwg, word: &[u8]| {
             let mut p = 0;
             for &tile in word {
@@ -8574,7 +8646,7 @@ mod tests {
                     return false;
                 }
             }
-            kwg::Node::accepts(&graph[p])
+            graph.node(p).is_ok_and(kwg::Node::accepts)
         };
         let sim = sim_of(
             "tiny-sim-pruned",
@@ -8729,7 +8801,8 @@ mod tests {
                 sim.simmer.restore_prepared(&sim.pristine);
                 sim.simmer.reseed(iteration_seed(sim.seed, iteration));
                 sim.simmer
-                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)));
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)))
+                    .unwrap();
                 let rack = &sim.simmer.prepared_state().players[1].rack;
                 assert_eq!(rack.len(), 7);
                 for (tile, count) in [(E, 2), (0, 1)] {
@@ -9701,7 +9774,7 @@ mod tests {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &game_config,
-                &kwg.kwg,
+                game_config.graphs(&kwg.kwg).unwrap(),
                 &arm_tables,
                 kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
@@ -9866,7 +9939,7 @@ mod tests {
                 false,
             >::with_generator(
                 &game_config,
-                &kwg.kwg,
+                game_config.graphs(&kwg.kwg).unwrap(),
                 &arm_tables,
                 kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
@@ -10325,7 +10398,7 @@ mod tests {
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &game_config,
-                &kwg.kwg,
+                game_config.graphs(&kwg.kwg).unwrap(),
                 &arm_tables,
                 kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
@@ -11593,7 +11666,7 @@ mod tests {
                 build::BuildContent::DawgOnly,
                 build::BuildLayout::Wolges,
                 build::BuildOrder::Sorted,
-                &build::make_alphagrams(&words),
+                &build::make_alphagrams(&words).unwrap(),
             )
         } else {
             build::build(

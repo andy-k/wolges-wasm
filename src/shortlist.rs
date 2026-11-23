@@ -182,7 +182,7 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
     let snapshot = &movegen::BoardSnapshot {
         board_tiles: &shortlist.position.board_tiles,
         game_config: &shortlist.rules,
-        kwg: &shortlist.kwg.kwg,
+        graphs: shortlist.rules.graphs(&shortlist.kwg.kwg)?,
         anagrams: None,
         rack_lengths: None,
         klv: &shortlist.rules.no_leaves,

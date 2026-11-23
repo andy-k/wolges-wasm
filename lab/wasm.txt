@@ -58,6 +58,9 @@ These messages are the ones a page may want to tell apart:
   sim 7: none such, or freed (and the same for inference, threats, endgame, and
     shortlist): the handle is not live (HANDLES below).
 
+A check the engine makes on its own inputs and sums (an index past its table, a
+total past its type's range) that fails throws its message as a string too.
+
 A panic or an allocation failure the module does not catch reaches the page as
 a WebAssembly RuntimeError instead of a thrown string, the panic's message
 going to the console. The instance should not be used after one.
@@ -505,8 +508,8 @@ the board, not placed by the move, and not on the watcher's rack. The rack
 counted is 7 tiles, or all of them when fewer.
 
 No leave is inferred when the bag before the move is empty, when the move's
-draw empties it, or when the move is an exchange of one or more tiles and the
-bag holds too few tiles to exchange. The bag before the move is the tiles the
+draw empties it, when the move is a pass, or when the move is an exchange of
+one or more tiles and the bag holds too few tiles to exchange. The bag before the move is the tiles the
 watcher could not see less a full rack. While that bag holds tiles, a move that
 places tiles the watcher holds or the board has is refused. A move that is no
 move on the board is refused whatever the bag holds: an exchange of more than 7
