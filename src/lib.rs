@@ -1833,7 +1833,7 @@ fn sim_memory(max_memory_mb: Option<usize>) -> Result<Option<endgame::MemoryLimi
         mb => Ok(mb.map(|mb| endgame::MemoryLimit {
             bytes: mb.saturating_mul(1 << 20),
             held: page_memory,
-            reserved: None,
+            reserved: Some(&RESERVED),
         })),
     }
 }
@@ -5036,6 +5036,9 @@ fn do_sim_free(handle: u32) -> Result<(), String> {
 // solve's table is freed
 static HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// the room the caps' growths under way have reserved, beside the bytes held
+static RESERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 struct Counting;
 
 thread_local! {
@@ -5578,6 +5581,15 @@ macro_rules! step_solver {
 }
 
 impl Endgame {
+    // the step's cap, held as memory counts it (none: no cap)
+    fn cap(&self, memory: fn() -> usize) -> Option<endgame::MemoryLimit> {
+        (self.max_memory).map(|bytes| endgame::MemoryLimit {
+            bytes,
+            held: memory,
+            reserved: Some(&RESERVED),
+        })
+    }
+
     // the table's bytes a first step reserves: under a cap, no more than half
     // the room it leaves, as a growing table holds its old buckets beside the
     // new ones, so the reserving never passes it
@@ -5597,6 +5609,7 @@ impl Endgame {
         clock: endgame::Clock,
         memory: fn() -> usize,
     ) -> Result<Result<endgame::PegBagRows, endgame::PegBagRowsMissing>, String> {
+        let cap = self.cap(memory);
         let Some(progress) = self.peg_bag.as_mut() else {
             return Err("draws_of: only with two or more in the bag".into());
         };
@@ -5610,11 +5623,7 @@ impl Endgame {
         let limits = endgame::Limits {
             time: Some(std::time::Duration::MAX),
             states: None,
-            memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
-                bytes,
-                held: memory,
-                reserved: None,
-            }),
+            memory: cap,
             clock: Some(clock),
         };
         let found = solver.peg_bag_rows(progress, play, rows, &limits);
@@ -5794,6 +5803,7 @@ impl Endgame {
         memory: fn() -> usize,
         priority: &[movegen::Play],
     ) -> Result<(), String> {
+        let cap = self.cap(memory);
         let mut solver = (step_solver!(self)).with_root_priority(priority);
         match self.table.take() {
             Some(table) => {
@@ -5809,11 +5819,7 @@ impl Endgame {
         let limits = endgame::Limits {
             time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
             states: None,
-            memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
-                bytes,
-                held: memory,
-                reserved: None,
-            }),
+            memory: cap,
             clock: Some(clock),
         };
         let lead = points(equity::Equity::new(self.lead));
@@ -5987,6 +5993,7 @@ impl Endgame {
         memory: fn() -> usize,
         priority: &[movegen::Play],
     ) -> Result<(), String> {
+        let cap = self.cap(memory);
         let mut solver = (step_solver!(self)).with_root_priority(priority);
         match self.table.take() {
             Some(table) => {
@@ -6002,11 +6009,7 @@ impl Endgame {
         let limits = endgame::Limits {
             time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
             states: None,
-            memory: self.max_memory.map(|bytes| endgame::MemoryLimit {
-                bytes,
-                held: memory,
-                reserved: None,
-            }),
+            memory: cap,
             clock: Some(clock),
         };
         let lead = points(equity::Equity::new(self.lead));
@@ -6227,7 +6230,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     let limit = max_memory.map(|bytes| endgame::MemoryLimit {
         bytes,
         held: memory,
-        reserved: None,
+        reserved: Some(&RESERVED),
     });
 
     let mut kibitzer = kibitzer::Kibitzer::new();
@@ -6888,7 +6891,7 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
         mb => mb.map(|mb| endgame::MemoryLimit {
             bytes: mb.saturating_mul(1 << 20),
             held: memory,
-            reserved: None,
+            reserved: Some(&RESERVED),
         }),
     };
     let mut kibitzer = kibitzer::Kibitzer::new();
