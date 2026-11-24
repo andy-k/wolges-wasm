@@ -12023,4 +12023,134 @@ mod tests {
             do_endgame_free(handle).unwrap();
         }
     }
+
+    // a json value's keys, sorted
+    fn keys_of(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    // the stable exports' answers keep their keys, on one fixed position
+    #[test]
+    fn the_stable_exports_keep_their_json_keys() {
+        let lexicon = "tiny-stable-keys";
+        tiny_lexicon(lexicon);
+        let position = format!(
+            r#""rack":[{S},{E},{A},{T}],"board":{},"lexicon":"{lexicon}","leave":"noleave","rules":"CrosswordGame""#,
+            cat_board()
+        );
+        let kwg = CACHED_KWG.read().unwrap()[lexicon].clone();
+        let analyzed = report(
+            &do_analyze(
+                serde_json::from_str(&format!(r#"{{{position},"count":3}}"#)).unwrap(),
+                &kwg,
+            )
+            .unwrap(),
+        );
+        let analyzed_plays = analyzed.as_array().unwrap();
+        assert!(!analyzed_plays.is_empty());
+        for one in analyzed_plays {
+            assert_eq!(
+                keys_of(one),
+                ["action", "down", "equity", "idx", "lane", "score", "word"]
+            );
+        }
+        let scored = report(
+            &do_play_score(
+                serde_json::from_str(&format!(
+                    r#"{{{position},"plays":[{},{PASS}]}}"#,
+                    analyzed[0]
+                ))
+                .unwrap(),
+                &kwg,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            keys_of(&scored[0]),
+            [
+                "action",
+                "canonical",
+                "down",
+                "equity",
+                "idx",
+                "invalid_words",
+                "lane",
+                "result",
+                "score",
+                "valid",
+                "word"
+            ]
+        );
+        assert_eq!(
+            keys_of(&scored[1]),
+            [
+                "action",
+                "canonical",
+                "equity",
+                "invalid_words",
+                "result",
+                "tiles",
+                "valid"
+            ]
+        );
+        let hooked = report(
+            &do_hooks(&format!(
+                r#"{{"board":{},"lexicon":"{lexicon}","rules":"CrosswordGame"}}"#,
+                cat_board()
+            ))
+            .unwrap(),
+        );
+        assert_eq!(keys_of(&hooked), ["squares"]);
+        assert_eq!(
+            keys_of(&hooked["squares"][0]),
+            ["across", "col", "down", "row"]
+        );
+        let sim = cat_sim("tiny-stable-keys-sim");
+        let stepped = step(sim, r#"{"iterations":4,"prune":false}"#);
+        assert_eq!(keys_of(&stepped), ["candidates", "iterations", "stepped"]);
+        let candidate = &stepped["candidates"][0];
+        assert_eq!(
+            keys_of(candidate),
+            [
+                "equity",
+                "leaves",
+                "n",
+                "objective",
+                "play",
+                "plies",
+                "spread",
+                "state",
+                "win"
+            ]
+        );
+        assert_eq!(keys_of(&candidate["equity"]), ["mean", "variance"]);
+        assert_eq!(keys_of(&candidate["plies"][0]), ["bingo", "n", "score"]);
+        do_sim_free(sim).unwrap();
+        let endgame = endgame_of("tiny-stable-keys-end", &[S, E, A, T], &[A, T, E], "").unwrap();
+        let solved = endgame_step(endgame, r#"{"ms":60000}"#);
+        assert_eq!(
+            keys_of(&solved),
+            [
+                "bag",
+                "depth",
+                "exact",
+                "line",
+                "nodes",
+                "out_of_memory",
+                "play",
+                "spread",
+                "steps",
+                "value"
+            ]
+        );
+        assert_eq!(keys_of(&solved["line"][0]), ["play", "value"]);
+        do_endgame_free(endgame).unwrap();
+    }
 }
