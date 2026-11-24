@@ -1,5 +1,15 @@
 // Copyright (C) 2020-2026 Andy Kurnia.
 
+// the stable exports, the ones a caller builds on: version, precache_kwg,
+// precache_kbwg, precache_klv, precache_kblv2, evict_kwg, evict_klv, analyze,
+// play_score, hooks, infer, infer_free, infer_export, infer_import, sim_new,
+// sim_step, sim_add, sim_remove, sim_pause, sim_resume, sim_set, sim_free,
+// threats_new, threats_step, threats_free, endgame_new, endgame_step,
+// endgame_free, build_kbwg. Each keeps its name, its meaning, and its json
+// keys; a change is additive, a new meaning takes a new name, and an old one
+// goes only in a commit that says it removes it. The build identity is
+// version(), never a field. Every other export is free to change.
+
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
 
