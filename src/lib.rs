@@ -1188,6 +1188,8 @@ struct InferRequest {
     fuzz: f64,
     #[serde(default)]
     list: usize,
+    #[serde(default)]
+    weigh_passes: bool,
 }
 
 // a leave a player may have kept, and its weight
@@ -1427,7 +1429,7 @@ fn do_infer(req_str: &str) -> Result<String, String> {
         infer::InferOptions {
             fuzz: req.fuzz,
             threads: 1,
-            weigh_passes: false,
+            weigh_passes: req.weigh_passes,
         },
     )
     .map_err(wolges_err)?;
@@ -8205,6 +8207,28 @@ mod tests {
             serde_json::json!({"handle": handle, "count": 0, "leaves": [], "tiles": tiles})
         );
         do_infer_free(handle.as_u64().unwrap() as u32).unwrap();
+    }
+
+    // a pass infers no leaves unless weigh_passes asks for them
+    #[test]
+    fn a_pass_infers_leaves_only_with_weigh_passes() {
+        let _one = one_infer_test();
+        tiny_lexicon("tiny-infer-pass");
+        let count = |more: &str| {
+            let answer = report(
+                &do_infer(&format!(
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-pass","leave":"noleave","rules":"CrosswordGame","play":{PASS},"fuzz":{}{more}}}"#,
+                    cat_board(),
+                    infer::FUZZ
+                ))
+                .unwrap(),
+            );
+            do_infer_free(answer["handle"].as_u64().unwrap() as u32).unwrap();
+            answer["count"].as_u64().unwrap()
+        };
+        assert_eq!(count(""), 0);
+        assert_eq!(count(r#","weigh_passes":false"#), 0);
+        assert!(count(r#","weigh_passes":true"#) > 0);
     }
 
     // a sim given an inference's handle deals its opponent one of its leaves

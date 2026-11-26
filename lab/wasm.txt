@@ -486,6 +486,9 @@ new inference's handle. The request:
     whose best play beats the move by that least are kept.
   list: whole number, optional (0 if left out). How many of the likeliest
     leaves to list.
+  weigh_passes: true or false, optional (false if left out). A pass weighs
+    the racks too, as a placement or an exchange does; without it a pass
+    infers no leaves.
 
 The answer:
 
