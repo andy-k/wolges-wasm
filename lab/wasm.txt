@@ -958,10 +958,11 @@ root_ids is refused for an endgame with no shortlist ("no shortlist attached")
 or with an id the shortlist lacks ("shortlist move 9: none such").
 
 With one tile in the bag, under rules that allow an exchange while the bag
-holds a tile (Spanish), root_moves or root_ids makes the endgame search as one
-with two or more tiles in the bag does, and all this file gives for two or more
-tiles in the bag then holds for it: model and exchanges are required, part and
-estimates may be given, and its steps answer as with two or more tiles.
+holds a tile (Spanish), the endgame searches as one with two or more tiles in
+the bag does, with root_moves, root_ids, or neither, and all this file gives
+for two or more tiles in the bag then holds for it: model and exchanges are
+required, part and estimates may be given, and its steps answer as with two or
+more tiles.
 
 An endgame holds its rules, the lexicon pruned for its board (under a cap
 without room for the prune, the lexicon itself), and its solver's table from
@@ -980,7 +981,7 @@ it stands. The request:
   priority: array of plays or null, optional. Moves the search has yet to
     value, to value first, in the order given, each a play as the answer's
     candidates give it; a play that is not such a move is passed over. With an
-    empty bag, priority orders the moves first_moves_ms values, and needs it.
+    empty bag, priority orders the moves first_moves_ms values.
     Left out or null, the step uses the priority endgame_prioritize saved, if
     any; given, even as [], it takes that one's place for this step alone.
   draws_of: whole number, play, object, or null, optional; only with two or
@@ -1073,11 +1074,6 @@ With candidates_range the answer also gives candidates_total, how many
 candidates there are, and, when draws_of's candidate is not in the range,
 drawn: that candidate with its draws, and index, its place.
 
-Without root_moves or root_ids, with one tile in the bag, under rules that
-allow an exchange while the bag holds a tile (Spanish), the search values each
-tile as if the player to move knew it is the one in the bag: the answer gives
-win, value, and tiles, but its play stays null and its candidates empty.
-
 A step's answer takes the last one's place when it is better: with an empty
 bag, when the last had no play, or the step's is exact, deeper, or worth more
 at the same depth; with tiles in the bag, always, as the search goes on from
@@ -1085,19 +1081,16 @@ where it stopped. The depth never falls.
 
 endgame_step refuses ms left out ("endgame_step: give ms"), first_moves_ms with
 tiles in the bag, draws_of with fewer than two tiles in the bag or naming no
-candidate, brief with draws_of or candidates_range, draws_range without
-draws_of, a priority of one or more plays with an empty bag but no
-first_moves_ms, and one where the search values each tile as if it were known
-(one tile in the bag under Spanish rules without root_moves or root_ids). A
-priority play whose word holds -128 or whose score is past 2147483 points
-either way is refused, as for root_moves. Of these, only draws_of naming no
-candidate is refused after the step's solve, which stands; the others are
-refused before it, the endgame unchanged. A step throws out_of_memory
-where its priority, or the first-move values it keeps, do not fit, and it
-throws when the rules let scoreless turns go on without end in the position,
-the message saying it is not solvable. When the cap stopped the draws that
-draws_of asked for, the answer comes as without draws_of, with out_of_memory
-true and out_of_memory_in "draws".
+candidate, brief with draws_of or candidates_range, and draws_range without
+draws_of. A priority play whose word holds -128 or whose score is past 2147483
+points either way is refused, as for root_moves. Of these, only draws_of naming
+no candidate is refused after the step's solve, which stands; the others are
+refused before it, the endgame unchanged. A step throws out_of_memory where its
+priority, or the first-move values it keeps, do not fit, and it throws when the
+rules let scoreless turns go on without end in the position, the message saying
+it is not solvable. When the cap stopped the draws that draws_of asked for, the
+answer comes as without draws_of, with out_of_memory true and out_of_memory_in
+"draws".
 
 endgame_prioritize(handle, ids) saves a priority for every later step of an
 endgame: the plays named by ids, a Uint32Array of ids in its shortlist, in that
@@ -1107,8 +1100,29 @@ its ms. With an empty bag the saved priority orders the moves of
 first_moves_ms, which a step gives when it wants first-move values, and from
 then on the endgame keeps its first-move values from step to step, as after a
 step's priority. Given ids, endgame_prioritize refuses an endgame with no
-shortlist, an id the shortlist lacks, and an endgame whose search values each
-tile as if it were known, and it throws out_of_memory where the plays the ids
-name do not fit.
+shortlist and an id the shortlist lacks, and it throws out_of_memory where the
+plays the ids name do not fit.
+
+endgame_add(handle, plays), endgame_remove(handle, plays),
+endgame_pause(handle, plays), and endgame_resume(handle, plays) change an
+endgame's moves between steps, as sim_add and the others change a sim's
+candidates, for an endgame with any number of tiles in the bag. plays is a JSON
+array of plays, each checked as root_moves are. Each answers a JSON array with
+one entry for each play, in the order given:
+
+  [{"play":{"action":"play",...},"was":"running"}]
+
+  play: the play as the endgame holds it.
+  was: where the play stood before the change: "absent", "running", or
+    "paused".
+
+endgame_add_ids(handle, ids), endgame_remove_ids(handle, ids),
+endgame_pause_ids(handle, ids), and endgame_resume_ids(handle, ids) do the same
+for the plays named by ids, a Uint32Array of ids in the endgame's shortlist,
+and answer a Uint8Array with one byte for each id: 0 absent, 1 running, or 2
+paused. An endgame with no shortlist is refused ("no shortlist attached").
+
+Each change takes effect from the next step on, and leaves the answer not
+exact. With an empty bag a paused move keeps its first-move row, listed last.
 
 endgame_free(handle) frees an endgame, with its table, and answers undefined.

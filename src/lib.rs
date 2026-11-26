@@ -5,10 +5,11 @@
 // play_score, hooks, infer, infer_free, infer_export, infer_import, sim_new,
 // sim_step, sim_add, sim_remove, sim_pause, sim_resume, sim_set, sim_free,
 // threats_new, threats_step, threats_free, endgame_new, endgame_step,
-// endgame_free, build_kbwg. Each keeps its name, its meaning, and its json
-// keys; a change is additive, a new meaning takes a new name, and an old one
-// goes only in a commit that says it removes it. The build identity is
-// version(), never a field. Every other export is free to change.
+// endgame_add, endgame_remove, endgame_pause, endgame_resume, endgame_free,
+// build_kbwg. Each keeps its name, its meaning, and its json keys; a change is
+// additive, a new meaning takes a new name, and an old one goes only in a
+// commit that says it removes it. The build identity is version(), never a
+// field. Every other export is free to change.
 
 use rand::prelude::*;
 use wasm_bindgen::prelude::*;
@@ -5540,6 +5541,9 @@ struct Endgame {
     bag: usize,
     peg_bag: Option<endgame::PegBagProgress>,
     root_moves: Option<endgame::RootMoves>,
+    root_plays: Vec<movegen::Play>, // an empty bag's root moves, made at its first change
+    steered: Vec<(movegen::Play, endgame::PegBagStanding)>, // those not running
+    running: Option<Option<endgame::RootMoves>>, // the rest, once one is not: none if none
     keep_first_moves: bool,
     turn: u8,
     lead: i32,
@@ -5664,7 +5668,12 @@ macro_rules! step_solver {
             },
         }
         .map_err(wolges_err)?
-        .map(|solver| solver.with_root_moves($endgame.root_moves.as_ref()))
+        .map(|solver| {
+            solver.with_root_moves(match &$endgame.running {
+                Some(running) => running.as_ref(),
+                None => $endgame.root_moves.as_ref(),
+            })
+        })
     };
 }
 
@@ -5880,13 +5889,136 @@ impl Endgame {
         })
     }
 
-    fn check_priority(&self) -> Result<(), String> {
-        if self.bag == 1 && self.peg_bag.is_none() && self.game_config.exchange_tile_limit() <= 1 {
-            return Err(
-                "priority: the one-tile clairvoyant search has no committed root moves".into(),
+    // the side to move's rack and the other's, by seat
+    fn racks(&self) -> [Vec<u8>; 2] {
+        let mut racks = [Vec::new(), Vec::new()];
+        racks[self.turn as usize].extend_from_slice(&self.rack);
+        racks[1 - self.turn as usize].extend(
+            (0u8..)
+                .zip(&self.unseen)
+                .flat_map(|(tile, &count)| std::iter::repeat_n(tile, count as usize)),
+        );
+        racks
+    }
+
+    // with an empty bag, a root move's change, as a sim's candidate's: what it
+    // was before (absent for a play that is no root move)
+    fn change_root(
+        &mut self,
+        play: &movegen::Play,
+        change: SimChange,
+        memory: fn() -> usize,
+    ) -> Result<endgame::PegBagStanding, String> {
+        use endgame::PegBagStanding as S;
+        if self.root_plays.is_empty() {
+            let cap = self.cap(memory);
+            let Some(solver) = step_solver!(self, cap) else {
+                return Err(OUT_OF_MEMORY.into());
+            };
+            let mut solver = solver.with_root_moves(self.root_moves.as_ref());
+            let racks = self.racks();
+            solver.init_after_scoreless_turns(
+                &self.board_tiles,
+                [&racks[0], &racks[1]],
+                self.pass_turns,
+                self.zero_turns,
             );
+            let plays = solver.root_plays(self.turn);
+            self.solver = Some(solver.into_kept());
+            self.root_plays = plays.map_err(wolges_err)?.ok_or(OUT_OF_MEMORY)?;
         }
-        Ok(())
+        if !self.root_plays.contains(play) {
+            return Ok(S::Absent);
+        }
+        let listed = self.steered.iter().position(|(other, _)| other == play);
+        let was = listed.map_or(S::Running, |k| self.steered[k].1);
+        let now = match (change, was) {
+            (SimChange::Add, S::Absent) | (SimChange::Resume, S::Paused) => S::Running,
+            (SimChange::Remove, _) => S::Absent,
+            (SimChange::Pause, S::Running) => S::Paused,
+            _ => was,
+        };
+        match (listed, now) {
+            (_, _) if now == was => return Ok(was),
+            (Some(k), S::Running) => {
+                self.steered.remove(k);
+            }
+            (Some(k), _) => self.steered[k].1 = now,
+            (None, _) => self.steered.push((play.clone(), now)),
+        }
+        let running = (self.root_plays.iter())
+            .filter(|play| self.steered.iter().all(|(other, _)| other != *play))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.running = if self.steered.is_empty() {
+            None
+        } else if running.is_empty() {
+            Some(None)
+        } else {
+            let mut state = game_state::GameState::new(&self.game_config);
+            state.board_tiles.copy_from_slice(&self.board_tiles);
+            state.turn = self.turn;
+            state.players[self.turn as usize]
+                .rack
+                .clone_from(&self.rack);
+            state.bag.set_from_iter([]);
+            Some(Some(
+                endgame::RootMoves::checked(
+                    &movegen::BoardSnapshot {
+                        board_tiles: &state.board_tiles,
+                        game_config: &self.game_config,
+                        graphs: self.game_config.graphs(self.kwg.kwg())?,
+                        anagrams: None,
+                        rack_lengths: None,
+                        klv: &self.game_config.no_leaves,
+                    },
+                    &state,
+                    running,
+                )
+                .map_err(wolges_err)?,
+            ))
+        };
+        // the answer is searched afresh among the running moves
+        self.finished = None;
+        let a = &mut self.answer;
+        (a.play, a.value, a.exact, a.depth) = (None, None, false, Some(0));
+        a.spread = points(equity::Equity::new(self.lead));
+        a.line = Some(Vec::new());
+        self.order_paused();
+        Ok(was)
+    }
+
+    // with an empty bag, the paused moves' first-move rows taken from the
+    // answer, which they stay in as they were
+    fn paused_rows(&mut self) -> Option<Vec<EndgameCandidate>> {
+        let old = self.answer.candidates.take()?;
+        let paused = (self.steered.iter())
+            .filter(|(_, standing)| *standing == endgame::PegBagStanding::Paused)
+            .map(|(play, _)| kibitzer::JsonPlay::from(play))
+            .collect::<Vec<_>>();
+        Some(
+            old.into_iter()
+                .filter(|row| paused.contains(&row.play))
+                .collect(),
+        )
+    }
+
+    // with an empty bag, the first moves listed without the removed ones, the
+    // paused ones last
+    fn order_paused(&mut self) {
+        if self.steered.is_empty() {
+            return;
+        }
+        let Some(listed) = self.answer.candidates.as_mut() else {
+            return;
+        };
+        let standing = |row: &EndgameCandidate| {
+            (self.steered.iter())
+                .find(|(play, _)| kibitzer::JsonPlay::from(play) == row.play)
+                .map(|&(_, standing)| standing)
+        };
+        listed.retain(|row| standing(row) != Some(endgame::PegBagStanding::Absent));
+        listed.sort_by_key(|row| standing(row).is_some());
     }
 
     // one solve of at most ms on the clock, on the table earlier steps kept
@@ -5897,6 +6029,9 @@ impl Endgame {
         memory: fn() -> usize,
         priority: &[movegen::Play],
     ) -> Result<(), String> {
+        if matches!(self.running, Some(None)) {
+            return Ok(());
+        }
         let cap = self.cap(memory);
         let Some(solver) = step_solver!(self, cap) else {
             self.answer.out_of_memory = true;
@@ -6072,7 +6207,13 @@ impl Endgame {
         };
         self.table = Some(solver.take_table());
         self.solver = Some(solver.into_kept());
-        let candidates = self.keep_first_moves.then(|| self.answer.candidates.take());
+        let candidates = if self.keep_first_moves {
+            Some(self.answer.candidates.take())
+        } else if !self.in_bag && !self.steered.is_empty() {
+            Some(self.paused_rows())
+        } else {
+            None
+        };
         self.answer.take(answer, self.in_bag);
         if let Some(candidates) = candidates {
             self.answer.candidates = candidates;
@@ -6091,6 +6232,9 @@ impl Endgame {
         memory: fn() -> usize,
         priority: &[movegen::Play],
     ) -> Result<(), String> {
+        if matches!(self.running, Some(None)) {
+            return Ok(());
+        }
         let cap = self.cap(memory);
         let Some(solver) = step_solver!(self, cap) else {
             self.answer.out_of_memory = true;
@@ -6193,8 +6337,11 @@ impl Endgame {
                 (b, a) => b.is_some().cmp(&a.is_some()),
             });
         } else {
+            let mut candidates = candidates;
+            candidates.extend(self.paused_rows().into_iter().flatten());
             self.answer.candidates = Some(candidates);
         }
+        self.order_paused();
         Ok(())
     }
 }
@@ -6365,9 +6512,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     }
     // with two tiles or more in the bag, what each player knows and the
     // exchanges made are the position's too
-    let committed_exchange = bag == 1
-        && (req.root_moves.is_some() || req.root_ids.is_some())
-        && game_config.exchange_tile_limit() <= 1;
+    let committed_exchange = bag == 1 && game_config.exchange_tile_limit() <= 1;
     let bag_search = if bag >= 2 || committed_exchange {
         let model = match req.model.as_deref() {
             Some("info_sets") => endgame::PegModel::InfoSets,
@@ -6583,6 +6728,9 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         bag,
         peg_bag,
         root_moves,
+        root_plays: Vec::new(),
+        steered: Vec::new(),
+        running: None,
         keep_first_moves: false,
         turn: req.turn,
         lead: scores,
@@ -6641,7 +6789,6 @@ fn do_endgame_prioritize(handle: u32, ids: &[u32]) -> Result<(), String> {
     if ids.is_empty() {
         endgame.priority = None;
     } else {
-        endgame.check_priority()?;
         let shortlist = shortlist::attached(&endgame.shortlist)?;
         endgame.priority = Some(shortlist::copy_plays(shortlist, ids)?.into());
         if endgame.bag == 0 {
@@ -6649,6 +6796,118 @@ fn do_endgame_prioritize(handle: u32, ids: &[u32]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn endgame_change(
+    handle: u32,
+    plays: &[movegen::Play],
+    change: SimChange,
+) -> Result<Vec<u8>, String> {
+    let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
+    let endgame = endgames
+        .live
+        .get_mut(&handle)
+        .ok_or_else(|| no_endgame(handle))?;
+    let peg_change = match change {
+        SimChange::Add => endgame::PegBagChange::Add,
+        SimChange::Remove => endgame::PegBagChange::Remove,
+        SimChange::Pause => endgame::PegBagChange::Pause,
+        SimChange::Resume => endgame::PegBagChange::Resume,
+    };
+    let mut before = Vec::new();
+    before
+        .try_reserve_exact(plays.len())
+        .map_err(|_| OUT_OF_MEMORY)?;
+    for play in plays {
+        let was = if let Some(progress) = endgame.peg_bag.as_mut() {
+            progress.change(play, peg_change)
+        } else if let Some(progress) = endgame.peg.as_mut() {
+            progress.change(play, peg_change)
+        } else {
+            endgame.change_root(play, change, page_memory)?
+        };
+        before.push(match was {
+            endgame::PegBagStanding::Absent => 0,
+            endgame::PegBagStanding::Running => 1,
+            endgame::PegBagStanding::Paused => 2,
+        });
+    }
+    if !plays.is_empty() {
+        endgame.answer.exact = false;
+    }
+    Ok(before)
+}
+
+#[derive(serde::Serialize)]
+struct EndgameChanged {
+    play: kibitzer::JsonPlay,
+    was: &'static str,
+}
+
+fn do_endgame_change(handle: u32, plays_str: &str, change: SimChange) -> Result<String, String> {
+    let requested =
+        serde_json::from_str::<Vec<kibitzer::JsonPlay>>(plays_str).map_err(err_to_str)?;
+    let plays = decode_root_plays(&requested, "plays")?;
+    let before = endgame_change(handle, &plays, change)?;
+    let answer = (plays.iter().zip(before))
+        .map(|(play, was)| EndgameChanged {
+            play: play.into(),
+            was: ["absent", "running", "paused"][was as usize],
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&answer).map_err(err_to_str)
+}
+
+fn do_endgame_change_ids(handle: u32, ids: &[u32], change: SimChange) -> Result<Vec<u8>, String> {
+    let plays = {
+        let endgames = ENDGAMES.lock().map_err(err_to_str)?;
+        let endgame = endgames
+            .live
+            .get(&handle)
+            .ok_or_else(|| no_endgame(handle))?;
+        shortlist::copy_plays(shortlist::attached(&endgame.shortlist)?, ids)?
+    };
+    endgame_change(handle, &plays, change)
+}
+
+#[wasm_bindgen]
+pub fn endgame_add(handle: u32, plays_str: String) -> Result<String, JsValue> {
+    Ok(do_endgame_change(handle, &plays_str, SimChange::Add)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_remove(handle: u32, plays_str: String) -> Result<String, JsValue> {
+    Ok(do_endgame_change(handle, &plays_str, SimChange::Remove)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_pause(handle: u32, plays_str: String) -> Result<String, JsValue> {
+    Ok(do_endgame_change(handle, &plays_str, SimChange::Pause)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_resume(handle: u32, plays_str: String) -> Result<String, JsValue> {
+    Ok(do_endgame_change(handle, &plays_str, SimChange::Resume)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_add_ids(handle: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_endgame_change_ids(handle, ids, SimChange::Add)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_remove_ids(handle: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_endgame_change_ids(handle, ids, SimChange::Remove)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_pause_ids(handle: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_endgame_change_ids(handle, ids, SimChange::Pause)?)
+}
+
+#[wasm_bindgen]
+pub fn endgame_resume_ids(handle: u32, ids: &[u32]) -> Result<Vec<u8>, JsValue> {
+    Ok(do_endgame_change_ids(handle, ids, SimChange::Resume)?)
 }
 
 // a step of an endgame, as EndgameAnswer
@@ -6703,14 +6962,8 @@ fn do_endgame_step(
     let inline = (req.priority.as_ref())
         .map(|plays| decode_root_plays(plays, "priority"))
         .transpose()?;
-    if inline.as_ref().is_some_and(|plays| !plays.is_empty()) {
-        endgame.check_priority()?;
-        if endgame.bag == 0 {
-            if req.first_moves_ms.is_none() {
-                return Err("priority: give first_moves_ms with an empty bag".into());
-            }
-            endgame.keep_first_moves = true;
-        }
+    if inline.as_ref().is_some_and(|plays| !plays.is_empty()) && endgame.bag == 0 {
+        endgame.keep_first_moves = true;
     }
     let kept = endgame.priority.clone();
     let priority = inline.as_deref().or(kept.as_deref()).unwrap_or(&[]);
@@ -9635,6 +9888,169 @@ mod tests {
     }
 
     #[test]
+    fn an_endgame_takes_a_sims_changes_to_its_moves() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
+        let lexicon = "tiny-end-steer";
+        tiny_lexicon(lexicon);
+        let all_tiles = [rack.as_slice(), others.as_slice()].concat();
+        let mut request = serde_json::json!({
+            "rack": rack, "board": report(&late_board(&all_tiles)), "lexicon": lexicon,
+            "rules": "CrosswordGame", "scores": [0, 0], "turn": 0, "zero_turns": 0,
+            "pass_turns": 0, "model": "random_draws", "exchanges": [0, 0], "cuts": false,
+        });
+        let reference = do_endgame_new(&request.to_string(), none_held).unwrap();
+        let full = endgame_step(reference, r#"{"ms":60000}"#);
+        assert_eq!(full["exact"], true);
+        let rows = full["candidates"].as_array().unwrap();
+        assert!(rows.len() >= 2);
+        let first = rows[0]["play"].clone();
+        let change = |endgame: u32, change: SimChange| {
+            report(&do_endgame_change(endgame, &format!("[{first}]"), change).unwrap())[0]["was"]
+                .clone()
+        };
+        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
+        assert_eq!(change(endgame, SimChange::Pause), "running");
+        assert_eq!(change(endgame, SimChange::Resume), "paused");
+        assert_eq!(endgame_step(endgame, r#"{"ms":60000}"#), full);
+        assert_eq!(change(endgame, SimChange::Pause), "running");
+        let paused = endgame_step(endgame, r#"{"ms":60000}"#);
+        assert_ne!(paused["play"], first);
+        let listed = paused["candidates"].as_array().unwrap();
+        assert!(listed.len() == rows.len() && listed.last().unwrap()["play"] == first);
+        assert_eq!(change(endgame, SimChange::Resume), "paused");
+        assert_eq!(
+            endgame_step(endgame, r#"{"ms":60000}"#)["candidates"],
+            full["candidates"]
+        );
+        let shortlist = shortlist::do_new(&request.to_string()).unwrap();
+        let ids = shortlist::do_add(shortlist, &format!("[{first}]")).unwrap();
+        request["shortlist"] = serde_json::json!(shortlist);
+        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
+        endgame_step(endgame, r#"{"ms":60000}"#);
+        assert_eq!(
+            do_endgame_change_ids(endgame, &ids, SimChange::Remove).unwrap(),
+            [1]
+        );
+        let removed = endgame_step(endgame, r#"{"ms":0}"#);
+        assert_eq!(
+            removed["candidates"].as_array().unwrap().len() + 1,
+            rows.len()
+        );
+        assert_eq!(
+            do_endgame_change_ids(endgame, &ids, SimChange::Add).unwrap(),
+            [0]
+        );
+        assert_eq!(
+            endgame_step(endgame, r#"{"ms":60000}"#)["candidates"],
+            full["candidates"]
+        );
+        do_endgame_free(endgame).unwrap();
+        shortlist::do_free(shortlist).unwrap();
+        do_endgame_free(reference).unwrap();
+        let one = [S, B, D, F, G, H, I, E, S, B, D, F, G, H, I];
+        request["board"] = report(&late_board(&one));
+        request.as_object_mut().unwrap().remove("shortlist");
+        request.as_object_mut().unwrap().remove("cuts");
+        let reference = do_endgame_new(&request.to_string(), none_held).unwrap();
+        let full = endgame_step(reference, r#"{"ms":60000}"#);
+        assert_eq!(full["exact"], true);
+        assert_eq!(full["bag"], 1);
+        let rows = full["candidates"].as_array().unwrap();
+        assert!(rows.len() >= 2);
+        let first = rows[0]["play"].clone();
+        let change = |endgame: u32, change: SimChange| {
+            report(&do_endgame_change(endgame, &format!("[{first}]"), change).unwrap())[0]["was"]
+                .clone()
+        };
+        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
+        assert_eq!(change(endgame, SimChange::Pause), "running");
+        assert_eq!(change(endgame, SimChange::Resume), "paused");
+        assert_eq!(endgame_step(endgame, r#"{"ms":60000}"#), full);
+        assert_eq!(change(endgame, SimChange::Pause), "running");
+        let paused = endgame_step(endgame, r#"{"ms":60000}"#);
+        assert_ne!(paused["play"], first);
+        let listed = paused["candidates"].as_array().unwrap();
+        assert!(listed.len() == rows.len() && *listed.last().unwrap() == rows[0]);
+        assert_eq!(change(endgame, SimChange::Remove), "paused");
+        let removed = endgame_step(endgame, r#"{"ms":0}"#);
+        assert_eq!(removed["candidates"].as_array().unwrap()[..], rows[1..]);
+        assert_eq!(change(endgame, SimChange::Add), "absent");
+        assert_eq!(
+            endgame_step(endgame, r#"{"ms":60000}"#)["candidates"],
+            full["candidates"]
+        );
+        do_endgame_free(endgame).unwrap();
+        do_endgame_free(reference).unwrap();
+    }
+
+    #[test]
+    fn an_empty_bags_endgame_takes_a_sims_changes_to_its_moves() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H];
+        let lexicon = "tiny-end-steer-empty";
+        tiny_lexicon(lexicon);
+        let all_tiles = [rack.as_slice(), others.as_slice()].concat();
+        let request = serde_json::json!({
+            "rack": rack, "board": report(&late_board(&all_tiles)), "lexicon": lexicon,
+            "rules": "CrosswordGame", "scores": [0, 0], "turn": 0, "zero_turns": 0,
+            "pass_turns": 0,
+        });
+        let step = r#"{"ms":60000,"first_moves_ms":60000}"#;
+        let reference = do_endgame_new(&request.to_string(), none_held).unwrap();
+        let full = endgame_step(reference, step);
+        assert_eq!(full["exact"], true);
+        assert_eq!(full["bag"], 0);
+        let rows = full["candidates"].as_array().unwrap();
+        assert!(rows.len() >= 2);
+        let first = rows[0]["play"].clone();
+        assert_eq!(full["play"], first);
+        let change = |endgame: u32, play: &serde_json::Value, change: SimChange| {
+            report(&do_endgame_change(endgame, &format!("[{play}]"), change).unwrap())[0]["was"]
+                .clone()
+        };
+        // what a step answers, not how it searched (a warm table finishes
+        // sooner, with a shorter line)
+        let answered = |a: &serde_json::Value| {
+            ["play", "value", "exact", "candidates"].map(|key| a[key].clone())
+        };
+        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
+        assert_eq!(change(endgame, &first, SimChange::Pause), "running");
+        assert_eq!(change(endgame, &first, SimChange::Resume), "paused");
+        assert_eq!(endgame_step(endgame, step), full);
+        assert_eq!(change(endgame, &first, SimChange::Pause), "running");
+        assert_eq!(change(endgame, &first, SimChange::Pause), "paused");
+        let paused = endgame_step(endgame, step);
+        assert_eq!(paused["exact"], true);
+        assert_eq!(paused["play"], rows[1]["play"]);
+        assert_eq!(paused["value"], rows[1]["value"]);
+        let listed = paused["candidates"].as_array().unwrap();
+        assert_eq!(listed.len(), rows.len());
+        assert_eq!(listed[..rows.len() - 1], rows[1..]);
+        assert_eq!(*listed.last().unwrap(), rows[0]);
+        assert_eq!(change(endgame, &first, SimChange::Resume), "paused");
+        assert_eq!(answered(&endgame_step(endgame, step)), answered(&full));
+        let removed =
+            report(&do_endgame_change(endgame, &format!("[{first}]"), SimChange::Remove).unwrap());
+        assert_eq!(removed[0]["was"], "running");
+        let without = endgame_step(endgame, step);
+        assert_eq!(without["play"], rows[1]["play"]);
+        assert_eq!(without["candidates"].as_array().unwrap()[..], rows[1..]);
+        assert_eq!(change(endgame, &first, SimChange::Pause), "absent");
+        assert_eq!(change(endgame, &first, SimChange::Add), "absent");
+        assert_eq!(answered(&endgame_step(endgame, step)), answered(&full));
+        let exchange = serde_json::json!({"action": "exchange", "tiles": [B]});
+        assert_eq!(change(endgame, &exchange, SimChange::Add), "absent");
+        for row in rows {
+            change(endgame, &row["play"], SimChange::Pause);
+        }
+        let held = endgame_step(endgame, step);
+        assert_eq!(held["candidates"].as_array().unwrap().len(), rows.len());
+        do_endgame_free(endgame).unwrap();
+        do_endgame_free(reference).unwrap();
+    }
+
+    #[test]
     fn an_endgame_uses_the_saved_order_in_a_timed_step() {
         let lexicon = "tiny-end-shortlist-order";
         tiny_lexicon(lexicon);
@@ -9671,12 +10087,36 @@ mod tests {
             "rules": rules, "scores": [0, 0], "turn": 0, "zero_turns": 0, "pass_turns": 0,
         });
         let make = |req: &serde_json::Value| do_endgame_new(&req.to_string(), none_held);
-        do_endgame_free(make(&request).unwrap()).unwrap();
-        request["root_moves"] = serde_json::json!([report(PASS)]);
         assert!(make(&request).unwrap_err().starts_with("model:"));
         request["model"] = serde_json::json!("random_draws");
         assert!(make(&request).unwrap_err().starts_with("exchanges:"));
         request["exchanges"] = serde_json::json!([0, 0]);
+        let reference = make(&request).unwrap();
+        let full = endgame_step(reference, r#"{"ms":60000}"#);
+        assert_eq!(full["exact"], true);
+        assert_eq!(full["bag"], 1);
+        let rows = full["candidates"].as_array().unwrap();
+        assert!(rows.len() >= 2);
+        let first = rows[0]["play"].clone();
+        let change = |endgame: u32, change: SimChange| {
+            report(&do_endgame_change(endgame, &format!("[{first}]"), change).unwrap())[0]["was"]
+                .clone()
+        };
+        let endgame = make(&request).unwrap();
+        assert_eq!(endgame_step(endgame, r#"{"ms":60000}"#), full);
+        assert_eq!(change(endgame, SimChange::Pause), "running");
+        let paused = endgame_step(endgame, r#"{"ms":60000}"#);
+        assert_ne!(paused["play"], first);
+        let listed = paused["candidates"].as_array().unwrap();
+        assert_eq!(listed.last().unwrap()["play"], first, "{paused}");
+        assert_eq!(change(endgame, SimChange::Resume), "paused");
+        assert_eq!(
+            endgame_step(endgame, r#"{"ms":60000}"#)["candidates"],
+            full["candidates"]
+        );
+        do_endgame_free(endgame).unwrap();
+        do_endgame_free(reference).unwrap();
+        request["root_moves"] = serde_json::json!([report(PASS)]);
         do_endgame_free(make(&request).unwrap()).unwrap();
     }
 
@@ -9728,6 +10168,23 @@ mod tests {
             }
             do_endgame_free(selected).unwrap();
             do_endgame_free(full).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_empty_bags_step_takes_a_priority_without_first_moves_ms() {
+        let solve = |step: &str| {
+            let handle =
+                endgame_of("tiny-end-priority-alone", &[S, E, A, T], &[A, T, E], "").unwrap();
+            let answer = endgame_step(handle, step);
+            do_endgame_free(handle).unwrap();
+            answer
+        };
+        let plain = solve(r#"{"ms":60000}"#);
+        let steered = solve(r#"{"ms":60000,"priority":[{"action":"exchange","tiles":[]}]}"#);
+        assert_eq!(plain["exact"], true);
+        for field in ["play", "value", "win", "exact"] {
+            assert_eq!(steered[field], plain[field], "{field}");
         }
     }
 
