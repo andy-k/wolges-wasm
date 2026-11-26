@@ -5269,6 +5269,8 @@ struct EndgameNewRequest {
     // passes refining them to exact; off unless asked
     #[serde(default)]
     estimates: bool,
+    #[serde(default)]
+    cuts: Option<bool>,
 }
 
 // endgame_step: at most this many milliseconds; 0 reads the last answer. With
@@ -5438,6 +5440,10 @@ struct EndgameCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     draws_total: Option<usize>,
     exact: bool,
+    // the bag search stopped valuing it once it could not win as often as the
+    // best: win is then its most, value null
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cut: bool,
 }
 
 // a move's splits with two or more in the bag, as the page reads them, each
@@ -5749,6 +5755,7 @@ impl Endgame {
                     deals: None,
                     draws_total: None,
                     exact: valued.exact,
+                    cut: false,
                 })
                 .collect();
         };
@@ -5764,6 +5771,7 @@ impl Endgame {
                 deals: Some(deals),
                 draws_total: None,
                 exact: valued.exact,
+                cut: valued.cut,
             })
             .collect::<Vec<_>>();
         if let Some((at, draws, rows)) = draws
@@ -6144,6 +6152,7 @@ impl Endgame {
                     deals: None,
                     draws_total: None,
                     exact: first.exact,
+                    cut: false,
                 })
             })
             .collect::<Vec<_>>();
@@ -6443,14 +6452,22 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 limit.as_ref(),
             )
             .map_err(wolges_err)?
-            .ok_or(OUT_OF_MEMORY)?
-            .without_cuts()
-            .map_err(wolges_err)?;
+            .ok_or(OUT_OF_MEMORY)?;
+            let progress = if req.cuts == Some(false) {
+                progress.without_cuts().map_err(wolges_err)?
+            } else {
+                progress.with_cuts().map_err(wolges_err)?
+            };
             Some(progress.with_root_moves(root_moves.take()))
         }
         None if req.estimates => {
             return Err(format!(
                 "estimates: with two tiles or more in the bag, found {bag} in it"
+            ));
+        }
+        None if req.cuts.is_some() => {
+            return Err(format!(
+                "cuts: with two tiles or more in the bag, found {bag} in it"
             ));
         }
         None if req.part.is_some() => {
@@ -9545,6 +9562,7 @@ mod tests {
             "pass_turns": 0,
             "model": "random_draws",
             "exchanges": [0, 0],
+            "cuts": false,
             "leave": "noleave",
             "plies": 2,
             "seed": 7,
@@ -10302,6 +10320,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_endgame_asked_for_cuts_answers_as_one_without() {
+        let rack = [S, B, D, F, G, H, I];
+        let others = [E, S, B, D, F, G, H, I, J];
+        let solve = |more: &str| {
+            let more = format!(r#","model":"random_draws","exchanges":[0,0]{more}"#);
+            let handle = endgame_of("tiny-end-cuts", &rack, &others, &more).unwrap();
+            let answer = endgame_step(handle, r#"{"ms":60000}"#);
+            do_endgame_free(handle).unwrap();
+            answer
+        };
+        let plain = solve("");
+        let cut = solve(r#","cuts":true"#);
+        let whole = solve(r#","cuts":false"#);
+        let null = solve(r#","cuts":null"#);
+        for field in ["play", "value", "win"] {
+            assert_eq!(cut[field], plain[field], "{field}");
+            assert_eq!(whole[field], plain[field], "{field}");
+        }
+        let cut_values = |answer: &serde_json::Value| {
+            (answer["candidates"].as_array().unwrap().iter())
+                .filter(|candidate| candidate["cut"] == true)
+                .map(|candidate| candidate["value"].is_null())
+                .collect::<Vec<_>>()
+        };
+        assert!(cut_values(&whole).is_empty());
+        for answer in [&plain, &null, &cut] {
+            let cut_rows = cut_values(answer);
+            assert!(!cut_rows.is_empty() && cut_rows.iter().all(|&null| null));
+        }
+        assert!(
+            endgame_of(
+                "tiny-end-cuts",
+                &[S, E, A, T],
+                &[A, T, E],
+                r#","cuts":true"#
+            )
+            .is_err()
+        );
+    }
+
     // two tiles in the bag searched in two parts (a page's two workers): each
     // part says it is one, and each candidate's draws from both are the whole
     // search's; a part with fewer than two tiles in the bag is refused
@@ -10368,12 +10427,12 @@ mod tests {
     fn an_endgame_with_two_tiles_in_the_bag_is_wolges_s_search() {
         let rack = [S, B, D, F, G, H, I];
         let others = [E, S, B, D, F, G, H, I, J];
-        let more = r#","model":"info_sets","exchanges":[0,0]"#;
+        let more = r#","model":"info_sets","exchanges":[0,0],"cuts":false"#;
         let handle = endgame_of("tiny-end-bag2", &rack, &others, more).unwrap();
         assert_eq!(endgame_step(handle, r#"{"ms":0}"#)["bag"], 2);
         do_endgame_free(handle).unwrap();
         let (name, model) = ("random_draws", endgame::PegModel::RandomDraws);
-        let more = format!(r#","model":"{name}","exchanges":[0,0]"#);
+        let more = format!(r#","model":"{name}","exchanges":[0,0],"cuts":false"#);
         let handle = endgame_of("tiny-end-bag2", &rack, &others, &more).unwrap();
         let before = endgame_step(handle, r#"{"ms":0}"#);
         assert_eq!(
