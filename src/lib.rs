@@ -1722,7 +1722,7 @@ impl SimPlay {
 // it. Whether to prune, said on every step; to prune, every prune_every
 // iterations each running candidate behind the leader by prune_z standard
 // errors split over the candidates still running, on the iterations both ran,
-// is pruned, a chance to win within prune_decided (0 to 0.5) of 0 or 1 having
+// is pruned, a chance to win within prune_decided (0 to 1) of 0 or 1 having
 // its game decided. And a play each candidate is compared with, on the
 // iterations both ran.
 #[derive(serde::Deserialize)]
@@ -1765,8 +1765,8 @@ fn pruning_of(req: &SimStepRequest) -> Result<Option<Pruning>, String> {
     let decided = req
         .prune_decided
         .ok_or("prune_decided: required to prune")?;
-    if !(0.0..=0.5).contains(&decided) {
-        return Err("prune_decided: must be from 0 to 0.5".into());
+    if !(0.0..=1.0).contains(&decided) {
+        return Err("prune_decided: must be from 0 to 1".into());
     }
     Ok(Some(Pruning { every, z, decided }))
 }
@@ -9554,6 +9554,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(below.z, -1.0);
+        let wide = asked(r#"{"prune":true,"prune_every":16,"prune_z":3.5,"prune_decided":0.6}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(wide.decided, 0.6);
         for (json, said) in [
             (r#""prune_z":3.5,"prune_decided":0.001"#, "prune_every: "),
             (r#""prune_every":16,"prune_decided":0.001"#, "prune_z: "),
@@ -9563,7 +9567,7 @@ mod tests {
                 "prune_every: ",
             ),
             (
-                r#""prune_every":16,"prune_z":3.5,"prune_decided":0.6"#,
+                r#""prune_every":16,"prune_z":3.5,"prune_decided":1.1"#,
                 "prune_decided: ",
             ),
             (
@@ -9659,7 +9663,7 @@ mod tests {
         let sim = far_ahead();
         let err = do_sim_step(
             sim,
-            &format!(r#"{{"iterations":1,{}}}"#, pruning(0.6)),
+            &format!(r#"{{"iterations":1,{}}}"#, pruning(1.1)),
             || 0.0,
         )
         .unwrap_err();
