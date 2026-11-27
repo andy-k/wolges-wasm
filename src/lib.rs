@@ -1377,15 +1377,13 @@ fn check_infer_play(rules: &CachedRules, play: &movegen::Play) -> Result<(), Str
 
 fn do_infer(req_str: &str) -> Result<String, String> {
     let req = serde_json::from_str::<InferRequest>(req_str).map_err(err_to_str)?;
-    if let SimPlay::Play {
-        bonus,
-        challenged_off,
-        ..
-    } = &req.play
-        && (*bonus != 0 || *challenged_off)
-    {
-        return Err("play: a bonus or a play challenged off says nothing of a leave".into());
-    }
+    let challenged_off = matches!(
+        req.play,
+        SimPlay::Play {
+            challenged_off: true,
+            ..
+        }
+    );
     let Tables {
         kwg,
         klv,
@@ -1435,12 +1433,34 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     )
     .map_err(wolges_err)?;
     drop(cached);
+    let placed = match &play {
+        movegen::Play::Place { word, .. } if challenged_off => (word.iter())
+            .filter(|&&tile| tile != 0)
+            .map(|&tile| if tile & 0x80 != 0 { 0 } else { tile })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    if !placed.is_empty() {
+        let mut held = infer::PackedLeaves::new();
+        let mut tiles = Vec::new();
+        for i in 0..leaves.len() {
+            tiles.clear();
+            tiles.extend_from_slice(leaves.leave(i));
+            tiles.extend_from_slice(&placed);
+            tiles.sort_unstable();
+            held.push(&tiles, leaves.weight(i)).map_err(wolges_err)?;
+        }
+        leaves = held;
+    }
     leaves.normalize();
     let listed = likeliest(&leaves, req.list);
     let count = leaves.len();
-    // the tiles unseen after the play: those it placed are on the board
+    // the tiles unseen after the play: those it placed are on the board, but
+    // for a play challenged off
     let mut unseen = kibitzer.available_tally.clone();
-    if let movegen::Play::Place { word, .. } = play {
+    if let movegen::Play::Place { word, .. } = play
+        && !challenged_off
+    {
         for &tile in word.iter().filter(|&&tile| tile != 0) {
             let tile = if tile & 0x80 != 0 { 0 } else { tile as usize };
             unseen[tile] = unseen[tile].saturating_sub(1);
@@ -8258,17 +8278,46 @@ mod tests {
             assert!(err.contains("fuzz"), "{err}");
         }
 
-        // a play with a bonus or challenged off is refused: neither says what
-        // was kept
-        for more in [r#""bonus":5"#, r#""challenged_off":true"#] {
-            let err = do_infer(&format!(
-                r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{},{more}}},"fuzz":{fuzz}}}"#,
-                infer_board(),
-                LATE_CATS.strip_suffix('}').unwrap()
-            ))
-            .unwrap_err();
-            assert!(err.starts_with("play: "), "{err}");
-        }
+        let adjusted = |more: &str| {
+            report(
+                &do_infer(&format!(
+                    r#"{{"rack":{rack:?},"board":{},"lexicon":"tiny-infer","leave":"noleave","rules":"CrosswordGame","play":{},{more}}},"fuzz":{fuzz},"list":{}}}"#,
+                    infer_board(),
+                    LATE_CATS.strip_suffix('}').unwrap(),
+                    u32::MAX
+                ))
+                .unwrap(),
+            )
+        };
+        let whole = report(&answer);
+        let plus5 = adjusted(r#""bonus":5"#);
+        assert_eq!(plus5["leaves"], whole["leaves"]);
+        let off = adjusted(r#""challenged_off":true"#);
+        let off = off["leaves"].as_array().unwrap();
+        let whole = whole["leaves"].as_array().unwrap();
+        assert_eq!(off.len(), whole.len());
+        let cats = match &play {
+            movegen::Play::Place { word, .. } => (word.iter())
+                .filter(|&&tile| tile != 0)
+                .map(|&tile| if tile & 0x80 != 0 { 0 } else { tile })
+                .collect::<Vec<_>>(),
+            movegen::Play::Exchange { .. } => unreachable!(),
+        };
+        let tiles_of = |leave: &serde_json::Value| {
+            serde_json::from_value::<Vec<u8>>(leave["tiles"].clone()).unwrap()
+        };
+        let mut held = off.iter().map(tiles_of).collect::<Vec<_>>();
+        let mut want = (whole.iter())
+            .map(|leave| {
+                let mut tiles = tiles_of(leave);
+                tiles.extend_from_slice(&cats);
+                tiles.sort_unstable();
+                tiles
+            })
+            .collect::<Vec<_>>();
+        held.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(held, want);
     }
 
     // a leave table of these leaves (in order) and values, laid out as a klv2

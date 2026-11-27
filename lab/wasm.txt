@@ -478,7 +478,8 @@ new inference's handle. The request:
   board: board, required. The board before the move.
   lexicon, leave, rules: strings, required.
   play: sim play, required. The move. An exchange's tiles are read only for how
-    many there are. A bonus or a play challenged off is refused.
+    many there are. A bonus changes nothing; for a play challenged off, each
+    leave holds the play's tiles as well, and they stay unseen.
   fuzz: number, 0 or more, required. How fast, in points of equity, a rack that
     could have made the move grows less likely as its best play beats the move
     by more: past the least that any such rack's best play beats the move by,
