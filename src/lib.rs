@@ -2654,10 +2654,25 @@ fn check_known(
     Ok(())
 }
 
-// the leaves the opponent may hold, weighted, from a request's known tiles (one
-// leave, certain) or its kept leaves (as infer answers them), never both; each
-// leave checked as known tiles are, each weight 0 or more, and the weights
-// summing to a number above 0 (a sim draws a leave from 0 up to their sum)
+fn holds_known(leave: &[u8], known: &[u8], left: &mut Vec<u8>) -> bool {
+    left.clear();
+    left.extend_from_slice(leave);
+    known
+        .iter()
+        .all(|tile| match left.iter().position(|t| t == tile) {
+            Some(at) => {
+                left.swap_remove(at);
+                true
+            }
+            None => false,
+        })
+}
+
+// the leaves the opponent may hold, weighted, from a request's known tiles
+// (one leave, certain), its kept leaves (as infer answers them), or both (the
+// kept leaves holding the known tiles); each leave checked as known tiles are,
+// each weight 0 or more, and the weights summing to a number above 0 (a sim
+// draws a leave from 0 up to their sum)
 fn kept_leaves_of(
     known: Vec<u8>,
     kept: Vec<WeightedLeave>,
@@ -2665,20 +2680,25 @@ fn kept_leaves_of(
     unseen: &[u8],
 ) -> Result<Vec<(Vec<u8>, f64)>, String> {
     if !known.is_empty() {
-        if !kept.is_empty() {
-            return Err("known, kept: give one or the other".into());
-        }
         check_known("known", &known, opponent_rack, unseen)?;
-        return Ok(vec![(known, 1.0)]);
+        if kept.is_empty() {
+            return Ok(vec![(known, 1.0)]);
+        }
     }
     let mut leaves = Vec::with_capacity(kept.len());
+    let mut left = Vec::new();
     for (i, leave) in kept.into_iter().enumerate() {
         let what = format!("kept[{i}]");
         if leave.weight < 0.0 {
             return Err(format!("{what}: weight must be 0 or more"));
         }
         check_known(&what, &leave.tiles, opponent_rack, unseen)?;
-        leaves.push((leave.tiles, leave.weight));
+        if holds_known(&leave.tiles, &known, &mut left) {
+            leaves.push((leave.tiles, leave.weight));
+        }
+    }
+    if !known.is_empty() && leaves.iter().all(|(_, weight)| *weight == 0.0) {
+        return Ok(vec![(known, 1.0)]);
     }
     let total = leaves.iter().map(|(_, weight)| weight).sum::<f64>();
     if !leaves.is_empty() && !(total > 0.0 && total.is_finite()) {
@@ -2710,9 +2730,6 @@ fn opponent_leaves(
             unseen,
         )?));
     };
-    if !known.is_empty() {
-        return Err("known, inferred: give one or the other".into());
-    }
     if !kept.is_empty() {
         return Err("kept, inferred: give one or the other".into());
     }
@@ -2740,7 +2757,19 @@ fn opponent_leaves(
             }
         }
     }
-    Ok(OpponentLeaves::Inferred(leaves))
+    if known.is_empty() {
+        return Ok(OpponentLeaves::Inferred(leaves));
+    }
+    check_known("known", &known, opponent_rack, unseen)?;
+    let mut left = Vec::new();
+    let held = (0..leaves.len())
+        .filter(|&i| leaves.weight(i) > 0.0 && holds_known(leaves.leave(i), &known, &mut left))
+        .map(|i| (leaves.leave(i).to_vec(), leaves.weight(i)))
+        .collect::<Vec<_>>();
+    if held.is_empty() {
+        return Ok(OpponentLeaves::Listed(vec![(known, 1.0)]));
+    }
+    Ok(OpponentLeaves::Listed(held))
 }
 
 // threats: what the opponent may play next, by score alone (no leave is read).
@@ -8150,6 +8179,32 @@ mod tests {
     // (the likeliest first; none unless asked); fuzz the caller's, never left
     // out; freed once
     #[test]
+    fn known_tiles_with_kept_leaves_keep_the_leaves_holding_them() {
+        let mut unseen = vec![0u8; 27];
+        for tile in [A, A, E, S, T] {
+            unseen[tile as usize] += 1;
+        }
+        let kept = |leaves: &[(&[u8], f64)]| {
+            (leaves.iter())
+                .map(|&(tiles, weight)| WeightedLeave {
+                    tiles: tiles.to_vec(),
+                    weight,
+                })
+                .collect::<Vec<_>>()
+        };
+        let both = kept(&[(&[A, E], 1.0), (&[S, T], 2.0), (&[A, S], 3.0)]);
+        assert_eq!(
+            kept_leaves_of(vec![A], both, 7, &unseen).unwrap(),
+            [(vec![A, E], 1.0), (vec![A, S], 3.0)]
+        );
+        let none = kept(&[(&[S, T], 2.0)]);
+        assert_eq!(
+            kept_leaves_of(vec![A], none, 7, &unseen).unwrap(),
+            [(vec![A], 1.0)]
+        );
+    }
+
+    #[test]
     fn infer_answers_as_wolges_infers() {
         let _one = one_infer_test();
         tiny_lexicon("tiny-infer");
@@ -8585,12 +8640,14 @@ mod tests {
 
         let err = do_sim_set(from_handle, &format!(r#"{{"inferred":{again}}}"#)).unwrap_err();
         assert!(err.starts_with("sim "), "{err}");
+        let both = do_sim_new(&format!(
+            r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-infer-sim","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":4,"known":[{E}],"inferred":{again}}}"#,
+            cat_board()
+        ))
+        .unwrap();
+        do_sim_free(both).unwrap();
         for (more, said) in [
             (format!(r#","inferred":{handle}"#), "inferred: inference "),
-            (
-                format!(r#","known":[{E}],"inferred":{again}"#),
-                "known, inferred",
-            ),
             (
                 format!(r#","kept":[{{"tiles":[0],"weight":1}}],"inferred":{again}"#),
                 "kept, inferred",
@@ -8652,9 +8709,8 @@ mod tests {
 
         tiny_lexicon("tiny-sim-kept-bad");
         for (more, said) in [
-            (format!(r#","known":[{E}],{kept}"#), "known, kept"),
             (
-                r#","kept":[{"tiles":[0],"weight":-1}]"#.into(),
+                String::from(r#","kept":[{"tiles":[0],"weight":-1}]"#),
                 "kept[0]: weight",
             ),
             (
