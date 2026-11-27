@@ -2504,7 +2504,6 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     let opponent = (turn + 1) % num_players;
     let (known, inferred) = match opponent_leaves(
         (req.known, req.kept, req.inferred),
-        num_players,
         rack_sizes[opponent],
         &kibitzer.available_tally,
     )? {
@@ -2616,18 +2615,14 @@ fn do_sim_new(req_str: &str) -> Result<u32, String> {
     Ok(handle)
 }
 
-// tiles known to be on the opponent's rack (a request's field what): a game of
-// two seats, no more than that rack holds, all among the tiles unseen (a tally)
+// tiles known to be on the opponent's rack (a request's field what): no more
+// than that rack holds, all among the tiles unseen (a tally)
 fn check_known(
     what: &str,
     known: &[u8],
-    num_players: usize,
     opponent_rack: usize,
     unseen: &[u8],
 ) -> Result<(), String> {
-    if num_players != 2 {
-        return Err(format!("{what}: only with two seats, found {num_players}"));
-    }
     if known.len() > opponent_rack {
         return Err(format!(
             "{what}: {} tiles, but the opponent's rack holds {opponent_rack}",
@@ -2655,7 +2650,6 @@ fn check_known(
 fn kept_leaves_of(
     known: Vec<u8>,
     kept: Vec<WeightedLeave>,
-    num_players: usize,
     opponent_rack: usize,
     unseen: &[u8],
 ) -> Result<Vec<(Vec<u8>, f64)>, String> {
@@ -2663,7 +2657,7 @@ fn kept_leaves_of(
         if !kept.is_empty() {
             return Err("known, kept: give one or the other".into());
         }
-        check_known("known", &known, num_players, opponent_rack, unseen)?;
+        check_known("known", &known, opponent_rack, unseen)?;
         return Ok(vec![(known, 1.0)]);
     }
     let mut leaves = Vec::with_capacity(kept.len());
@@ -2672,7 +2666,7 @@ fn kept_leaves_of(
         if leave.weight < 0.0 {
             return Err(format!("{what}: weight must be 0 or more"));
         }
-        check_known(&what, &leave.tiles, num_players, opponent_rack, unseen)?;
+        check_known(&what, &leave.tiles, opponent_rack, unseen)?;
         leaves.push((leave.tiles, leave.weight));
     }
     let total = leaves.iter().map(|(_, weight)| weight).sum::<f64>();
@@ -2694,7 +2688,6 @@ enum OpponentLeaves {
 // checked as known tiles are, none of them copied
 fn opponent_leaves(
     (known, kept, inferred): (Vec<u8>, Vec<WeightedLeave>, Option<u32>),
-    num_players: usize,
     opponent_rack: usize,
     unseen: &[u8],
 ) -> Result<OpponentLeaves, String> {
@@ -2702,7 +2695,6 @@ fn opponent_leaves(
         return Ok(OpponentLeaves::Listed(kept_leaves_of(
             known,
             kept,
-            num_players,
             opponent_rack,
             unseen,
         )?));
@@ -2716,11 +2708,6 @@ fn opponent_leaves(
     let leaves = (INFERENCES.lock().map_err(err_to_str)?.live.get(&handle))
         .cloned()
         .ok_or_else(|| format!("inferred: {}", no_inference(handle)))?;
-    if num_players != 2 && !leaves.is_empty() {
-        return Err(format!(
-            "inferred: only with two seats, found {num_players}"
-        ));
-    }
     let mut left = vec![0u8; unseen.len()];
     for i in 0..leaves.len() {
         let leave = leaves.leave(i);
@@ -3861,12 +3848,7 @@ fn threats_in_room(
     let unseen = &kibitzer.available_tally;
     let num_unseen = unseen.iter().map(|&count| count as usize).sum::<usize>();
     let opponent_rack = rack_size.min(num_unseen);
-    let opponent = opponent_leaves(
-        (req.known, req.kept, req.inferred),
-        game_config.num_players() as usize,
-        opponent_rack,
-        unseen,
-    )?;
+    let opponent = opponent_leaves((req.known, req.kept, req.inferred), opponent_rack, unseen)?;
     // each leave the opponent may keep, with its weight, read where it is held;
     // none (no kept leaves, or an inference holding none) deals the whole rack
     let held = match &opponent {
@@ -5054,7 +5036,6 @@ fn do_sim_set(handle: u32, req_str: &str) -> Result<String, String> {
                 req.kept.unwrap_or_default(),
                 req.inferred,
             ),
-            num_players,
             sim.game_state.players[opponent].rack.len(),
             &unseen,
         )?)
@@ -9213,6 +9194,70 @@ mod tests {
             .unwrap_err();
             assert!(err.starts_with("known: "), "{err}");
         }
+    }
+
+    #[test]
+    fn a_three_seat_sim_takes_what_the_next_seat_holds_alone() {
+        alone("tests::a_three_seat_sim_takes_what_the_next_seat_holds");
+    }
+
+    // its rules join the cached rules names, which the rules names test counts
+    #[test]
+    #[ignore = "run alone by a_three_seat_sim_takes_what_the_next_seat_holds_alone"]
+    fn a_three_seat_sim_takes_what_the_next_seat_holds() {
+        do_this_on_startup().unwrap();
+        let mut game_config = game_config::make_english_game_config();
+        let game_config::GameConfig::Static(rules) = &mut game_config;
+        rules.num_players = 3;
+        CACHED_GAME_CONFIG.write().unwrap().insert(
+            "three-seats".into(),
+            CachedRules::new(game_config).unwrap().into(),
+        );
+        tiny_lexicon("tiny-sim-known-three");
+        let request = |more: &str| {
+            format!(
+                r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-known-three","leave":"noleave","rules":"three-seats","scores":[0,0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":2,"seed":7{more}}}"#,
+                cat_board()
+            )
+        };
+        let handle = do_sim_new(&request(&format!(r#","known":[{E},{E},0]"#))).unwrap();
+        {
+            let mut sims = SIMS.lock().unwrap();
+            let sim = sims.live.get_mut(&handle).unwrap();
+            for iteration in 1..=20 {
+                sim.simmer.restore_prepared(&sim.pristine);
+                sim.simmer.reseed(iteration_seed(sim.seed, iteration));
+                sim.simmer
+                    .prepare_iteration(Some(move_picker::stratum_at(sim.seed, iteration)))
+                    .unwrap();
+                let rack = &sim.simmer.prepared_state().players[1].rack;
+                for (tile, count) in [(E, 2), (0, 1)] {
+                    assert!(
+                        rack.iter().filter(|&&t| t == tile).count() >= count,
+                        "{rack:?}"
+                    );
+                }
+            }
+        }
+        do_sim_free(handle).unwrap();
+        let kept = format!(r#","kept":[{{"tiles":[{E}],"weight":1}}]"#);
+        do_sim_free(do_sim_new(&request(&kept)).unwrap()).unwrap();
+        let inference = {
+            let _one = one_infer_test();
+            let answer = report(
+                &do_infer(&format!(
+                    r#"{{"rack":[{S},{E},{A},{T}],"board":{},"lexicon":"tiny-sim-known-three","leave":"noleave","rules":"CrosswordGame","play":{CATS},"fuzz":{}}}"#,
+                    cat_board(),
+                    infer::FUZZ
+                ))
+                .unwrap(),
+            );
+            assert!(answer["count"].as_u64().unwrap() > 0);
+            answer["handle"].as_u64().unwrap() as u32
+        };
+        let inferred = format!(r#","inferred":{inference}"#);
+        do_sim_free(do_sim_new(&request(&inferred)).unwrap()).unwrap();
+        do_infer_free(inference).unwrap();
     }
 
     #[test]

@@ -271,7 +271,7 @@ WHAT THE OPPONENT HOLDS
 
 sim_new, sim_set, threats, and threats_new take what the opponent holds in one
 of three fields, never in two of them. The opponent is the player after the one
-to move.
+to move, in a game of any number of seats.
 
   known: rack, optional ([] if left out). Tiles the opponent is known to hold.
   kept: array of weighted leaves, optional ([] if left out). Leaves the
