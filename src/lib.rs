@@ -7628,6 +7628,15 @@ mod tests {
         );
         let plays = report(&shortlist::do_plays(shortlist).unwrap());
         assert_eq!(plays.as_array().unwrap().len(), 3, "{plays}");
+        let cats = CATS.strip_suffix('}').unwrap();
+        assert_eq!(
+            shortlist::do_add(
+                shortlist,
+                &format!(r#"[{cats},"bonus":5}},{cats},"challenged_off":true}}]"#)
+            )
+            .unwrap(),
+            [1, 1]
+        );
         shortlist::do_free(shortlist).unwrap();
     }
 

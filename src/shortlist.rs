@@ -198,15 +198,6 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
         .map_err(|_| OUT_OF_MEMORY)?;
     for (i, requested) in requested.iter().enumerate() {
         let play = (|| {
-            if let SimPlay::Play {
-                bonus,
-                challenged_off,
-                ..
-            } = requested
-                && (*bonus != 0 || *challenged_off)
-            {
-                return Err("expected a play without challenge adjustments".into());
-            }
             let play = requested.to_play()?;
             if let movegen::Play::Exchange { tiles } = &play
                 && tiles.len() > shortlist.position.bag.len()

@@ -650,14 +650,14 @@ shortlist_new(request) makes a shortlist and answers its handle. The request:
 shortlist_add(handle, plays) adds plays to a shortlist and answers a
 Uint32Array of their ids, one for each play in the order given. plays is a JSON
 array of sim plays, each checked as sim_add checks one, and refused as well
-when a word it makes is not in the lexicon, when it gives a bonus or is
-challenged off, when its word holds -128, or when it exchanges more tiles than
-the bag holds, the bag being the tiles unseen less a full rack for each other
-player. A refused play refuses the whole call, which then adds none, the
-message naming it, as in plays[0]: play makes an invalid word. A placement's
-score is counted again from the board. A play is held as the scorer writes it,
-so a play given again, or written another way, answers the id it has. Ids count
-from 0 in the order the plays were first added, and never change.
+when a word it makes is not in the lexicon, when its word holds -128, or when
+it exchanges more tiles than the bag holds, the bag being the tiles unseen less
+a full rack for each other player. A refused play refuses the whole call, which
+then adds none, the message naming it, as in plays[0]: play makes an invalid
+word. A placement's score is counted again from the board, a bonus or a
+challenge left out. A play is held as the scorer writes it, so a play given
+again, or written another way, answers the id it has. Ids count from 0 in the
+order the plays were first added, and never change.
 
 shortlist_plays(handle) answers a JSON array of the shortlist's plays in id
 order, each a play as the scorer writes it, with its score. shortlist_new,
@@ -668,8 +668,7 @@ shortlist_free(handle) frees a shortlist and answers undefined, once no more
 plays are to be added to it and no more sims or endgames made with it. A sim or
 endgame given the shortlist keeps it, but a later sim_new or endgame_new cannot
 name it. A sim or endgame may be freed, letting go of its search, while its
-shortlist is kept for the next. Phonies, bonuses, and plays challenged off go
-to a sim by sim_add.
+shortlist is kept for the next. Phonies go to a sim by sim_add.
 
 
 SIMS
