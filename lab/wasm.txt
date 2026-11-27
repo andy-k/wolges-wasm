@@ -988,9 +988,9 @@ it stands. The request:
     empty bag, priority orders the moves first_moves_ms values.
     Left out or null, the step uses the priority endgame_prioritize saved, if
     any; given, even as [], it takes that one's place for this step alone.
-  draws_of: whole number, play, object, or null, optional; only with two or
-    more tiles in the bag. The candidate whose draws to give, by its place in
-    the answer's candidates, by its play as the answer gives it, or by
+  draws_of: whole number, play, object, or null, optional; with an empty bag
+    the answer as without it. The candidate whose draws to give, by its place
+    in the answer's candidates, by its play as the answer gives it, or by
     {"id":n}, its id in the endgame's shortlist. An id with no draws is refused
     ("draws_of: shortlist move 9 has no draws").
   draws_range: [from, to] or null, optional; only with draws_of. The draws from
@@ -1064,10 +1064,11 @@ Each candidate:
   value: its gain, in points, as the answer's value is the answer's play's.
   tiles: with one tile in the bag, as the answer's tiles, for this play.
   deals: with two or more tiles in the bag, the deals its value counts.
-  draws: given only for draws_of's candidate: for each way the tiles may lie,
-    an object of tiles, the bag's tiles; count, the deals that give them;
-    value, the play's gain then; and win, its chance to win then. With
-    "random_draws", drawn lists the same for each draw the play makes there.
+  draws: given only for draws_of's candidate: for each way the tiles may lie
+    (with one tile in the bag, each tile it may be), an object of tiles, the
+    bag's tiles; count, the deals that give them; value, the play's gain then;
+    and win, its chance to win then. With "random_draws", drawn lists the same
+    for each draw the play makes there.
   draws_total: with draws, how many ways there are in all; draws_range pages
     them.
   exact: true when its value is exact.
@@ -1083,17 +1084,16 @@ bag, when the last had no play, or the step's is exact, deeper, or worth more
 at the same depth; with tiles in the bag, always, as the search goes on from
 where it stopped. The depth never falls.
 
-endgame_step refuses first_moves_ms with tiles in the bag, draws_of with fewer
-than two tiles in the bag or naming no candidate, and draws_range without
-draws_of. A priority play whose word holds -128 or whose score is past 2147483
-points either way is refused, as for root_moves. Of these, only draws_of naming
-no candidate is refused after the step's solve, which stands; the others are
-refused before it, the endgame unchanged. A step throws out_of_memory where its
-priority, or the first-move values it keeps, do not fit, and it throws when the
-rules let scoreless turns go on without end in the position, the message saying
-it is not solvable. When the cap stopped the draws that draws_of asked for, the
-answer comes as without draws_of, with out_of_memory true and out_of_memory_in
-"draws".
+endgame_step refuses first_moves_ms with tiles in the bag, draws_of naming no
+candidate, and draws_range without draws_of. A priority play whose word holds
+-128 or whose score is past 2147483 points either way is refused, as for
+root_moves. Of these, only draws_of naming no candidate is refused after the
+step's solve, which stands; the others are refused before it, the endgame
+unchanged. A step throws out_of_memory where its priority, or the first-move
+values it keeps, do not fit, and it throws when the rules let scoreless turns
+go on without end in the position, the message saying it is not solvable. When
+the cap stopped the draws that draws_of asked for, the answer comes as without
+draws_of, with out_of_memory true and out_of_memory_in "draws".
 
 endgame_prioritize(handle, ids) saves a priority for every later step of an
 endgame: the plays named by ids, a Uint32Array of ids in its shortlist, in that

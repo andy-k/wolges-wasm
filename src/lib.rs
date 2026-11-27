@@ -5770,7 +5770,8 @@ impl Endgame {
             let Some(progress) = self.peg.as_ref() else {
                 return Vec::new();
             };
-            return (progress.answer_moves(places).iter())
+            let from = places.start;
+            let mut listed = (progress.answer_moves(places).iter())
                 .map(|valued| EndgameCandidate {
                     play: peg_play(&valued.play),
                     win: valued.win_pct,
@@ -5790,7 +5791,14 @@ impl Endgame {
                     exact: valued.exact,
                     cut: false,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            if let Some((at, draws, rows)) = draws
+                && let Some(candidate) = at.checked_sub(from).and_then(|at| listed.get_mut(at))
+            {
+                candidate.draws = Some(draws);
+                candidate.draws_total = Some(rows);
+            }
+            return listed;
         };
         let (_, deals) = progress.splits();
         let from = places.start;
@@ -5870,12 +5878,8 @@ impl Endgame {
     }
 
     // the candidate draws_of names, read as far as the step's solve cannot
-    // change it: refused with fewer than two tiles in the bag, its play taken
-    // from the shortlist or decoded
+    // change it, its play taken from the shortlist or decoded
     fn draws_named(&self, draws_of: DrawsOf) -> Result<DrawsNamed, String> {
-        if self.peg_bag.is_none() {
-            return Err("draws_of: only with two or more in the bag".into());
-        }
         Ok(match draws_of {
             DrawsOf::Index(i) => DrawsNamed::Index(i),
             DrawsOf::Id { id } => {
@@ -5908,8 +5912,38 @@ impl Endgame {
     }
 
     fn draws_place(&self, play: &movegen::Play) -> (Option<usize>, usize) {
-        self.peg_bag.as_ref().map_or((None, 0), |progress| {
-            (progress.answer_place(play), progress.answer_total())
+        if let Some(progress) = self.peg_bag.as_ref() {
+            return (progress.answer_place(play), progress.answer_total());
+        }
+        let Some(progress) = self.peg.as_ref() else {
+            return (None, 0);
+        };
+        let at = (progress.answer_moves(0..usize::MAX).iter()).position(|valued| {
+            match (&valued.play, play) {
+                (endgame::PegMove::Pass, movegen::Play::Exchange { tiles }) => tiles.is_empty(),
+                (endgame::PegMove::Place(placed), _) => placed == play,
+                _ => false,
+            }
+        });
+        (at, progress.answer_total())
+    }
+
+    fn one_tile_draws(&self, row: usize) -> Vec<EndgameBagDraw> {
+        let lead = points(equity::Equity::new(self.lead));
+        self.peg.as_ref().map_or_else(Vec::new, |progress| {
+            (progress.hypotheses(Some(row)))
+                .map(|(tile, count, margin)| EndgameBagDraw {
+                    tiles: vec![tile],
+                    count: u64::from(count),
+                    value: points(margin) - lead,
+                    win: match margin.raw().signum() {
+                        1 => 1.0,
+                        0 => 0.5,
+                        _ => 0.0,
+                    },
+                    drawn: Vec::new(),
+                })
+                .collect()
         })
     }
 
@@ -6973,7 +7007,8 @@ fn do_endgame_step(
     if let Some(ms) = req.first_moves_ms {
         endgame.value_first_moves(ms, clock, memory, priority)?;
     }
-    if req.brief && draws_of.is_none() && req.candidates_range.is_none() {
+    let no_draws = endgame.peg_bag.is_none() && endgame.peg.is_none();
+    if req.brief && (draws_of.is_none() || no_draws) && req.candidates_range.is_none() {
         let a = &endgame.answer;
         let brief = EndgameBrief {
             bag: a.bag,
@@ -6999,7 +7034,33 @@ fn do_endgame_step(
         }
         return endgame.answer_json(None);
     };
+    if no_draws {
+        return match req.candidates_range {
+            Some(range) => endgame.answer_page(range, None),
+            None => endgame.answer_json(None),
+        };
+    }
     let i = endgame.place_of(draws_of)?;
+    if let Some(progress) = endgame.peg.as_ref() {
+        let Some(valued) = progress.answer_moves(i..i.saturating_add(1)).pop() else {
+            return Err(format!(
+                "draws_of: {i} is no candidate of the {} with draws",
+                progress.answer_total()
+            ));
+        };
+        let mut draws = endgame.one_tile_draws(valued.row);
+        let total = draws.len();
+        let [from, to] = req
+            .draws_range
+            .unwrap_or([0, total])
+            .map(|at| at.min(total));
+        draws.truncate(to.max(from));
+        draws.drain(..from);
+        if let Some(range) = req.candidates_range {
+            return endgame.answer_page(range, Some((i, draws, total)));
+        }
+        return endgame.answer_json(Some((i, draws, total)));
+    }
     let listed = endgame.peg_bag.as_ref().map(|progress| {
         let total = progress.answer_total();
         (progress.answer_moves(i..i.saturating_add(1)).pop(), total)
@@ -10401,19 +10462,17 @@ mod tests {
     fn a_refused_step_leaves_its_endgame_unsolved() {
         let (rack, others) = ([S, E, A, T], [A, T, E]);
         let handle = endgame_of("tiny-end-refused-step", &rack, &others, "").unwrap();
-        for (request, error) in [
-            (
-                r#"{"ms":60000,"draws_of":0}"#,
-                "draws_of: only with two or more in the bag",
-            ),
-            (
-                r#"{"ms":60000,"draws_range":[0,1]}"#,
-                "draws_range: it pages draws_of's rows, so give draws_of",
-            ),
-        ] {
-            let refused = do_endgame_step(handle, request, ticking, held_bytes).unwrap_err();
-            assert_eq!(refused, error);
-        }
+        let refused = do_endgame_step(
+            handle,
+            r#"{"ms":60000,"draws_range":[0,1]}"#,
+            ticking,
+            held_bytes,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused,
+            "draws_range: it pages draws_of's rows, so give draws_of"
+        );
         let unsolved = endgame_step(handle, r#"{"ms":0}"#);
         assert_eq!(unsolved["exact"], false, "{unsolved}");
         assert_eq!(
@@ -10747,7 +10806,26 @@ mod tests {
             (answer["win"].as_f64().unwrap() - won).abs() < 1e-6,
             "{answer}"
         );
+        let drawn = endgame_step(handle, r#"{"ms":0,"draws_of":0}"#);
+        let draws = drawn["candidates"][0]["draws"].as_array().unwrap();
+        assert_eq!(drawn["candidates"][0]["draws_total"], tiles.len());
+        assert_eq!(draws.len(), tiles.len());
+        for (draw, tile) in draws.iter().zip(tiles) {
+            assert_eq!(draw["tiles"], serde_json::json!([tile["tile"]]));
+            assert_eq!(draw["count"], tile["count"]);
+            assert_eq!(draw["value"], tile["value"]);
+        }
+        let paged = endgame_step(handle, r#"{"ms":0,"draws_of":0,"draws_range":[1,2]}"#);
+        assert_eq!(paged["candidates"][0]["draws"][0], draws[1]);
         do_endgame_free(handle).unwrap();
+        let empty = endgame_of("tiny-end-bag", &[S, E, A, T], &[A, T, E], "").unwrap();
+        let plain = endgame_step(empty, r#"{"ms":60000}"#);
+        assert_eq!(endgame_step(empty, r#"{"ms":0,"draws_of":0}"#), plain);
+        assert_eq!(
+            endgame_step(empty, r#"{"ms":0,"brief":true,"draws_of":0}"#),
+            endgame_step(empty, r#"{"ms":0,"brief":true}"#)
+        );
+        do_endgame_free(empty).unwrap();
     }
 
     // a range of the candidates reads the whole answer's from the first to
