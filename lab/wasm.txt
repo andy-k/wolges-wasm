@@ -971,9 +971,10 @@ step to step.
 endgame_step(handle, request) solves the endgame for a time and answers where
 it stands. The request:
 
-  ms: number, 0 or more, required. The most milliseconds to solve; 0 solves
-    nothing and answers the last answer. An exact answer stays: a later step
-    solves nothing more.
+  ms: number, 0 or more, or null, optional. The most milliseconds to solve;
+    left out, no limit, the search runs to its end; 0 solves nothing and
+    answers the last answer. An exact answer stays: a later step solves nothing
+    more.
   first_moves_ms: number, 0 or more, or null, optional; only with an empty bag.
     After solving, value every first move as well, on the table the steps kept,
     in at most this many milliseconds more; the answer's candidates then list
@@ -1079,18 +1080,17 @@ bag, when the last had no play, or the step's is exact, deeper, or worth more
 at the same depth; with tiles in the bag, always, as the search goes on from
 where it stopped. The depth never falls.
 
-endgame_step refuses ms left out ("endgame_step: give ms"), first_moves_ms with
-tiles in the bag, draws_of with fewer than two tiles in the bag or naming no
-candidate, brief with draws_of or candidates_range, and draws_range without
-draws_of. A priority play whose word holds -128 or whose score is past 2147483
-points either way is refused, as for root_moves. Of these, only draws_of naming
-no candidate is refused after the step's solve, which stands; the others are
-refused before it, the endgame unchanged. A step throws out_of_memory where its
-priority, or the first-move values it keeps, do not fit, and it throws when the
-rules let scoreless turns go on without end in the position, the message saying
-it is not solvable. When the cap stopped the draws that draws_of asked for, the
-answer comes as without draws_of, with out_of_memory true and out_of_memory_in
-"draws".
+endgame_step refuses first_moves_ms with tiles in the bag, draws_of with fewer
+than two tiles in the bag or naming no candidate, brief with draws_of or
+candidates_range, and draws_range without draws_of. A priority play whose word
+holds -128 or whose score is past 2147483 points either way is refused, as for
+root_moves. Of these, only draws_of naming no candidate is refused after the
+step's solve, which stands; the others are refused before it, the endgame
+unchanged. A step throws out_of_memory where its priority, or the first-move
+values it keeps, do not fit, and it throws when the rules let scoreless turns
+go on without end in the position, the message saying it is not solvable. When
+the cap stopped the draws that draws_of asked for, the answer comes as without
+draws_of, with out_of_memory true and out_of_memory_in "draws".
 
 endgame_prioritize(handle, ids) saves a priority for every later step of an
 endgame: the plays named by ids, a Uint32Array of ids in its shortlist, in that

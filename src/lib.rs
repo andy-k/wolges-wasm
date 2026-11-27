@@ -5251,15 +5251,15 @@ struct EndgameNewRequest {
     cuts: Option<bool>,
 }
 
-// endgame_step: at most this many milliseconds; 0 reads the last answer. With
-// an empty bag, first_moves_ms asks for every first move's value too, on the
-// table the steps kept, in at most that many milliseconds more. With two tiles
-// or more in the bag, draws_of asks for the draws of the candidate it names
-// (DrawsOf). brief asks for the answer's state alone: no candidates, draws,
-// tiles or line. candidates_range [from, to] gives only the candidates from
-// the first to before the second (each past the last read as the last) and
-// candidates_total, how many there are in all, and the candidate draws_of
-// names, when it is not among them, as drawn; the search is the same
+// endgame_step: at most this many milliseconds (none: no limit); 0 reads the
+// last answer. With an empty bag, first_moves_ms asks for every first move's
+// value too, on the table the steps kept, in at most that many milliseconds
+// more. With two tiles or more in the bag, draws_of asks for the draws of the
+// candidate it names (DrawsOf). brief asks for the answer's state alone: no
+// candidates, draws, tiles or line. candidates_range [from, to] gives only the
+// candidates from the first to before the second (each past the last read as
+// the last) and candidates_total, how many there are in all, and the candidate
+// draws_of names, when it is not among them, as drawn; the search is the same
 #[derive(serde::Deserialize)]
 struct EndgameStepRequest {
     ms: Option<f64>,
@@ -5998,10 +5998,11 @@ impl Endgame {
         listed.sort_by_key(|row| standing(row).is_some());
     }
 
-    // one solve of at most ms on the clock, on the table earlier steps kept
+    // one solve of at most ms on the clock (none: no limit), on the table
+    // earlier steps kept
     fn solve(
         &mut self,
-        ms: f64,
+        ms: Option<f64>,
         clock: endgame::Clock,
         memory: fn() -> usize,
         priority: &[movegen::Play],
@@ -6027,7 +6028,7 @@ impl Endgame {
             None => {}
         }
         let limits = endgame::Limits {
-            time: Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+            time: ms.map(|ms| std::time::Duration::from_secs_f64(ms / 1000.0)),
             states: None,
             memory: cap,
             clock: Some(clock),
@@ -6901,9 +6902,9 @@ fn do_endgame_step(
 ) -> Result<String, String> {
     let req = serde_json::from_str::<EndgameStepRequest>(req_str).map_err(err_to_str)?;
     let ms = match req.ms {
-        Some(ms) if ms >= 0.0 && ms.is_finite() => ms,
+        Some(ms) if ms >= 0.0 && ms.is_finite() => Some(ms),
         Some(ms) => return Err(format!("ms: {ms} is not a time to run")),
-        None => return Err("endgame_step: give ms".into()),
+        None => None,
     };
     let mut endgames = ENDGAMES.lock().map_err(err_to_str)?;
     let endgame = endgames
@@ -6945,7 +6946,7 @@ fn do_endgame_step(
     let kept = endgame.priority.clone();
     let priority = inline.as_deref().or(kept.as_deref()).unwrap_or(&[]);
     // an exact answer stays: no solve can better it
-    if ms > 0.0 && !endgame.answer.exact {
+    if ms.is_none_or(|ms| ms > 0.0) && !endgame.answer.exact {
         endgame.solve(ms, clock, memory, priority)?;
     }
     if let Some(ms) = req.first_moves_ms {
@@ -11841,10 +11842,8 @@ mod tests {
             assert!(err.contains(&format!("missing field `{field}`")), "{err}");
         }
         let handle = endgame_of("tiny-end-refuse", &[S], &[A, T], "").unwrap();
-        assert_eq!(
-            do_endgame_step(handle, "{}", frozen, held_bytes).unwrap_err(),
-            "endgame_step: give ms"
-        );
+        let untimed = report(&do_endgame_step(handle, "{}", frozen, held_bytes).unwrap());
+        assert_eq!(untimed["exact"], true);
         assert_eq!(
             do_endgame_step(handle, r#"{"ms":-1}"#, frozen, held_bytes).unwrap_err(),
             "ms: -1 is not a time to run"
