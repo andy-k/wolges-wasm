@@ -1585,9 +1585,6 @@ pub fn prune_pays(req_str: String) -> Result<bool, JsValue> {
 
 fn do_prune_pays(req_str: &str) -> Result<bool, String> {
     let req = serde_json::from_str::<PrunePaysRequest>(req_str).map_err(err_to_str)?;
-    if req.uses == 0 {
-        return Err("uses: 1 or more".into());
-    }
     let game_config = (CACHED_GAME_CONFIG
         .read()
         .map_err(err_to_str)?
@@ -10473,7 +10470,7 @@ mod tests {
             };
             assert_eq!(pruned, late);
             assert_eq!(req(1), Ok(late));
-            assert!(req(0).is_err());
+            assert_eq!(req(0), req(1));
         }
         forget_late_kwg("tiny-prune-pays").unwrap();
     }

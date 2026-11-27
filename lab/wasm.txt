@@ -362,8 +362,8 @@ request:
 
   rules: string, required.
   board: board, required.
-  uses: whole number, 1 or more, required. How many searches will run on the
-    pruned graph.
+  uses: whole number, 0 or more, required. How many searches will run on the
+    pruned graph; 0 answers as 1.
 
 It answers true when the bag, which is the tiles off the board less a full rack
 for each player, holds at most 25 tiles for one use, or 28 for more, and at
