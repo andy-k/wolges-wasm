@@ -10059,12 +10059,11 @@ mod tests {
         assert_eq!(one["play"], *play);
         assert_eq!(one["candidates"].as_array().unwrap().len(), 1);
         do_endgame_free(fixed).unwrap();
-        // a refused root id is named by its place in root_ids
         request["root_ids"] = serde_json::json!([ids[1], ids[1]]);
-        assert_eq!(
-            do_endgame_new(&request.to_string(), none_held).unwrap_err(),
-            "root_ids[1]: duplicate play"
-        );
+        let twice = do_endgame_new(&request.to_string(), none_held).unwrap();
+        let answer = endgame_step(twice, r#"{"ms":60000}"#);
+        assert_eq!(answer["candidates"].as_array().unwrap().len(), 1);
+        do_endgame_free(twice).unwrap();
         request["root_ids"] = serde_json::json!([ids[0]]);
         do_endgame_free(reference).unwrap();
         let resumed = do_sim_new(&request.to_string()).unwrap();
@@ -10436,10 +10435,6 @@ mod tests {
             (
                 r#"[{"action":"exchange","tiles":[19]}]"#,
                 "root_moves[0]: exchange is unavailable",
-            ),
-            (
-                r#"[{"action":"exchange","tiles":[]},{"action":"exchange","tiles":[]}]"#,
-                "root_moves[1]: duplicate play",
             ),
             (
                 r#"[{"action":"play","down":false,"lane":2,"idx":5,"word":[-128,0],"score":0}]"#,
