@@ -5256,10 +5256,11 @@ struct EndgameNewRequest {
 // value too, on the table the steps kept, in at most that many milliseconds
 // more. With two tiles or more in the bag, draws_of asks for the draws of the
 // candidate it names (DrawsOf). brief asks for the answer's state alone: no
-// candidates, draws, tiles or line. candidates_range [from, to] gives only the
-// candidates from the first to before the second (each past the last read as
-// the last) and candidates_total, how many there are in all, and the candidate
-// draws_of names, when it is not among them, as drawn; the search is the same
+// candidates, draws, tiles, or line, unless draws_of or candidates_range asks.
+// candidates_range [from, to] gives only the candidates from the first to
+// before the second (each past the last read as the last) and
+// candidates_total, how many there are in all, and the candidate draws_of
+// names, when it is not among them, as drawn; the search is the same
 #[derive(serde::Deserialize)]
 struct EndgameStepRequest {
     ms: Option<f64>,
@@ -6923,14 +6924,6 @@ fn do_endgame_step(
     }
     // the answer asked for, checked before the step's solve, so that a step
     // refused for it changes nothing
-    if req.brief {
-        if req.draws_of.is_some() {
-            return Err("brief: no draws come with it, so not with draws_of".into());
-        }
-        if req.candidates_range.is_some() {
-            return Err("brief: no candidates come with it, so not with candidates_range".into());
-        }
-    }
     if req.draws_of.is_none() && req.draws_range.is_some() {
         return Err("draws_range: it pages draws_of's rows, so give draws_of".into());
     }
@@ -6952,7 +6945,7 @@ fn do_endgame_step(
     if let Some(ms) = req.first_moves_ms {
         endgame.value_first_moves(ms, clock, memory, priority)?;
     }
-    if req.brief {
+    if req.brief && draws_of.is_none() && req.candidates_range.is_none() {
         let a = &endgame.answer;
         let brief = EndgameBrief {
             bag: a.bag,
@@ -10329,16 +10322,16 @@ mod tests {
                 r#"{"ms":60000,"draws_range":[0,1]}"#,
                 "draws_range: it pages draws_of's rows, so give draws_of",
             ),
-            (
-                r#"{"ms":60000,"brief":true,"candidates_range":[0,1]}"#,
-                "brief: no candidates come with it, so not with candidates_range",
-            ),
         ] {
             let refused = do_endgame_step(handle, request, ticking, held_bytes).unwrap_err();
             assert_eq!(refused, error);
         }
         let unsolved = endgame_step(handle, r#"{"ms":0}"#);
         assert_eq!(unsolved["exact"], false, "{unsolved}");
+        assert_eq!(
+            endgame_step(handle, r#"{"ms":0,"brief":true,"candidates_range":[0,1]}"#),
+            endgame_step(handle, r#"{"ms":0,"candidates_range":[0,1]}"#)
+        );
         assert_eq!(endgame_step(handle, r#"{"ms":60000}"#)["exact"], true);
         do_endgame_free(handle).unwrap();
     }
@@ -10669,7 +10662,7 @@ mod tests {
 
     // a range of the candidates reads the whole answer's from the first to
     // before the second, the rest of it the same, with the count of all; a
-    // draws_of within the range comes with it; brief takes no range
+    // draws_of within the range comes with it; brief gives the range too
     #[test]
     fn a_range_of_candidates_reads_that_slice_of_the_whole() {
         let rack = [S, B, D, F, G, H, I];
@@ -10734,8 +10727,10 @@ mod tests {
         );
         // the whole answer as it was, after the pages
         assert_eq!(endgame_step(handle, r#"{"ms":0}"#), whole);
-        let brief = r#"{"ms":0,"brief":true,"candidates_range":[0,1]}"#;
-        assert!(do_endgame_step(handle, brief, frozen, held_bytes).is_err());
+        assert_eq!(
+            endgame_step(handle, r#"{"ms":0,"brief":true,"candidates_range":[0,1]}"#),
+            endgame_step(handle, r#"{"ms":0,"candidates_range":[0,1]}"#)
+        );
         do_endgame_free(handle).unwrap();
     }
 
@@ -10985,9 +10980,9 @@ mod tests {
             state.as_object_mut().unwrap().remove(key);
         }
         assert_eq!(brief, state, "{name}");
-        let both = r#"{"ms":0,"brief":true,"draws_of":0}"#;
-        assert!(
-            do_endgame_step(handle, both, frozen, held_bytes).is_err(),
+        assert_eq!(
+            endgame_step(handle, r#"{"ms":0,"brief":true,"draws_of":0}"#),
+            endgame_step(handle, r#"{"ms":0,"draws_of":0}"#),
             "{name}"
         );
         assert_eq!(answer["play"], candidates[0]["play"], "{name}");
