@@ -179,14 +179,13 @@ pub(crate) fn do_add(handle: u32, plays_str: &str) -> Result<Vec<u32>, String> {
     let requested = serde_json::from_str::<Vec<SimPlay>>(plays_str).map_err(err_to_str)?;
     let shared = get(handle)?;
     let mut shortlist = shared.lock().map_err(err_to_str)?;
-    let snapshot = &movegen::BoardSnapshot {
-        board_tiles: &shortlist.position.board_tiles,
-        game_config: &shortlist.rules,
-        vocab: &movegen::Vocab::lean(&shortlist.kwg.kwg),
-        anagrams: None,
-        rack_lengths: None,
-        klv: &shortlist.rules.no_leaves,
-    };
+    let vocab_view = movegen::Vocab::bare(&shortlist.kwg.kwg);
+    let snapshot = &movegen::BoardSnapshot::new(
+        &shortlist.position.board_tiles,
+        &shortlist.rules,
+        &vocab_view,
+        &shortlist.rules.no_leaves,
+    );
     let mut room = Taken::<PlayScoreRoom>::from(&shortlist.rules.play_score_rooms)?;
     let scorer = &mut room.ps;
     let mut plays = Vec::new();

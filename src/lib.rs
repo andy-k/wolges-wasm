@@ -718,14 +718,9 @@ fn do_analyze(req: AnalyzeRequest, kwg: &CachedKwg) -> Result<String, String> {
         .map_err(wolges_err)?;
 
     let mut move_generator = game_config.lend()?;
-    let board_snapshot = &movegen::BoardSnapshot {
-        board_tiles: &kibitzer.board_tiles,
-        game_config: &game_config,
-        vocab: &movegen::Vocab::lean(&kwg.kwg),
-        anagrams: None,
-        rack_lengths: None,
-        klv: &klv.klv,
-    };
+    let vocab_view = movegen::Vocab::bare(&kwg.kwg);
+    let board_snapshot =
+        &movegen::BoardSnapshot::new(&kibitzer.board_tiles, &game_config, &vocab_view, &klv.klv);
 
     let mut refused = false;
     {
@@ -874,14 +869,9 @@ fn do_play_score(req: ScoreRequest, kwg: &CachedKwg) -> Result<String, JsValue> 
     game_state.players[0].rack.clear();
     game_state.players[0].rack.extend(&req.rack);
 
-    let board_snapshot = &movegen::BoardSnapshot {
-        board_tiles: &kibitzer.board_tiles,
-        game_config: &game_config,
-        vocab: &movegen::Vocab::lean(&kwg.kwg),
-        anagrams: None,
-        rack_lengths: None,
-        klv: &klv.klv,
-    };
+    let vocab_view = movegen::Vocab::bare(&kwg.kwg);
+    let board_snapshot =
+        &movegen::BoardSnapshot::new(&kibitzer.board_tiles, &game_config, &vocab_view, &klv.klv);
 
     let answer = ScoredPlaysJson {
         plays: &req.plays,
@@ -1113,14 +1103,12 @@ fn do_hooks(req_str: &str) -> Result<String, String> {
     // run across one, each 0 when no tile is beside it that way
     let mut hooks = vec![(0u64, 0u64); kibitzer.board_tiles.len()];
     game_config.lend()?.gen_hooks(
-        &movegen::BoardSnapshot {
-            board_tiles: &kibitzer.board_tiles,
-            game_config: &game_config,
-            vocab: &movegen::Vocab::lean(&kwg.kwg),
-            anagrams: None,
-            rack_lengths: None,
-            klv: &game_config.no_leaves,
-        },
+        &movegen::BoardSnapshot::new(
+            &kibitzer.board_tiles,
+            &game_config,
+            &movegen::Vocab::bare(&kwg.kwg),
+            &game_config.no_leaves,
+        ),
         |idx, down, across| hooks[idx] = (down, across),
     );
     let alphabet_len = game_config.alphabet().len();
@@ -1396,14 +1384,12 @@ fn do_infer(req_str: &str) -> Result<String, String> {
     let mut leaves = infer::kept_leaves_packed_lean(
         tables,
         &mut move_generator,
-        &movegen::BoardSnapshot {
-            board_tiles: &kibitzer.board_tiles,
-            game_config: &game_config,
-            vocab: &movegen::Vocab::lean(&kwg.kwg),
-            anagrams: None,
-            rack_lengths: None,
-            klv: &klv.klv,
-        },
+        &movegen::BoardSnapshot::new(
+            &kibitzer.board_tiles,
+            &game_config,
+            &movegen::Vocab::bare(&kwg.kwg),
+            &klv.klv,
+        ),
         &req.rack,
         &play,
         infer::InferOptions {
@@ -1900,11 +1886,10 @@ fn rollout(
     play: &movegen::Play,
     challenged_off: bool,
 ) -> Result<(f64, i32, f64, i32, i32), String> {
-    let no_tables = &anagrams::ArmTables::None;
     let game_ended = if challenged_off {
-        simmer.simulate_lean_challenged_off(game_config, graphs, no_tables, klv)
+        simmer.simulate_lean_challenged_off(game_config, graphs, klv)
     } else {
-        simmer.simulate_lean(game_config, graphs, no_tables, klv, play)
+        simmer.simulate_lean(game_config, graphs, klv, play)
     }
     .map_err(wolges_err)?;
     let final_spread = simmer.final_equity_spread().map_err(wolges_err)?;
@@ -1957,14 +1942,13 @@ impl Sim {
         if challenged_off && bonus != 0 {
             return Err("a play challenged off scores nothing, so takes no bonus".into());
         }
-        let board_snapshot = &movegen::BoardSnapshot {
-            board_tiles: &self.game_state.board_tiles,
-            game_config: &self.game_config,
-            vocab: &movegen::Vocab::lean(&self.kwg.kwg),
-            anagrams: None,
-            rack_lengths: None,
-            klv: &self.klv.klv,
-        };
+        let vocab_view = movegen::Vocab::bare(&self.kwg.kwg);
+        let board_snapshot = &movegen::BoardSnapshot::new(
+            &self.game_state.board_tiles,
+            &self.game_config,
+            &vocab_view,
+            &self.klv.klv,
+        );
         let mut taken = Taken::<PlayScoreRoom>::from(&self.game_config.play_score_rooms)?;
         let ps = &mut taken.ps;
         let play = sim_play.to_play()?;
@@ -2013,16 +1997,16 @@ impl Sim {
     ) -> Result<u64, String> {
         let rack_size = self.game_config.rack_size();
         let mut stepped = 0;
-        let memory = self.memory;
+        let memory = self.memory.clone();
         // the rollouts grow within the step's cap
-        self.simmer.begin_within(memory);
+        self.simmer.begin_within(memory.clone());
         while stepped < max
             && !self.out_of_memory
             && self.candidates.iter().any(|c| c.state == SimState::Running)
             && !out_of_time()
         {
             // no room left under the cap: out of memory
-            if memory.is_some_and(|memory| !memory.has_room(1)) {
+            if memory.as_ref().is_some_and(|memory| !memory.has_room(1)) {
                 self.out_of_memory = true;
                 break;
             }
@@ -2053,7 +2037,7 @@ impl Sim {
             // each rollout's row and plies kept within the cap; an iteration
             // whose rollouts were refused room is out of memory, uncounted
             let mut refused = false;
-            let graphs = &movegen::Vocab::lean(&self.kwg.kwg);
+            let graphs = &movegen::Vocab::bare(&self.kwg.kwg);
             for candidate in &self.candidates {
                 if candidate.state != SimState::Running {
                     continue;
@@ -4112,14 +4096,13 @@ impl Threats {
         if self.pool.is_empty() {
             return Ok(Some(0));
         }
-        let board_snapshot = movegen::BoardSnapshot {
-            board_tiles: &self.board_tiles,
-            game_config: &self.game_config,
-            vocab: &movegen::Vocab::lean(&self.kwg.kwg),
-            anagrams: None,
-            rack_lengths: None,
-            klv: &self.game_config.no_leaves,
-        };
+        let vocab_view = movegen::Vocab::bare(&self.kwg.kwg);
+        let board_snapshot = movegen::BoardSnapshot::new(
+            &self.board_tiles,
+            &self.game_config,
+            &vocab_view,
+            &self.game_config.no_leaves,
+        );
         let cols = self.cols;
         let jumbled = matches!(
             self.game_config.game_rules(),
@@ -4869,14 +4852,12 @@ impl Sim {
         };
         let equity = ps
             .compute_equity(
-                &movegen::BoardSnapshot {
-                    board_tiles: &self.game_state.board_tiles,
-                    game_config: &self.game_config,
-                    vocab: &movegen::Vocab::lean(&self.kwg.kwg),
-                    anagrams: None,
-                    rack_lengths: None,
-                    klv: &self.klv.klv,
-                },
+                &movegen::BoardSnapshot::new(
+                    &self.game_state.board_tiles,
+                    &self.game_config,
+                    &movegen::Vocab::bare(&self.kwg.kwg),
+                    &self.klv.klv,
+                ),
                 &self.game_state,
                 play,
                 move_filter::LEAVE_SCALE_DENOM,
@@ -5406,16 +5387,7 @@ struct EndgamePly {
     value: f64,
 }
 
-// a tile the bag may hold: how many of it are unseen, and the play's gain if it
-// is the one in the bag, in points
-#[derive(serde::Serialize)]
-struct EndgameBagTile {
-    tile: u8,
-    count: u32,
-    value: f64,
-}
-
-// tiles the bag may hold, with two or more in it: the deals that give them, the
+// tiles the bag may hold: the deals that give them, the
 // play's gain if they are the bag's, in points, and its chance to win then;
 // with the model of random draws, the tiles the play then draws, each draw with
 // the same (drawn: its deals within the set, its gain, its chance)
@@ -5439,8 +5411,6 @@ struct EndgameCandidate {
     play: kibitzer::JsonPlay,
     win: f64,
     value: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tiles: Option<Vec<EndgameBagTile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     draws: Option<Vec<EndgameBagDraw>>,
     // with two or more in the bag, the deals its draws count
@@ -5509,8 +5479,6 @@ struct EndgameAnswer {
     #[serde(skip_serializing_if = "Option::is_none")]
     win: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tiles: Option<Vec<EndgameBagTile>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     candidates: Option<Vec<EndgameCandidate>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     endgames: Option<u64>,
@@ -5540,9 +5508,8 @@ struct Endgame {
     priority: Option<std::sync::Arc<[movegen::Play]>>,
     game_config: std::sync::Arc<CachedRules>,
     kwg: std::sync::Arc<EndgameGraph>, // with its run letters, found as it was made
-    arm_tables: std::sync::Arc<anagrams::ArmTables>,
-    lexicon: String, // the lexicon its graph was pruned from
-    rules: String,   // and the rules it was asked of
+    lexicon: String,                   // the lexicon its graph was pruned from
+    rules: String,                     // and the rules it was asked of
     board_tiles: Vec<u8>,
     rack: Vec<u8>,
     unseen: Vec<u8>,
@@ -5563,7 +5530,6 @@ struct Endgame {
     table: Option<endgame::KeptTable>,
     // the solver earlier steps kept, taken apart from what it borrows
     solver: Option<endgame::KeptSolver<kwg::Node24, u32, false, false>>,
-    peg: Option<endgame::PegProgress>,
     finished: Option<(i8, equity::Equity)>, // an empty bag's deepest pass done, its value
     nodes: u64,                             // the nodes an empty bag's steps searched
     answer: EndgameAnswer,
@@ -5652,7 +5618,6 @@ macro_rules! step_solver {
             Some(kept) => endgame::EndgameSolver::with_kept(
                 &$endgame.game_config,
                 $vocab,
-                &$endgame.arm_tables,
                 $endgame.kwg.run_letters()?,
                 kept,
             )
@@ -5668,7 +5633,6 @@ macro_rules! step_solver {
                 >::with_generator_within(
                     &$endgame.game_config,
                     $vocab,
-                    &$endgame.arm_tables,
                     $endgame.kwg.run_letters()?,
                     movegen,
                     (&$endgame.game_config.no_leaves, $memory),
@@ -5717,10 +5681,10 @@ impl Endgame {
     ) -> Result<Result<endgame::PegBagRows, endgame::PegBagRowsMissing>, String> {
         let cap = self.cap(memory);
         let Some(progress) = self.peg_bag.as_mut() else {
-            return Err("draws_of: only with two or more in the bag".into());
+            return Err("draws_of: only with tiles in the bag".into());
         };
-        let vocab = movegen::Vocab::lean(self.kwg.kwg());
-        let Some(mut solver) = step_solver!(self, &vocab, cap) else {
+        let vocab = movegen::Vocab::bare(self.kwg.kwg());
+        let Some(mut solver) = step_solver!(self, &vocab, cap.clone()) else {
             return Ok(Err(endgame::PegBagRowsMissing::Stopped {
                 out_of_memory: true,
             }));
@@ -5753,38 +5717,7 @@ impl Endgame {
     ) -> Vec<EndgameCandidate> {
         let lead = points(equity::Equity::new(self.lead));
         let Some(progress) = self.peg_bag.as_ref() else {
-            let Some(progress) = self.peg.as_ref() else {
-                return Vec::new();
-            };
-            let from = places.start;
-            let mut listed = (progress.answer_moves(places).iter())
-                .map(|valued| EndgameCandidate {
-                    play: peg_play(&valued.play),
-                    win: valued.win_pct,
-                    value: Some(points(valued.expected_margin) - lead),
-                    tiles: Some(
-                        (progress.hypotheses(Some(valued.row)))
-                            .map(|(tile, count, margin)| EndgameBagTile {
-                                tile,
-                                count,
-                                value: points(margin) - lead,
-                            })
-                            .collect(),
-                    ),
-                    draws: None,
-                    deals: None,
-                    draws_total: None,
-                    exact: valued.exact,
-                    cut: false,
-                })
-                .collect::<Vec<_>>();
-            if let Some((at, draws, rows)) = draws
-                && let Some(candidate) = at.checked_sub(from).and_then(|at| listed.get_mut(at))
-            {
-                candidate.draws = Some(draws);
-                candidate.draws_total = Some(rows);
-            }
-            return listed;
+            return Vec::new();
         };
         let (_, deals) = progress.splits();
         let from = places.start;
@@ -5793,7 +5726,6 @@ impl Endgame {
                 play: (&valued.play).into(),
                 win: valued.win_pct,
                 value: (valued.expected_margin).map(|margin| points(margin) - lead),
-                tiles: None,
                 draws: None,
                 deals: Some(deals),
                 draws_total: None,
@@ -5816,7 +5748,7 @@ impl Endgame {
         &mut self,
         draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
     ) -> Result<String, String> {
-        if self.peg_bag.is_none() && self.peg.is_none() {
+        if self.peg_bag.is_none() {
             return serde_json::to_string(&self.answer).map_err(err_to_str);
         }
         let listed = self.listed(0..usize::MAX, draws);
@@ -5834,11 +5766,10 @@ impl Endgame {
         range: [usize; 2],
         draws: Option<(usize, Vec<EndgameBagDraw>, usize)>,
     ) -> Result<String, String> {
-        let total = match (&self.peg_bag, &self.peg) {
-            (Some(progress), _) => progress.answer_total(),
-            (None, Some(progress)) => progress.answer_total(),
-            (None, None) => return page_json(&mut self.answer, range),
+        let Some(progress) = &self.peg_bag else {
+            return page_json(&mut self.answer, range);
         };
+        let total = progress.answer_total();
         let [from, to] = range.map(|at| at.min(total));
         let places = from..to.max(from);
         let (inside, outside) = match draws {
@@ -5901,36 +5832,7 @@ impl Endgame {
         if let Some(progress) = self.peg_bag.as_ref() {
             return (progress.answer_place(play), progress.answer_total());
         }
-        let Some(progress) = self.peg.as_ref() else {
-            return (None, 0);
-        };
-        let at = (progress.answer_moves(0..usize::MAX).iter()).position(|valued| {
-            match (&valued.play, play) {
-                (endgame::PegMove::Pass, movegen::Play::Exchange { tiles }) => tiles.is_empty(),
-                (endgame::PegMove::Place(placed), _) => placed == play,
-                _ => false,
-            }
-        });
-        (at, progress.answer_total())
-    }
-
-    fn one_tile_draws(&self, row: usize) -> Vec<EndgameBagDraw> {
-        let lead = points(equity::Equity::new(self.lead));
-        self.peg.as_ref().map_or_else(Vec::new, |progress| {
-            (progress.hypotheses(Some(row)))
-                .map(|(tile, count, margin)| EndgameBagDraw {
-                    tiles: vec![tile],
-                    count: u64::from(count),
-                    value: points(margin) - lead,
-                    win: match margin.raw().signum() {
-                        1 => 1.0,
-                        0 => 0.5,
-                        _ => 0.0,
-                    },
-                    drawn: Vec::new(),
-                })
-                .collect()
-        })
+        (None, 0)
     }
 
     // the side to move's rack and the other's, by seat
@@ -5955,8 +5857,8 @@ impl Endgame {
     ) -> Result<u8, String> {
         if self.root_plays.is_empty() {
             let cap = self.cap(memory);
-            let vocab = movegen::Vocab::lean(self.kwg.kwg());
-            let Some(solver) = step_solver!(self, &vocab, cap) else {
+            let vocab = movegen::Vocab::bare(self.kwg.kwg());
+            let Some(solver) = step_solver!(self, &vocab, cap.clone()) else {
                 return Err(OUT_OF_MEMORY.into());
             };
             let mut solver = solver.with_root_moves(self.root_moves.as_ref());
@@ -6009,14 +5911,12 @@ impl Endgame {
             state.bag.set_from_iter([]);
             Some(Some(
                 endgame::RootMoves::checked(
-                    &movegen::BoardSnapshot {
-                        board_tiles: &state.board_tiles,
-                        game_config: &self.game_config,
-                        vocab: &movegen::Vocab::lean(self.kwg.kwg()),
-                        anagrams: None,
-                        rack_lengths: None,
-                        klv: &self.game_config.no_leaves,
-                    },
+                    &movegen::BoardSnapshot::new(
+                        &state.board_tiles,
+                        &self.game_config,
+                        &movegen::Vocab::bare(self.kwg.kwg()),
+                        &self.game_config.no_leaves,
+                    ),
                     &state,
                     running,
                 )
@@ -6079,8 +5979,8 @@ impl Endgame {
             return Ok(());
         }
         let cap = self.cap(memory);
-        let vocab = movegen::Vocab::lean(self.kwg.kwg());
-        let Some(solver) = step_solver!(self, &vocab, cap) else {
+        let vocab = movegen::Vocab::bare(self.kwg.kwg());
+        let Some(solver) = step_solver!(self, &vocab, cap.clone()) else {
             self.answer.out_of_memory = true;
             return Ok(());
         };
@@ -6137,54 +6037,6 @@ impl Endgame {
                 depth: Some(peg.depth),
                 line: None,
                 win: valued.then_some(peg.win_pct),
-                tiles: None,
-                // listed from the search as a read asks (listed)
-                candidates: Some(Vec::new()),
-                endgames: Some(endgames),
-                moves: progress.moves().map(|(valued, of)| [valued, of]),
-            }
-        } else if let Some(progress) = self.peg.as_mut() {
-            let peg = solver.resume_peg_one_in_bag_best(progress, &limits, 1);
-            let peg = peg
-                .map_err(wolges_err)
-                .and_then(|peg| peg.map_err(|unsupported| unsupported.to_string()));
-            let peg = match peg {
-                Ok(peg) => peg,
-                Err(e) => {
-                    self.table = Some(solver.take_table());
-                    self.solver = Some(solver.into_kept());
-                    return Err(e);
-                }
-            };
-            // the search's margins are the leads the game ends with; none yet
-            // when a limit stopped it before a pass valued every tile, as
-            // before a step
-            let valued = !progress.hypotheses(peg.row).is_empty();
-            let value = valued.then(|| points(peg.expected_margin) - lead);
-            let (endgames, nodes) = progress.searched();
-            EndgameAnswer {
-                part: None,
-                out_of_memory: peg.out_of_memory,
-                out_of_memory_in: None,
-                bag: 1,
-                steps,
-                nodes,
-                exact: peg.exact,
-                play: peg.best_move.as_ref().map(peg_play),
-                value,
-                spread: lead + value.unwrap_or(0.0),
-                depth: Some(peg.depth),
-                line: None,
-                win: valued.then_some(peg.win_pct),
-                tiles: Some(
-                    (progress.hypotheses(peg.row))
-                        .map(|(tile, count, margin)| EndgameBagTile {
-                            tile,
-                            count,
-                            value: points(margin) - lead,
-                        })
-                        .collect(),
-                ),
                 // listed from the search as a read asks (listed)
                 candidates: Some(Vec::new()),
                 endgames: Some(endgames),
@@ -6246,7 +6098,6 @@ impl Endgame {
                         .collect(),
                 ),
                 win: None,
-                tiles: None,
                 candidates: None,
                 endgames: None,
                 moves: None,
@@ -6283,8 +6134,8 @@ impl Endgame {
             return Ok(());
         }
         let cap = self.cap(memory);
-        let vocab = movegen::Vocab::lean(self.kwg.kwg());
-        let Some(solver) = step_solver!(self, &vocab, cap) else {
+        let vocab = movegen::Vocab::bare(self.kwg.kwg());
+        let Some(solver) = step_solver!(self, &vocab, cap.clone()) else {
             self.answer.out_of_memory = true;
             return Ok(());
         };
@@ -6339,7 +6190,6 @@ impl Endgame {
                         0.5
                     },
                     value: Some(value),
-                    tiles: None,
                     draws: None,
                     deals: None,
                     draws_total: None,
@@ -6445,17 +6295,6 @@ fn json_play_hash(hasher: &fash::MyHasherDefault, play: &kibitzer::JsonPlay) -> 
     }
 }
 
-// a move of a search with a tile in the bag, as the page reads it (a pass as an
-// exchange of no tiles)
-fn peg_play(play: &endgame::PegMove) -> kibitzer::JsonPlay {
-    match play {
-        endgame::PegMove::Pass => kibitzer::JsonPlay::Exchange {
-            tiles: Vec::new().into(),
-        },
-        endgame::PegMove::Place(play) => play.into(),
-    }
-}
-
 // a new endgame's handle
 #[wasm_bindgen]
 pub fn endgame_new(req_str: String) -> Result<u32, JsValue> {
@@ -6558,19 +6397,27 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     // exchanges made are the position's too
     let committed_exchange = bag == 1 && game_config.exchange_tile_limit() <= 1;
     let bag_options = req.estimates || req.cuts.is_some() || req.part.is_some();
-    let bag_search = if bag >= 2 || committed_exchange || (bag == 1 && bag_options) {
+    let bag_search = if in_bag {
+        let fields_required = bag >= 2 || committed_exchange || bag_options;
         let model = match req.model.as_deref() {
             Some("info_sets") => endgame::PegModel::InfoSets,
             Some("random_draws") => endgame::PegModel::RandomDraws,
+            None if !fields_required => endgame::PegModel::RandomDraws,
             found => {
                 return Err(format!(
                     "model: \"info_sets\" or \"random_draws\" with {bag} tiles in the bag, found {found:?}"
                 ));
             }
         };
-        let exchanges = req
-            .exchanges
-            .ok_or_else(|| format!("exchanges: each seat's, with {bag} tiles in the bag"))?;
+        let exchanges = match req.exchanges {
+            Some(made) => made,
+            None if !fields_required => [0, 0],
+            None => {
+                return Err(format!(
+                    "exchanges: each seat's, with {bag} tiles in the bag"
+                ));
+            }
+        };
         if exchanges.iter().any(|&made| made < 0) {
             return Err(format!("exchanges: each must be >= 0, found {exchanges:?}"));
         }
@@ -6599,18 +6446,16 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         state.board_tiles.copy_from_slice(&kibitzer.board_tiles);
         state.turn = req.turn;
         state.players[turn].rack.clone_from(&rack);
-        state.players[turn].num_exchanges = bag_search.map_or(0, |(_, made)| made[turn]);
+        state.players[turn].num_exchanges = bag_search.as_ref().map_or(0, |(_, made)| made[turn]);
         state.bag.set_from_iter(std::iter::repeat_n(0, bag));
         Some(
             endgame::RootMoves::checked(
-                &movegen::BoardSnapshot {
-                    board_tiles: &state.board_tiles,
-                    game_config: &game_config,
-                    vocab: &movegen::Vocab::lean(&kwg.kwg),
-                    anagrams: None,
-                    rack_lengths: None,
-                    klv: &game_config.no_leaves,
-                },
+                &movegen::BoardSnapshot::new(
+                    &state.board_tiles,
+                    &game_config,
+                    &movegen::Vocab::bare(&kwg.kwg),
+                    &game_config.no_leaves,
+                ),
                 &state,
                 plays,
             )
@@ -6652,17 +6497,6 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         }
         None => None,
     };
-    let peg = (bag == 1 && peg_bag.is_none()).then(|| {
-        endgame::PegProgress::new(
-            req.turn,
-            &kibitzer.board_tiles,
-            &rack,
-            &unseen,
-            equity::Equity::new(scores),
-            [req.pass_turns, req.zero_turns],
-        )
-        .with_root_moves(root_moves.take())
-    });
     // an endgame warmed by one before it (warm_from), of the same rules and
     // lexicon: the new one takes that one's table, which then leaves that one,
     // whose later steps start cold, and is given over to a graph pruned anew
@@ -6686,11 +6520,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
             }
             // the source's own game_config too: a table goes only to a solver
             // of the very tables it was made with
-            Some((
-                from,
-                std::sync::Arc::clone(&source.game_config),
-                std::sync::Arc::clone(&source.arm_tables),
-            ))
+            Some((from, std::sync::Arc::clone(&source.game_config)))
         }
     };
     // a graph pruned here, with its run letters; under a cap, pruned within
@@ -6719,20 +6549,19 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
             None => EndgameGraph::of_lexicon(std::sync::Arc::clone(&kwg)),
         }))
     };
-    let (game_config, kwg, arm_tables, table) = match warm {
-        Some((from, game_config, arm_tables)) => {
+    let (game_config, kwg, table) = match warm {
+        Some((from, game_config)) => {
             let kwg = pruned(&game_config)?;
             let table = (ENDGAMES.lock().map_err(err_to_str)?.live.get_mut(&from))
                 .ok_or_else(|| format!("warm_from: {}", no_endgame(from)))?
                 .table
                 .take()
-                .map(|table| table.for_another_graph(&movegen::Vocab::lean(kwg.kwg())));
-            (game_config, kwg, arm_tables, table)
+                .map(|table| table.for_another_graph(&movegen::Vocab::bare(kwg.kwg())));
+            (game_config, kwg, table)
         }
         None => (
             std::sync::Arc::clone(&game_config),
             pruned(&game_config)?,
-            std::sync::Arc::new(anagrams::ArmTables::None),
             None,
         ),
     };
@@ -6743,7 +6572,6 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         priority: None,
         game_config,
         kwg,
-        arm_tables,
         lexicon: req.lexicon,
         rules: req.rules,
         board_tiles: kibitzer.board_tiles.clone(),
@@ -6765,7 +6593,6 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
         reserve,
         table,
         solver: None,
-        peg,
         finished: None,
         nodes: 0,
         answer: EndgameAnswer {
@@ -6782,7 +6609,6 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
             depth: Some(0),
             line: (!in_bag).then(Vec::new),
             win: None,
-            tiles: (bag == 1).then(Vec::new),
             candidates: in_bag.then(Vec::new),
             endgames: in_bag.then_some(0),
             moves: None,
@@ -6850,8 +6676,6 @@ fn endgame_change(
         .map_err(|_| OUT_OF_MEMORY)?;
     for play in plays {
         let was = if let Some(progress) = endgame.peg_bag.as_mut() {
-            standing(progress.change(play, peg_change()))
-        } else if let Some(progress) = endgame.peg.as_mut() {
             standing(progress.change(play, peg_change()))
         } else {
             endgame.change_root(play, change, page_memory)?
@@ -6992,7 +6816,7 @@ fn do_endgame_step(
     if let Some(ms) = req.first_moves_ms {
         endgame.value_first_moves(ms, clock, memory, priority)?;
     }
-    let no_draws = endgame.peg_bag.is_none() && endgame.peg.is_none();
+    let no_draws = endgame.peg_bag.is_none();
     if req.brief && (draws_of.is_none() || no_draws) && req.candidates_range.is_none() {
         let a = &endgame.answer;
         let brief = EndgameBrief {
@@ -7026,26 +6850,6 @@ fn do_endgame_step(
         };
     }
     let i = endgame.place_of(draws_of)?;
-    if let Some(progress) = endgame.peg.as_ref() {
-        let Some(valued) = progress.answer_moves(i..i.saturating_add(1)).pop() else {
-            return Err(format!(
-                "draws_of: {i} is no candidate of the {} with draws",
-                progress.answer_total()
-            ));
-        };
-        let mut draws = endgame.one_tile_draws(valued.row);
-        let total = draws.len();
-        let [from, to] = req
-            .draws_range
-            .unwrap_or([0, total])
-            .map(|at| at.min(total));
-        draws.truncate(to.max(from));
-        draws.drain(..from);
-        if let Some(range) = req.candidates_range {
-            return endgame.answer_page(range, Some((i, draws, total)));
-        }
-        return endgame.answer_json(Some((i, draws, total)));
-    }
     let listed = endgame.peg_bag.as_ref().map(|progress| {
         let total = progress.answer_total();
         (progress.answer_moves(i..i.saturating_add(1)).pop(), total)
@@ -7218,14 +7022,12 @@ fn pruned_graph_within(
     let mut words = Vec::<bites::Bites>::new();
     let mut refused = false;
     let pruned = game_config.lend()?.gen_remaining_words_within(
-        &movegen::BoardSnapshot {
+        &movegen::BoardSnapshot::new(
             board_tiles,
             game_config,
-            vocab: &movegen::Vocab::lean(&lexicon.kwg),
-            anagrams: None,
-            rack_lengths: None,
-            klv: &empty_klv,
-        },
+            &movegen::Vocab::bare(&lexicon.kwg),
+            &empty_klv,
+        ),
         Some(memory),
         |word: &[u8]| {
             // a word too long to be held in its Bites takes its tiles' bytes
@@ -7310,14 +7112,12 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
     let mut refused = false;
     let mut generator = game_config.lend()?;
     let pruned = generator.gen_remaining_words_within(
-        &movegen::BoardSnapshot {
-            board_tiles: &kibitzer.board_tiles,
-            game_config: &game_config,
-            vocab: &movegen::Vocab::lean(&kwg.kwg),
-            anagrams: None,
-            rack_lengths: None,
-            klv: &game_config.no_leaves,
-        },
+        &movegen::BoardSnapshot::new(
+            &kibitzer.board_tiles,
+            &game_config,
+            &movegen::Vocab::bare(&kwg.kwg),
+            &game_config.no_leaves,
+        ),
         memory,
         |word: &[u8]| {
             // a word too long to be held in its Bites takes its tiles' bytes
@@ -7361,14 +7161,12 @@ fn prune_into(
     let mut generator = game_config.lend()?;
     generator
         .gen_remaining_words(
-            &movegen::BoardSnapshot {
+            &movegen::BoardSnapshot::new(
                 board_tiles,
                 game_config,
-                vocab: &movegen::Vocab::lean(&lexicon.kwg),
-                anagrams: None,
-                rack_lengths: None,
-                klv: &game_config.no_leaves,
-            },
+                &movegen::Vocab::bare(&lexicon.kwg),
+                &game_config.no_leaves,
+            ),
             |word: &[u8]| words.push(word.into()),
         )
         .map_err(wolges_err)?;
@@ -8280,14 +8078,12 @@ mod tests {
         let mut wolges = infer::kept_leaves_lean(
             &mut infer::InferTables::new(&game_config, &klv.klv).unwrap(),
             &mut movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config).unwrap(),
-            &movegen::BoardSnapshot {
-                board_tiles: &kibitzer.board_tiles,
-                game_config: &game_config,
-                vocab: &movegen::Vocab::lean(&kwg.kwg),
-                anagrams: None,
-                rack_lengths: None,
-                klv: &klv.klv,
-            },
+            &movegen::BoardSnapshot::new(
+                &kibitzer.board_tiles,
+                &game_config,
+                &movegen::Vocab::bare(&kwg.kwg),
+                &klv.klv,
+            ),
             &rack,
             &play,
             infer::FUZZ,
@@ -9027,14 +8823,12 @@ mod tests {
             movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
                 .unwrap()
                 .gen_remaining_words(
-                    &movegen::BoardSnapshot {
+                    &movegen::BoardSnapshot::new(
                         board_tiles,
-                        game_config: &game_config,
-                        vocab: &movegen::Vocab::lean(&kwg.kwg),
-                        anagrams: None,
-                        rack_lengths: None,
-                        klv: &Klv::empty().unwrap(),
-                    },
+                        &game_config,
+                        &movegen::Vocab::bare(&kwg.kwg),
+                        &Klv::empty().unwrap(),
+                    ),
                     |word: &[u8]| words.push(word.into()),
                 )
                 .unwrap();
@@ -9123,14 +8917,12 @@ mod tests {
         movegen::KurniaMoveGenerator::<u32, false, false>::try_new(&game_config)
             .unwrap()
             .gen_remaining_words(
-                &movegen::BoardSnapshot {
+                &movegen::BoardSnapshot::new(
                     board_tiles,
-                    game_config: &game_config,
-                    vocab: &movegen::Vocab::lean(&kwg.kwg),
-                    anagrams: None,
-                    rack_lengths: None,
-                    klv: &Klv::empty().unwrap(),
-                },
+                    &game_config,
+                    &movegen::Vocab::bare(&kwg.kwg),
+                    &Klv::empty().unwrap(),
+                ),
                 |word: &[u8]| remaining.push(word.into()),
             )
             .unwrap();
@@ -10125,7 +9917,6 @@ mod tests {
         let one = [S, B, D, F, G, H, I, E, S, B, D, F, G, H, I];
         request["board"] = report(&late_board(&one));
         request.as_object_mut().unwrap().remove("shortlist");
-        request.as_object_mut().unwrap().remove("cuts");
         let reference = do_endgame_new(&request.to_string(), none_held).unwrap();
         let full = endgame_step(reference, r#"{"ms":60000}"#);
         assert_eq!(full["exact"], true);
@@ -10224,26 +10015,51 @@ mod tests {
         do_endgame_free(reference).unwrap();
     }
 
+    fn first_timed_bag_move(
+        mut fresh: impl FnMut() -> u32,
+        step: impl Fn(u32, u64) -> serde_json::Value,
+    ) -> (u32, serde_json::Value) {
+        for ms in 1..=60_000 {
+            let handle = fresh();
+            let answer = step(handle, ms);
+            if answer["moves"][0].as_u64().unwrap_or(0) != 0 {
+                assert_eq!(answer["moves"][0], 1, "{answer}");
+                assert_eq!(answer["exact"], false, "{answer}");
+                return (handle, answer);
+            }
+            do_endgame_free(handle).unwrap();
+        }
+        panic!("the timed step did not value a move");
+    }
+
     #[test]
     fn an_endgame_uses_the_saved_order_in_a_timed_step() {
         let lexicon = "tiny-end-shortlist-order";
         tiny_lexicon(lexicon);
         let rack = [S, B, D, F, G, H, I];
         let tiles = [S, B, D, F, G, H, I, E, S, B, D, F, G, H, I];
-        let mut request = serde_json::json!({
+        let request = serde_json::json!({
             "rack": rack, "board": report(&late_board(&tiles)), "lexicon": lexicon,
             "rules": "CrosswordGame", "scores": [0, 0], "turn": 0, "zero_turns": 0,
             "pass_turns": 0,
         });
-        let shortlist = shortlist::do_new(&request.to_string()).unwrap();
-        let ids = shortlist::do_add(shortlist, &format!("[{PASS}]")).unwrap();
-        request["shortlist"] = serde_json::json!(shortlist);
-        let endgame = do_endgame_new(&request.to_string(), none_held).unwrap();
-        do_endgame_prioritize(endgame, &ids).unwrap();
-        shortlist::do_free(shortlist).unwrap();
-        let short = report(&do_endgame_step(endgame, r#"{"ms":1}"#, ticking, none_held).unwrap());
+        let (endgame, short) = first_timed_bag_move(
+            || {
+                let shortlist = shortlist::do_new(&request.to_string()).unwrap();
+                let ids = shortlist::do_add(shortlist, &format!("[{PASS}]")).unwrap();
+                let mut attached = request.clone();
+                attached["shortlist"] = serde_json::json!(shortlist);
+                let endgame = do_endgame_new(&attached.to_string(), none_held).unwrap();
+                do_endgame_prioritize(endgame, &ids).unwrap();
+                shortlist::do_free(shortlist).unwrap();
+                endgame
+            },
+            |handle, ms| {
+                let step = serde_json::json!({"ms":ms});
+                report(&do_endgame_step(handle, &step.to_string(), ticking, none_held).unwrap())
+            },
+        );
         assert_eq!(short["candidates"][0]["play"], report(PASS), "{short}");
-        assert_eq!(short["exact"], false);
         assert!(endgame_step(endgame, r#"{"ms":60000}"#)["exact"] == true);
         do_endgame_free(endgame).unwrap();
     }
@@ -10395,17 +10211,19 @@ mod tests {
         let rack = [S, B, D, F, G, H, I];
         let others = [E, S, B, D, F, G, H, I];
         let pass = serde_json::json!({"action":"exchange","tiles":[]});
-        let handle = endgame_of("tiny-end-priority-bag", &rack, &others, "").unwrap();
-        let request = serde_json::json!({"ms":1,"priority":[pass]});
-        let answer =
-            report(&do_endgame_step(handle, &request.to_string(), ticking, held_bytes).unwrap());
-        assert_eq!(answer["moves"][0], 1, "{answer}");
+        let no_cuts = r#","model":"random_draws","exchanges":[0,0],"cuts":false"#;
+        let (handle, answer) = first_timed_bag_move(
+            || endgame_of("tiny-end-priority-bag", &rack, &others, no_cuts).unwrap(),
+            |handle, ms| {
+                let request = serde_json::json!({"ms":ms,"priority":[pass]});
+                report(&do_endgame_step(handle, &request.to_string(), ticking, held_bytes).unwrap())
+            },
+        );
         assert_eq!(answer["candidates"][0]["play"], pass, "{answer}");
-        assert_eq!(answer["exact"], false);
         let full = endgame_step(handle, r#"{"ms":60000}"#);
         assert_eq!(full["exact"], true);
         assert!(full["candidates"].as_array().unwrap().len() > 1);
-        let reference = endgame_of("tiny-end-priority-reference", &rack, &others, "").unwrap();
+        let reference = endgame_of("tiny-end-priority-reference", &rack, &others, no_cuts).unwrap();
         let reference_answer = endgame_step(reference, r#"{"ms":60000}"#);
         assert_eq!(full["candidates"], reference_answer["candidates"]);
         do_endgame_free(handle).unwrap();
@@ -10532,13 +10350,11 @@ mod tests {
         ))
         .unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
-        let arm_tables = anagrams::ArmTables::None;
-        let vocab = movegen::Vocab::lean(&kwg.kwg);
+        let vocab = movegen::Vocab::bare(&kwg.kwg);
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &game_config,
                 &vocab,
-                &arm_tables,
                 kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
@@ -10694,8 +10510,7 @@ mod tests {
             let mut kibitzer = kibitzer::Kibitzer::new();
             let board = serde_json::from_str::<Vec<Vec<i8>>>(&board).unwrap();
             kibitzer.prepare(&game_config, &rack, &board).unwrap();
-            let arm_tables = anagrams::ArmTables::None;
-            let vocab = movegen::Vocab::lean(&kwg.kwg);
+            let vocab = movegen::Vocab::bare(&kwg.kwg);
             let mut solver = endgame::EndgameSolver::<
                 kwg::Node24,
                 kwg::Node24,
@@ -10706,7 +10521,6 @@ mod tests {
             >::with_generator(
                 &game_config,
                 &vocab,
-                &arm_tables,
                 kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
@@ -10733,7 +10547,7 @@ mod tests {
         assert_eq!(
             before,
             serde_json::json!({"bag": 1, "steps": 0, "nodes": 0, "exact": false,
-                "play": null, "spread": 0.0, "depth": 0, "tiles": [], "candidates": [],
+                "play": null, "spread": 0.0, "depth": 0, "candidates": [],
                 "endgames": 0, "out_of_memory": false})
         );
         let answer = endgame_step(handle, r#"{"ms":60000}"#);
@@ -10750,54 +10564,44 @@ mod tests {
         );
         assert!(answer["depth"].as_i64().unwrap() >= 1, "{answer}");
         assert!(answer["play"].is_object(), "{answer}");
-        // every move the pass valued, best first, the first the answer's own,
-        // each with its tiles, all exact
         let candidates = answer["candidates"].as_array().unwrap();
         assert!(!candidates.is_empty(), "{answer}");
         assert_eq!(candidates[0]["play"], answer["play"]);
         assert_eq!(candidates[0]["value"], answer["value"]);
         assert_eq!(candidates[0]["win"], answer["win"]);
-        assert_eq!(candidates[0]["tiles"], answer["tiles"]);
+        assert_eq!(candidates[0]["exact"], true, "{answer}");
         assert!(
             candidates
                 .iter()
-                .all(|c| c["exact"] == true && c["tiles"].is_array()),
+                .all(|candidate| candidate["deals"] == others.len()),
             "{answer}"
         );
-        let tiles = answer["tiles"].as_array().unwrap();
+        let drawn = endgame_step(handle, r#"{"ms":0,"draws_of":0}"#);
+        let draws = drawn["candidates"][0]["draws"].as_array().unwrap();
+        assert_eq!(drawn["candidates"][0]["draws_total"], draws.len());
+        assert!(
+            draws
+                .iter()
+                .all(|d| d["tiles"].as_array().unwrap().len() == 1)
+        );
         let count = |t: &serde_json::Value| t["count"].as_f64().unwrap();
         let value = |t: &serde_json::Value| t["value"].as_f64().unwrap();
-        let total = tiles.iter().map(count).sum::<f64>();
+        let total = draws.iter().map(count).sum::<f64>();
         assert_eq!(total, others.len() as f64);
-        let mean = tiles.iter().map(|t| count(t) * value(t)).sum::<f64>() / total;
+        let mean = draws.iter().map(|t| count(t) * value(t)).sum::<f64>() / total;
         assert!(
             (answer["value"].as_f64().unwrap() - mean).abs() < 0.001,
             "{answer}"
         );
-        let won = (tiles.iter())
-            .map(|t| {
-                count(t)
-                    * match value(t).total_cmp(&0.0) {
-                        std::cmp::Ordering::Greater => 1.0,
-                        std::cmp::Ordering::Equal => 0.5,
-                        std::cmp::Ordering::Less => 0.0,
-                    }
-            })
+        let won = draws
+            .iter()
+            .map(|t| count(t) * t["win"].as_f64().unwrap())
             .sum::<f64>()
             / total;
         assert!(
             (answer["win"].as_f64().unwrap() - won).abs() < 1e-6,
             "{answer}"
         );
-        let drawn = endgame_step(handle, r#"{"ms":0,"draws_of":0}"#);
-        let draws = drawn["candidates"][0]["draws"].as_array().unwrap();
-        assert_eq!(drawn["candidates"][0]["draws_total"], tiles.len());
-        assert_eq!(draws.len(), tiles.len());
-        for (draw, tile) in draws.iter().zip(tiles) {
-            assert_eq!(draw["tiles"], serde_json::json!([tile["tile"]]));
-            assert_eq!(draw["count"], tile["count"]);
-            assert_eq!(draw["value"], tile["value"]);
-        }
         let paged = endgame_step(handle, r#"{"ms":0,"draws_of":0,"draws_range":[1,2]}"#);
         assert_eq!(paged["candidates"][0]["draws"][0], draws[1]);
         do_endgame_free(handle).unwrap();
@@ -11235,13 +11039,11 @@ mod tests {
         ))
         .unwrap();
         kibitzer.prepare(&game_config, &rack, &board).unwrap();
-        let arm_tables = anagrams::ArmTables::None;
-        let vocab = movegen::Vocab::lean(&kwg.kwg);
+        let vocab = movegen::Vocab::bare(&kwg.kwg);
         let mut solver =
             endgame::EndgameSolver::<kwg::Node24, kwg::Node24, true, u32, false, false>::with_generator(
                 &game_config,
                 &vocab,
-                &arm_tables,
                 kwg.kwg.run_letters(),
                 movegen::KurniaMoveGenerator::try_new(&game_config).unwrap(),
             )
@@ -11390,7 +11192,6 @@ mod tests {
             depth: Some(depth),
             line: Some(Vec::new()),
             win: None,
-            tiles: None,
             candidates: None,
             endgames: None,
             moves: None,
