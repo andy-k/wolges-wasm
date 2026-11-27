@@ -4671,10 +4671,12 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
     let deadline = match req.ms {
         Some(ms) if ms >= 0.0 && ms.is_finite() => Some(now() + ms),
         Some(ms) => return Err(format!("ms: {ms} is not a time to run")),
-        None if req.iterations.is_none() => {
-            return Err("sim_step: give iterations, ms, or both".into());
-        }
         None => None,
+    };
+    let iterations = match (req.iterations, deadline) {
+        (Some(iterations), _) => iterations,
+        (None, Some(_)) => u64::MAX,
+        (None, None) => 0,
     };
     let pruning = pruning_of(&req)?;
     let memory = sim_memory(req.max_memory_mb)?;
@@ -4703,7 +4705,7 @@ fn do_sim_step(handle: u32, req_str: &str, now: impl Fn() -> f64) -> Result<Stri
         ),
         (None, None) => None,
     };
-    let stepped = sim.step(req.iterations.unwrap_or(u64::MAX), pruning, || {
+    let stepped = sim.step(iterations, pruning, || {
         deadline.is_some_and(|deadline| now() >= deadline)
     })?;
     try_json_kept(&sim.game_config, &sim.report(stepped, against, req.compact))?
@@ -7868,6 +7870,7 @@ mod tests {
             (5.into(), 0.into())
         );
         assert_eq!(read["candidates"], at_once["candidates"]);
+        assert_eq!(step(b, r#"{"prune":false}"#), read);
         do_sim_free(a).unwrap();
         do_sim_free(b).unwrap();
     }

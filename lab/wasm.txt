@@ -738,8 +738,8 @@ both, and answers how its candidates stand. The request:
   iterations: whole number or null, optional. The most iterations to run; 0
     runs none and answers the sim as it is.
   ms: number, 0 or more, or null, optional. The most milliseconds to run, the
-    clock read before each iteration. A step gives iterations, ms, or both, and
-    with both it stops at whichever ends first.
+    clock read before each iteration. With both it stops at whichever ends
+    first; with neither it runs none and answers the sim as it is.
   prune: true or false, required. Whether the step prunes.
   prune_every: whole number, 1 or more, or null; required to prune. The step
     prunes every prune_every of the sim's iterations.
