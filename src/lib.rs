@@ -1762,9 +1762,6 @@ fn pruning_of(req: &SimStepRequest) -> Result<Option<Pruning>, String> {
         return Err("prune_every: must be 1 or more".into());
     }
     let z = req.prune_z.ok_or("prune_z: required to prune")?;
-    if z < 0.0 {
-        return Err("prune_z: must be 0 or more".into());
-    }
     let decided = req
         .prune_decided
         .ok_or("prune_decided: required to prune")?;
@@ -9553,6 +9550,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!((given.every, given.z, given.decided), (16, 3.5, 0.5));
+        let below = asked(r#"{"prune":true,"prune_every":16,"prune_z":-1,"prune_decided":0.5}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(below.z, -1.0);
         for (json, said) in [
             (r#""prune_z":3.5,"prune_decided":0.001"#, "prune_every: "),
             (r#""prune_every":16,"prune_decided":0.001"#, "prune_z: "),
@@ -9560,10 +9561,6 @@ mod tests {
             (
                 r#""prune_every":0,"prune_z":3.5,"prune_decided":0.001"#,
                 "prune_every: ",
-            ),
-            (
-                r#""prune_every":16,"prune_z":-1,"prune_decided":0.001"#,
-                "prune_z: ",
             ),
             (
                 r#""prune_every":16,"prune_z":3.5,"prune_decided":0.6"#,

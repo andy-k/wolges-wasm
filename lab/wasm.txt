@@ -743,9 +743,9 @@ both, and answers how its candidates stand. The request:
   prune: true or false, required. Whether the step prunes.
   prune_every: whole number, 1 or more, or null; required to prune. The step
     prunes every prune_every of the sim's iterations.
-  prune_z: number, 0 or more, or null; required to prune. How many standard
-    errors, split over the candidates still running, a candidate must be behind
-    the leader to be pruned.
+  prune_z: number or null; required to prune. How many standard errors, split
+    over the candidates still running, a candidate must be behind the leader to
+    be pruned.
   prune_decided: number from 0 to 0.5, or null; required to prune. A chance to
     win within prune_decided of 1 or of 0 has its game won or lost.
   against: sim play or null, optional. A candidate of the sim to compare each
