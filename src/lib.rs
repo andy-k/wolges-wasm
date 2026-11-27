@@ -6505,7 +6505,8 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
     // with two tiles or more in the bag, what each player knows and the
     // exchanges made are the position's too
     let committed_exchange = bag == 1 && game_config.exchange_tile_limit() <= 1;
-    let bag_search = if bag >= 2 || committed_exchange {
+    let bag_options = req.estimates || req.cuts.is_some() || req.part.is_some();
+    let bag_search = if bag >= 2 || committed_exchange || (bag == 1 && bag_options) {
         let model = match req.model.as_deref() {
             Some("info_sets") => endgame::PegModel::InfoSets,
             Some("random_draws") => endgame::PegModel::RandomDraws,
@@ -6596,21 +6597,6 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 progress.with_cuts().map_err(wolges_err)?
             };
             Some(progress.with_root_moves(root_moves.take()))
-        }
-        None if req.estimates => {
-            return Err(format!(
-                "estimates: with two tiles or more in the bag, found {bag} in it"
-            ));
-        }
-        None if req.cuts.is_some() => {
-            return Err(format!(
-                "cuts: with two tiles or more in the bag, found {bag} in it"
-            ));
-        }
-        None if req.part.is_some() => {
-            return Err(format!(
-                "part: with two tiles or more in the bag, found {bag} in it"
-            ));
         }
         None => None,
     };
@@ -10837,8 +10823,8 @@ mod tests {
     }
 
     // two tiles in the bag with estimates asked for, and no limit: the answer
-    // the steps end on is the one without them, every candidate exact; with
-    // fewer than two in the bag, asking is refused
+    // the steps end on is the one without them, every candidate exact; one
+    // tile in the bag then searches as two do, and an empty bag ignores it
     #[test]
     fn an_endgame_asked_for_estimates_ends_as_one_without() {
         let rack = [S, B, D, F, G, H, I];
@@ -10853,18 +10839,31 @@ mod tests {
         let plain = solve("");
         let estimated = solve(r#","estimates":true"#);
         assert_eq!(estimated["exact"], true, "{estimated}");
+        let one = endgame_of(
+            "tiny-end-estimates",
+            &rack,
+            &others[1..],
+            r#","model":"random_draws","exchanges":[0,0],"estimates":true"#,
+        )
+        .unwrap();
+        let answer = endgame_step(one, r#"{"ms":60000}"#);
+        assert_eq!(
+            (answer["bag"].clone(), answer["exact"].clone()),
+            (1.into(), true.into())
+        );
+        do_endgame_free(one).unwrap();
         for field in ["play", "value", "win", "draws", "candidates"] {
             assert_eq!(estimated[field], plain[field], "{field}");
         }
-        assert!(
-            endgame_of(
-                "tiny-end-estimates",
-                &[S, E, A, T],
-                &[A, T, E],
-                r#","estimates":true"#
-            )
-            .is_err()
+        let empty = endgame_of(
+            "tiny-end-estimates",
+            &[S, E, A, T],
+            &[A, T, E],
+            r#","estimates":true"#,
         );
+        let empty = empty.unwrap();
+        assert_eq!(endgame_step(empty, r#"{"ms":60000}"#)["exact"], true);
+        do_endgame_free(empty).unwrap();
     }
 
     #[test]
@@ -10897,20 +10896,20 @@ mod tests {
             let cut_rows = cut_values(answer);
             assert!(!cut_rows.is_empty() && cut_rows.iter().all(|&null| null));
         }
-        assert!(
-            endgame_of(
-                "tiny-end-cuts",
-                &[S, E, A, T],
-                &[A, T, E],
-                r#","cuts":true"#
-            )
-            .is_err()
+        let empty = endgame_of(
+            "tiny-end-cuts",
+            &[S, E, A, T],
+            &[A, T, E],
+            r#","cuts":true"#,
         );
+        let empty = empty.unwrap();
+        assert_eq!(endgame_step(empty, r#"{"ms":60000}"#)["exact"], true);
+        do_endgame_free(empty).unwrap();
     }
 
     // two tiles in the bag searched in two parts (a page's two workers): each
     // part says it is one, and each candidate's draws from both are the whole
-    // search's; a part with fewer than two tiles in the bag is refused
+    // search's; an empty bag ignores a part
     #[test]
     fn an_endgame_in_parts_draws_what_the_whole_does() {
         let rack = [S, B, D, F, G, H, I];
@@ -10949,15 +10948,15 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "{candidate}");
         }
-        assert!(
-            endgame_of(
-                "tiny-end-parts",
-                &[S, E, A, T],
-                &[A, T, E],
-                r#","part":[0,2]"#
-            )
-            .is_err()
+        let empty = endgame_of(
+            "tiny-end-parts",
+            &[S, E, A, T],
+            &[A, T, E],
+            r#","part":[0,2]"#,
         );
+        let empty = empty.unwrap();
+        assert_eq!(endgame_step(empty, r#"{"ms":60000}"#)["exact"], true);
+        do_endgame_free(empty).unwrap();
         // a part past the last is refused with wolges's message, unquoted
         let more = r#","model":"random_draws","exchanges":[0,0],"part":[2,2]"#;
         assert_eq!(

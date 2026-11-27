@@ -910,19 +910,19 @@ may lie between the opponent's rack and the bag. The request:
   warm_from: endgame handle or null, optional. A live endgame of the same rules
     and lexicon names, whose solver table this one takes; that endgame's later
     steps start with an empty table. The bag may hold tiles in either.
-  part: [k, n] or null, optional; only with two or more tiles in the bag. Part
-    k of n: the search values only the ways the tiles may lie whose place is k
-    more than a multiple of n, so that n endgames, one for each part, value
-    each way once between them. k is below n. A candidate's draws from all n
-    parts, weighed by their counts, are the whole search's.
-  estimates: true or false, optional (false if left out); only with two or more
-    tiles in the bag. The search's early passes value every move fast where a
-    line still leaves tiles in the bag, each such value an estimate and the
-    answer then not exact, and its later passes make them exact.
-  cuts: true or false, or null, optional; only with two or more tiles in the
-    bag. The search stops valuing a move once it cannot win as often as the
-    best so far, listing it as a cut candidate (below). Left out or null, it
-    cuts: a step's ms is the step's share of the search, not a limit on it.
+  part: [k, n] or null, optional; not read with an empty bag. Part k of n: the
+    search values only the ways the tiles may lie whose place is k more than a
+    multiple of n, so that n endgames, one for each part, value each way once
+    between them. k is below n. A candidate's draws from all n parts, weighed
+    by their counts, are the whole search's.
+  estimates: true or false, optional (false if left out); not read with an
+    empty bag. The search's early passes value every move fast where a line
+    still leaves tiles in the bag, each such value an estimate and the answer
+    then not exact, and its later passes make them exact.
+  cuts: true or false, or null, optional; not read with an empty bag. The
+    search stops valuing a move once it cannot win as often as the best so far,
+    listing it as a cut candidate (below). Left out or null, it cuts: a step's
+    ms is the step's share of the search, not a limit on it.
   root_moves: array of plays or null, optional. The plays the search may choose
     its play among, as below; left out, it may choose any.
   shortlist: shortlist handle or null, optional. A shortlist of this position,
@@ -934,11 +934,11 @@ may lie between the opponent's rack and the bag. The request:
     exchanges included.
 
 endgame_new refuses an empty rack, a rack that is not full while the bag holds
-a tile, a position whose opponent holds no tiles, model or exchanges left out
-with two or more tiles in the bag, and part, estimates, or cuts with fewer.
-Under a cap, an endgame with two or more tiles in the bag whose ways the tiles
-may lie do not fit throws out_of_memory. So does one whose root_moves or
-root_ids do not fit, under a cap or not.
+a tile, a position whose opponent holds no tiles, and model or exchanges left
+out where the search has tiles in the bag. Under a cap, an endgame with two or
+more tiles in the bag whose ways the tiles may lie do not fit throws
+out_of_memory. So does one whose root_moves or root_ids do not fit, under a cap
+or not.
 
 Given root_moves or root_ids, endgame_step chooses its play among those plays
 alone, and searches the replies and the moves after them as without it. With an
@@ -962,7 +962,8 @@ holds a tile (Spanish), the endgame searches as one with two or more tiles in
 the bag does, with root_moves, root_ids, or neither, and all this file gives
 for two or more tiles in the bag then holds for it: model and exchanges are
 required, part and estimates may be given, and its steps answer as with two or
-more tiles.
+more tiles. So does one with one tile in the bag given part, estimates, or
+cuts, under any rules.
 
 An endgame holds its rules, the lexicon pruned for its board (under a cap
 without room for the prune, the lexicon itself), and its solver's table from
