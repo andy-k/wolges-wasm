@@ -113,10 +113,10 @@ The module keeps some working memory from one call to the next, so it does not
 fall all the way back when a request is done.
 
 sim_new, sim_step, endgame_new, and build_kbwg take max_memory_mb, a cap in MiB
-on the module's memory while they run; it is 1 or more, and 0 is refused. The
-cap counts the module's whole linear memory, which grows but never shrinks, not
-memory_held. Without a cap, a call grows its memory until the browser refuses
-it more.
+on the module's memory while they run; it is 0 or more, and 0 leaves no room
+for anything the cap counts. The cap counts the module's whole linear memory,
+which grows but never shrinks, not memory_held. Without a cap, a call grows its
+memory until the browser refuses it more.
 
 A call that cannot get the memory it needs throws "out_of_memory", or, for a
 step, says out_of_memory: true in its answer; each call's section says which,

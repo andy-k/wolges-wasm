@@ -1851,14 +1851,11 @@ struct Sim {
 
 // a sim's cap of max_memory_mb, read as an endgame's is
 fn sim_memory(max_memory_mb: Option<usize>) -> Result<Option<endgame::MemoryLimit>, String> {
-    match max_memory_mb {
-        Some(0) => Err("max_memory_mb: at least 1, found 0".into()),
-        mb => Ok(mb.map(|mb| endgame::MemoryLimit {
-            bytes: mb.saturating_mul(1 << 20),
-            held: page_memory,
-            reserved: Some(&RESERVED),
-        })),
-    }
+    Ok(max_memory_mb.map(|mb| endgame::MemoryLimit {
+        bytes: mb.saturating_mul(1 << 20),
+        held: page_memory,
+        reserved: Some(&RESERVED),
+    }))
 }
 
 // the sims made, by handle; a handle is never used twice
@@ -6448,11 +6445,7 @@ fn do_endgame_new(req_str: &str, memory: fn() -> usize) -> Result<u32, String> {
                 req.scores
             )
         })?;
-    // a cap past what the page can have is never reached; none at all leaves no
-    // room for the table
-    if req.max_memory_mb == Some(0) {
-        return Err("max_memory_mb: at least 1, found 0".into());
-    }
+    // a cap past what the page can have is never reached
     // the cap in bytes, as many as a usize holds at most (on wasm32, 4096 MiB
     // shifted would wrap to none)
     let max_memory = req.max_memory_mb.map(|mb| mb.saturating_mul(1 << 20));
@@ -7221,14 +7214,11 @@ fn do_build_kbwg(req_str: &str, memory: fn() -> usize) -> Result<Vec<u8>, String
             req.rules
         ));
     }
-    let limit = match req.max_memory_mb {
-        Some(0) => return Err("max_memory_mb: at least 1, found 0".into()),
-        mb => mb.map(|mb| endgame::MemoryLimit {
-            bytes: mb.saturating_mul(1 << 20),
-            held: memory,
-            reserved: Some(&RESERVED),
-        }),
-    };
+    let limit = req.max_memory_mb.map(|mb| endgame::MemoryLimit {
+        bytes: mb.saturating_mul(1 << 20),
+        held: memory,
+        reserved: Some(&RESERVED),
+    });
     let mut kibitzer = kibitzer::Kibitzer::new();
     kibitzer
         .prepare(&game_config, &[], &req.board_tiles)
@@ -8965,11 +8955,9 @@ mod tests {
         drop(kept);
         assert_eq!(tight["out_of_memory"], true, "{tight}");
         assert_eq!(tight["stepped"], 0, "{tight}");
-        let err = do_sim_new(&format!(
-            r#"{{"rack":[{S}],"board":{board},"lexicon":"{lexicon}","leave":"noleave","rules":"CrosswordGame","scores":[0,0],"turn":0,"zero_turns":0,"pass_turns":0,"plies":2,"max_memory_mb":0}}"#
-        ))
-        .unwrap_err();
-        assert_eq!(err, "max_memory_mb: at least 1, found 0");
+        let none = answer(r#","max_memory_mb":0"#);
+        assert_eq!(none["out_of_memory"], true, "{none}");
+        assert_eq!(none["stepped"], 0, "{none}");
     }
 
     #[test]
@@ -10533,6 +10521,8 @@ mod tests {
             );
             let refused = do_build_kbwg(&format!(r#"{build},"max_memory_mb":1}}"#), || 1 << 20);
             assert_eq!(refused, Err(OUT_OF_MEMORY.to_string()), "{rules}");
+            let none = do_build_kbwg(&format!(r#"{build},"max_memory_mb":0}}"#), none_held);
+            assert_eq!(none, Err(OUT_OF_MEMORY.to_string()), "{rules}");
         }
     }
 
@@ -11806,16 +11796,14 @@ mod tests {
                 "",
                 "endgame: the other side holds no tiles, so the game is over",
             ),
-            (
-                &[S][..],
-                &[A, T][..],
-                r#","max_memory_mb":0"#,
-                "max_memory_mb: at least 1, found 0",
-            ),
         ] {
             let err = endgame_of("tiny-end-refuse", rack, others, more).unwrap_err();
             assert_eq!(err, wanted);
         }
+        let none = endgame_of("tiny-end-refuse", &[S], &[A, T], r#","max_memory_mb":0"#).unwrap();
+        let answer = report(&do_endgame_step(none, r#"{"ms":60000}"#, frozen, held_bytes).unwrap());
+        assert_eq!(answer["out_of_memory"], true, "{answer}");
+        do_endgame_free(none).unwrap();
         tiny_lexicon("tiny-end-refuse");
         let board = late_board(&[A, T, E]);
         let err = do_endgame_new(
